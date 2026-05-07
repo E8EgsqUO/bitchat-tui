@@ -1,8 +1,7 @@
-
 // File: src/terminal_ux.rs
 
-use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Local};
+use std::collections::{HashMap, HashSet};
 
 // This enum is correct.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,15 +42,14 @@ impl ChatContext {
         self.format_prompt()
     }
 
-
-
     // FIX 5: Made all state-changing methods silent.
     pub fn add_channel(&mut self, channel: &str) {
         self.active_channels.insert(channel.to_string());
     }
 
     pub fn add_dm(&mut self, nickname: &str, peer_id: &str) {
-        self.active_dms.insert(nickname.to_string(), peer_id.to_string());
+        self.active_dms
+            .insert(nickname.to_string(), peer_id.to_string());
     }
 
     pub fn enter_dm_mode(&mut self, nickname: &str, peer_id: &str) {
@@ -66,7 +64,7 @@ impl ChatContext {
         self.add_channel(channel);
         self.current_mode = ChatMode::Channel(channel.to_string());
     }
-    
+
     pub fn switch_to_channel_silent(&mut self, channel: &str) {
         self.add_channel(channel);
         self.current_mode = ChatMode::Channel(channel.to_string());
@@ -75,12 +73,10 @@ impl ChatContext {
     pub fn switch_to_public(&mut self) {
         self.current_mode = ChatMode::Public;
     }
-    
+
     pub fn remove_channel(&mut self, channel: &str) {
         self.active_channels.remove(channel);
     }
-    
-
 }
 
 pub fn format_message_display(
@@ -94,36 +90,63 @@ pub fn format_message_display(
     my_nickname: &str,
 ) -> String {
     let time_str = timestamp.format("%H:%M").to_string();
-    
+
     if is_private {
         if sender == my_nickname {
             if let Some(recipient) = recipient {
-                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → {}>\x1b[0m {}", time_str, recipient, content)
+                format!(
+                    "\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → {}>\x1b[0m {}",
+                    time_str, recipient, content
+                )
             } else {
-                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → ???>\x1b[0m {}", time_str, content)
+                format!(
+                    "\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → ???>\x1b[0m {}",
+                    time_str, content
+                )
             }
         } else {
-            format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;208m<{} → you>\x1b[0m {}", time_str, sender, content)
+            format!(
+                "\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;208m<{} → you>\x1b[0m {}",
+                time_str, sender, content
+            )
         }
     } else if is_channel {
         if sender == my_nickname {
             if let Some(channel) = channel_name {
-                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[38;5;117m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, content)
+                format!(
+                    "\x1b[2;34m[{}|{}]\x1b[0m \x1b[38;5;117m<{} @ {}>\x1b[0m {}",
+                    time_str, channel, sender, channel, content
+                )
             } else {
-                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[38;5;117m<{} @ ???>\x1b[0m {}", time_str, sender, content)
+                format!(
+                    "\x1b[2;34m[{}|Ch]\x1b[0m \x1b[38;5;117m<{} @ ???>\x1b[0m {}",
+                    time_str, sender, content
+                )
             }
         } else {
             if let Some(channel) = channel_name {
-                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[34m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, content)
+                format!(
+                    "\x1b[2;34m[{}|{}]\x1b[0m \x1b[34m<{} @ {}>\x1b[0m {}",
+                    time_str, channel, sender, channel, content
+                )
             } else {
-                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[34m<{} @ ???>\x1b[0m {}", time_str, sender, content)
+                format!(
+                    "\x1b[2;34m[{}|Ch]\x1b[0m \x1b[34m<{} @ ???>\x1b[0m {}",
+                    time_str, sender, content
+                )
             }
         }
     } else {
         if sender == my_nickname {
-            format!("\x1b[2;32m[{}]\x1b[0m \x1b[38;5;120m<{}>\x1b[0m {}", time_str, sender, content)
+            format!(
+                "\x1b[2;32m[{}]\x1b[0m \x1b[38;5;120m<{}>\x1b[0m {}",
+                time_str, sender, content
+            )
         } else {
-            format!("\x1b[2;32m[{}]\x1b[0m \x1b[32m<{}>\x1b[0m {}", time_str, sender, content)
+            format!(
+                "\x1b[2;32m[{}]\x1b[0m \x1b[32m<{}>\x1b[0m {}",
+                time_str, sender, content
+            )
         }
     }
 }
@@ -156,7 +179,8 @@ pub fn get_help_text() -> String {
         "  /block                   List blocked users",
         "  /unblock @user         Unblock a user\n",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    ].join("\n")
+    ]
+    .join("\n")
 }
 
 // Helper to extract message target from chat mode

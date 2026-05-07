@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-use crate::tui::app::{App, TuiPhase, FocusArea};
+use crate::tui::app::{App, FocusArea, TuiPhase};
 
 /// Renders a centered popup block.
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -64,12 +64,12 @@ fn render_nickname_popup(f: &mut Frame, app: &mut App, area: Rect) {
     let content_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  // Current nickname info
-            Constraint::Length(1),  // Spacing
-            Constraint::Length(2),  // Input field
-            Constraint::Length(1),  // Spacing
-            Constraint::Length(1),  // Instructions
-            Constraint::Min(0),     // Fill remaining space
+            Constraint::Length(2), // Current nickname info
+            Constraint::Length(1), // Spacing
+            Constraint::Length(2), // Input field
+            Constraint::Length(1), // Spacing
+            Constraint::Length(1), // Instructions
+            Constraint::Min(0),    // Fill remaining space
         ])
         .split(content_area);
 
@@ -111,7 +111,7 @@ fn render_connection_popup(f: &mut Frame, app: &mut App, area: Rect) {
     // Use a fixed 60% width and 35% height for the popup, always centered
     // Ensure minimum size to prevent border issues
     let popup_area = centered_rect(60, 35, area);
-    
+
     // Ensure the popup area is large enough to render properly
     if popup_area.width < 20 || popup_area.height < 10 {
         return; // Don't render if area is too small
@@ -139,12 +139,12 @@ fn render_connection_popup(f: &mut Frame, app: &mut App, area: Rect) {
     let content_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  // Status/icon
-            Constraint::Length(1),  // Spacing
-            Constraint::Min(1),     // Messages
-            Constraint::Length(1),  // Spacing
-            Constraint::Length(1),  // Instructions
-            Constraint::Min(0),     // Fill remaining space
+            Constraint::Length(2), // Status/icon
+            Constraint::Length(1), // Spacing
+            Constraint::Min(1),    // Messages
+            Constraint::Length(1), // Spacing
+            Constraint::Length(1), // Instructions
+            Constraint::Min(0),    // Fill remaining space
         ])
         .split(content_area);
 
@@ -152,9 +152,9 @@ fn render_connection_popup(f: &mut Frame, app: &mut App, area: Rect) {
     let messages_area = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(1),  // Left padding
-            Constraint::Min(0),     // Content
-            Constraint::Length(1),  // Right padding
+            Constraint::Length(1), // Left padding
+            Constraint::Min(0),    // Content
+            Constraint::Length(1), // Right padding
         ])
         .split(content_chunks[2]);
 

@@ -1,6 +1,6 @@
 // src/tui/event.rs
 
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, KeyEventKind};
+use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 use tui_input::backend::crossterm::EventHandler;
 
@@ -15,7 +15,9 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sen
         app.should_quit = true;
         return;
     }
-    if matches!(app.phase, crate::tui::app::TuiPhase::Error(_)) && key_event.code == KeyCode::Char('r') {
+    if matches!(app.phase, crate::tui::app::TuiPhase::Error(_))
+        && key_event.code == KeyCode::Char('r')
+    {
         app.trigger_connection_retry();
         return;
     }
@@ -50,7 +52,11 @@ fn handle_sidebar_events(app: &mut App, key_event: KeyEvent) {
         }
         KeyCode::Up => {
             if !visible_items.is_empty() {
-                app.sidebar_flat_selected = if current_selection == 0 { visible_items.len() - 1 } else { current_selection - 1 };
+                app.sidebar_flat_selected = if current_selection == 0 {
+                    visible_items.len() - 1
+                } else {
+                    current_selection - 1
+                };
             }
         }
         KeyCode::Enter => {
@@ -60,14 +66,31 @@ fn handle_sidebar_events(app: &mut App, key_event: KeyEvent) {
                     app.sidebar_state.channel_selected = None;
                     app.sidebar_state.public_selected = None;
                     match section_idx {
-                        0 => { app.sidebar_state.public_selected = Some(true); app.switch_to_public(); }
-                        1 => { if let Some(channel_name) = app.channels.get(child_idx) { app.switch_to_channel(channel_name.clone()); } }
-                        2 => { if let Some(person_name) = app.people.get(child_idx) { app.switch_to_dm(person_name.clone()); } }
+                        0 => {
+                            app.sidebar_state.public_selected = Some(true);
+                            app.switch_to_public();
+                        }
+                        1 => {
+                            if let Some(channel_name) = app.channels.get(child_idx) {
+                                app.switch_to_channel(channel_name.clone());
+                            }
+                        }
+                        2 => {
+                            if let Some(person_name) = app.people.get(child_idx) {
+                                app.switch_to_dm(person_name.clone());
+                            }
+                        }
                         3 => app.sidebar_state.blocked_selected = Some(child_idx),
-                        4 => { if child_idx == 0 { app.open_nickname_popup(); } }
+                        4 => {
+                            if child_idx == 0 {
+                                app.open_nickname_popup();
+                            }
+                        }
                         _ => {}
                     }
-                    if section_idx != 1 { app.update_current_conversation(); }
+                    if section_idx != 1 {
+                        app.update_current_conversation();
+                    }
                 } else {
                     app.sidebar_state.toggle_expand(section_idx);
                 }
@@ -81,7 +104,7 @@ fn handle_main_panel_events(app: &mut App, key_event: KeyEvent) {
     let (messages, _, _) = app.get_current_messages();
     let total_messages = messages.len();
     let messages_height = app.message_viewport_height;
-    
+
     let max_scroll = total_messages.saturating_sub(messages_height);
 
     match key_event.code {
@@ -120,7 +143,9 @@ fn handle_popup_events(app: &mut App, key_event: KeyEvent, _input_tx: &mpsc::Sen
         KeyCode::Esc => app.close_popup(),
         _ => {
             // FIX: Ignore the return value of handle_event
-            let _ = app.popup_input.handle_event(&CrosstermEvent::Key(key_event));
+            let _ = app
+                .popup_input
+                .handle_event(&CrosstermEvent::Key(key_event));
         }
     }
 }

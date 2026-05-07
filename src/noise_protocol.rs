@@ -12,6 +12,10 @@ use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 // MARK: - Debug Logging
 
 fn write_noise_protocol_debug_log(message: &str) {
+    if !crate::data_structures::file_logging_enabled() {
+        return;
+    }
+
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1236,7 +1240,7 @@ impl NoiseHandshakeState {
         // Responder uses c2 for send, c1 for receive
         Ok(match self.role {
             NoiseRole::Initiator => (c1, c2), // send_cipher, receive_cipher
-            NoiseRole::Responder => (c2, c1), // send_cipher, receive_cipher  
+            NoiseRole::Responder => (c2, c1), // send_cipher, receive_cipher
         })
     }
 

@@ -4,8 +4,9 @@ use crate::fragmentation::{send_packet_with_fragmentation, should_fragment};
 use crate::noise_session::NoiseSessionManager;
 use crate::notification_handlers::write_noise_debug_log;
 use crate::packet_creation::{
-    create_bitchat_packet_with_recipient, create_bitchat_packet_with_recipient_and_signature,
-    create_bitchat_packet_with_signature,
+    create_bitchat_packet_for_signing_at, create_bitchat_packet_with_recipient,
+    create_bitchat_packet_with_recipient_and_signature, create_bitchat_packet_with_signature_at,
+    current_timestamp_ms,
 };
 use crate::payload_handling::{
     create_bitchat_message_payload_full, create_encrypted_channel_message_payload,
@@ -16,7 +17,29 @@ use btleplug::platform::Peripheral as PlatformPeripheral;
 use chrono::Local;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::fs::OpenOptions;
+use std::io::Write;
 use tokio::sync::mpsc;
+use uuid::Uuid;
+
+fn write_send_debug_log(message: &str) {
+    if !crate::data_structures::file_logging_enabled() {
+        return;
+    }
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("send_debug.log")
+    {
+        let _ = writeln!(
+            file,
+            "[{}] {}",
+            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            message
+        );
+    }
+}
 
 // Handler for private DM messages using Noise protocol
 pub async fn handle_private_dm_message(
@@ -457,7 +480,9 @@ pub async fn handle_regular_message(
         // The warning about wrong passwords is handled in the join command when they try to rejoin
     }
 
-    let (message_payload, message_id) = if let Some(ref channel) = current_channel {
+    let (message_payload, message_id) = if current_channel.is_none() {
+        (line.as_bytes().to_vec(), Uuid::new_v4().to_string())
+    } else if let Some(ref channel) = current_channel {
         if let Some(channel_key) = channel_keys.get(channel) {
             if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
                 let _ = ui_tx
@@ -485,13 +510,7 @@ pub async fn handle_regular_message(
             )
         }
     } else {
-        create_bitchat_message_payload_full(
-            nickname,
-            line,
-            current_channel.as_deref(),
-            false,
-            my_peer_id,
-        )
+        unreachable!()
     };
 
     delivery_tracker.track_message(message_id.clone(), line.to_string(), false);
@@ -514,13 +533,36 @@ pub async fn handle_regular_message(
             .await;
     }
 
-    let signature = encryption_service.sign(&message_payload);
-    let message_packet = create_bitchat_packet_with_signature(
+    let message_timestamp = current_timestamp_ms();
+    let message_signature_payload = create_bitchat_packet_for_signing_at(
+        my_peer_id,
+        None,
+        MessageType::Message,
+        &message_payload,
+        message_timestamp,
+    );
+    let message_signature = encryption_service.sign(&message_signature_payload);
+    let message_packet = create_bitchat_packet_with_signature_at(
         my_peer_id,
         MessageType::Message,
         message_payload.clone(),
-        Some(signature),
+        Some(message_signature),
+        message_timestamp,
     );
+    write_send_debug_log(&format!(
+        "public message: content={:?}, peer_id={}, packet_len={}, type=0x{:02x}, ttl={}, flags=0x{:02x}, payload_len={}, packet_hex={}",
+        line,
+        my_peer_id,
+        message_packet.len(),
+        message_packet.get(1).copied().unwrap_or_default(),
+        message_packet.get(2).copied().unwrap_or_default(),
+        message_packet.get(11).copied().unwrap_or_default(),
+        message_packet
+            .get(12..14)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+            .unwrap_or_default(),
+        hex::encode(&message_packet)
+    ));
 
     // THIS BLOCK IS NOW CORRECT
     let send_result: Result<(), Box<dyn Error>> = if should_fragment(&message_packet) {
@@ -542,16 +584,20 @@ pub async fn handle_regular_message(
                 ))
                 .await;
         }
-        let write_type = if message_packet.len() > 512 {
+        let write_type = if cfg!(target_os = "windows") || message_packet.len() > 512 {
             WriteType::WithResponse
         } else {
             WriteType::WithoutResponse
         };
-        // Map the concrete btleplug::Error to a boxed trait object
-        peripheral
+        let write_result = peripheral
             .write(cmd_char, &message_packet, write_type)
-            .await
-            .map_err(Into::into)
+            .await;
+        write_send_debug_log(&format!(
+            "public message write result: write_type={:?}, result={:?}",
+            write_type,
+            write_result.as_ref().map(|_| ())
+        ));
+        write_result.map_err(Into::into)
     };
 
     if let Err(_) = send_result {

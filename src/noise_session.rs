@@ -14,6 +14,10 @@ use x25519_dalek::{PublicKey, StaticSecret};
 // MARK: - Debug Logging
 
 fn write_noise_debug_log(message: &str) {
+    if !crate::data_structures::file_logging_enabled() {
+        return;
+    }
+
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1291,19 +1295,28 @@ impl NoiseSessionManager {
     }
 
     // FIXED: Add method to store peer static keys for identity announcements
-    pub fn store_peer_static_key(&mut self, peer_id: &str, static_key_bytes: &[u8]) -> Result<(), NoiseError> {
+    pub fn store_peer_static_key(
+        &mut self,
+        peer_id: &str,
+        static_key_bytes: &[u8],
+    ) -> Result<(), NoiseError> {
         if static_key_bytes.len() != 32 {
             return Err(NoiseError::InvalidPublicKey);
         }
-        
+
         // Validate and store the key for future handshakes
-        let static_key_array: [u8; 32] = static_key_bytes.try_into()
+        let static_key_array: [u8; 32] = static_key_bytes
+            .try_into()
             .map_err(|_| NoiseError::InvalidPublicKey)?;
         let public_key = PublicKey::from(static_key_array);
-        
+
         // Store in a map for later use during handshakes
         // You might need to add a field to store these keys
-        log_noise_event("STATIC_KEY_STORED", peer_id, &format!("Stored static key for peer: {}", peer_id));
+        log_noise_event(
+            "STATIC_KEY_STORED",
+            peer_id,
+            &format!("Stored static key for peer: {}", peer_id),
+        );
         Ok(())
     }
 }

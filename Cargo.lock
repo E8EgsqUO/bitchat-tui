@@ -148,6 +148,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "lz4_flex",
+ "miniz_oxide",
  "pbkdf2",
  "rand",
  "ratatui",

@@ -5,6 +5,8 @@ use chrono;
 use hex;
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -13,8 +15,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 use crate::data_structures::{
-    BitchatMessage, BitchatPacket, DebugLevel, DeliveryAck, DeliveryTracker, FragmentCollector, MessageType, Peer,
-    BROADCAST_RECIPIENT, COVER_TRAFFIC_PREFIX, DEBUG_LEVEL,
+    BitchatMessage, BitchatPacket, DebugLevel, DeliveryAck, DeliveryTracker, FragmentCollector,
+    MessageType, Peer, BROADCAST_RECIPIENT, COVER_TRAFFIC_PREFIX, DEBUG_LEVEL,
 };
 use crate::encryption::EncryptionService;
 use crate::noise_protocol::NoiseError;
@@ -29,6 +31,10 @@ use crate::terminal_ux::{ChatContext, ChatMode};
 // MARK: - Debug Logging
 
 pub fn write_noise_debug_log(message: &str) {
+    if !crate::data_structures::file_logging_enabled() {
+        return;
+    }
+
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -43,13 +49,309 @@ pub fn write_noise_debug_log(message: &str) {
     }
 }
 
+fn parse_announcement_nickname(payload: &[u8]) -> Option<String> {
+    let mut offset = 0;
+
+    while offset + 2 <= payload.len() {
+        let field_type = payload[offset];
+        let field_len = payload[offset + 1] as usize;
+        offset += 2;
+
+        if offset + field_len > payload.len() {
+            return None;
+        }
+
+        if field_type == 0x01 {
+            return String::from_utf8(payload[offset..offset + field_len].to_vec()).ok();
+        }
+
+        offset += field_len;
+    }
+
+    None
+}
+
+const MAX_FILE_TRANSFER_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct FileTransferPacket {
+    file_name: Option<String>,
+    file_size: Option<u64>,
+    mime_type: Option<String>,
+    content: Vec<u8>,
+}
+
+fn read_be_len(data: &[u8], offset: &mut usize, bytes: usize) -> Option<usize> {
+    if data.len().checked_sub(*offset)? < bytes {
+        return None;
+    }
+
+    let mut result = 0usize;
+    for _ in 0..bytes {
+        result = (result << 8) | data[*offset] as usize;
+        *offset += 1;
+    }
+    Some(result)
+}
+
+fn decode_file_transfer_payload(data: &[u8]) -> Option<FileTransferPacket> {
+    let mut offset = 0usize;
+    let mut file_name = None;
+    let mut file_size = None;
+    let mut mime_type = None;
+    let mut content = Vec::new();
+
+    while offset < data.len() {
+        let field_type = *data.get(offset)?;
+        offset += 1;
+
+        let length = if field_type == 0x04 {
+            let snapshot = offset;
+            match read_be_len(data, &mut offset, 4) {
+                Some(canonical) if canonical <= data.len().saturating_sub(offset) => canonical,
+                _ => {
+                    offset = snapshot;
+                    read_be_len(data, &mut offset, 2)?
+                }
+            }
+        } else {
+            read_be_len(data, &mut offset, 2)?
+        };
+
+        if length > data.len().saturating_sub(offset) {
+            return None;
+        }
+        let value = &data[offset..offset + length];
+        offset += length;
+
+        match field_type {
+            0x01 => file_name = String::from_utf8(value.to_vec()).ok(),
+            0x02 => {
+                if length == 4 || length == 8 {
+                    let mut size = 0u64;
+                    for byte in value {
+                        size = (size << 8) | u64::from(*byte);
+                    }
+                    file_size = Some(size);
+                }
+            }
+            0x03 => mime_type = String::from_utf8(value.to_vec()).ok(),
+            0x04 => {
+                if content.len().saturating_add(value.len()) > MAX_FILE_TRANSFER_BYTES {
+                    return None;
+                }
+                content.extend_from_slice(value);
+            }
+            _ => {}
+        }
+    }
+
+    if content.is_empty() || content.len() > MAX_FILE_TRANSFER_BYTES {
+        return None;
+    }
+
+    Some(FileTransferPacket {
+        file_name,
+        file_size,
+        mime_type,
+        content,
+    })
+}
+
+fn mime_category(mime: Option<&str>) -> (&'static str, &'static str, &'static str, &'static str) {
+    match mime.unwrap_or("").to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => ("images/incoming", "[image] ", "jpg", "image"),
+        "image/png" => ("images/incoming", "[image] ", "png", "image"),
+        "image/gif" => ("images/incoming", "[image] ", "gif", "image"),
+        "image/webp" => ("images/incoming", "[image] ", "webp", "image"),
+        "audio/mp4" | "audio/m4a" | "audio/aac" => {
+            ("voicenotes/incoming", "[voice] ", "m4a", "audio")
+        }
+        "audio/mpeg" | "audio/mp3" => ("voicenotes/incoming", "[voice] ", "mp3", "audio"),
+        "audio/wav" | "audio/x-wav" => ("voicenotes/incoming", "[voice] ", "wav", "audio"),
+        "audio/ogg" => ("voicenotes/incoming", "[voice] ", "ogg", "audio"),
+        "application/pdf" => ("files/incoming", "[file] ", "pdf", "file"),
+        _ => ("files/incoming", "[file] ", "bin", "file"),
+    }
+}
+
+fn sanitize_file_name(preferred: Option<&str>, default_prefix: &str, extension: &str) -> String {
+    let default_name = format!(
+        "{}_{}",
+        default_prefix,
+        chrono::Local::now().format("%Y%m%d_%H%M%S")
+    );
+    let raw = preferred
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&default_name);
+    let base_name = Path::new(raw)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&default_name);
+
+    let mut cleaned = base_name
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['.', ' '])
+        .to_string();
+
+    if cleaned.is_empty() {
+        cleaned = default_name;
+    }
+
+    if Path::new(&cleaned).extension().is_none() && !extension.is_empty() {
+        cleaned.push('.');
+        cleaned.push_str(extension);
+    }
+
+    cleaned
+}
+
+fn unique_path(directory: &Path, file_name: &str) -> PathBuf {
+    let mut candidate = directory.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let extension = Path::new(file_name).extension().and_then(|e| e.to_str());
+
+    for index in 1..100 {
+        let next_name = match extension {
+            Some(ext) if !ext.is_empty() => format!("{} ({}).{}", stem, index, ext),
+            _ => format!("{} ({})", stem, index),
+        };
+        candidate = directory.join(next_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    directory.join(format!("{}_{}.dat", stem, uuid::Uuid::new_v4()))
+}
+
+fn save_received_file(packet: &FileTransferPacket) -> std::io::Result<(PathBuf, &'static str)> {
+    let (subdir, prefix, extension, default_prefix) = mime_category(packet.mime_type.as_deref());
+    let base_dir = std::env::current_dir()?.join("received_files").join(subdir);
+    fs::create_dir_all(&base_dir)?;
+    let file_name = sanitize_file_name(packet.file_name.as_deref(), default_prefix, extension);
+    let destination = unique_path(&base_dir, &file_name);
+    fs::write(&destination, &packet.content)?;
+    Ok((destination, prefix))
+}
+
+pub async fn handle_file_transfer_packet(
+    packet: &BitchatPacket,
+    peers_lock: &mut HashMap<String, Peer>,
+    bloom: &mut Bloom<String>,
+    my_peer_id: &str,
+    ui_tx: mpsc::Sender<String>,
+) {
+    let is_broadcast = packet
+        .recipient_id
+        .as_ref()
+        .map(|r| r == &BROADCAST_RECIPIENT)
+        .unwrap_or(true);
+    let is_for_us = if is_broadcast {
+        true
+    } else {
+        packet
+            .recipient_id_str
+            .as_ref()
+            .map(|r| r == my_peer_id)
+            .unwrap_or(false)
+    };
+    if !is_for_us {
+        return;
+    }
+
+    let dedup_id = format!(
+        "file-{}-{}-{}",
+        packet.sender_id_str,
+        packet.timestamp,
+        hex::encode(packet.signature.as_deref().unwrap_or(&[]))
+    );
+    if bloom.check(&dedup_id) {
+        return;
+    }
+    bloom.set(&dedup_id);
+
+    let Some(file_packet) = decode_file_transfer_payload(&packet.payload) else {
+        let _ = ui_tx
+            .send("[!] Failed to decode incoming file transfer\n".to_string())
+            .await;
+        return;
+    };
+
+    if let Some(file_size) = file_packet.file_size {
+        if file_size > MAX_FILE_TRANSFER_BYTES as u64
+            || file_size != file_packet.content.len() as u64
+        {
+            let _ = ui_tx
+                .send("[!] Rejected incoming file transfer with invalid size\n".to_string())
+                .await;
+            return;
+        }
+    }
+
+    let (destination, prefix) = match save_received_file(&file_packet) {
+        Ok(saved) => saved,
+        Err(e) => {
+            let _ = ui_tx
+                .send(format!("[!] Failed to save incoming file: {}\n", e))
+                .await;
+            return;
+        }
+    };
+
+    let sender_nick = peers_lock
+        .get(&packet.sender_id_str)
+        .and_then(|peer| peer.nickname.clone())
+        .unwrap_or_else(|| {
+            let short = packet.sender_id_str.chars().take(4).collect::<String>();
+            format!("anon{}", short)
+        });
+
+    let content = format!("{}{}", prefix, destination.to_string_lossy());
+    let timestamp = chrono::Local::now();
+    let structured_msg = if !is_broadcast {
+        format!(
+            "__DM__:{}:{}:{}",
+            sender_nick,
+            timestamp.format("%H%M"),
+            content
+        )
+    } else {
+        format!(
+            "__CHANNEL__:#public:{}:{}:{}",
+            sender_nick,
+            timestamp.format("%H%M"),
+            content
+        )
+    };
+
+    let _ = ui_tx.send(structured_msg).await;
+}
+
 // Handler for announce messages
 pub async fn handle_announce_message(
     packet: &BitchatPacket,
     peers_lock: &mut HashMap<String, Peer>,
     ui_tx: mpsc::Sender<String>,
 ) {
-    let peer_nickname = String::from_utf8_lossy(&packet.payload).trim().to_string();
+    let peer_nickname = parse_announcement_nickname(&packet.payload)
+        .unwrap_or_else(|| String::from_utf8_lossy(&packet.payload).trim().to_string());
 
     let is_new_peer = !peers_lock.contains_key(&packet.sender_id_str);
     let peer_entry = peers_lock.entry(packet.sender_id_str.clone()).or_default();
@@ -486,6 +788,56 @@ pub async fn handle_message_packet(
             }
         }
     } else {
+        if !is_private_message {
+            if let Ok(content) = String::from_utf8(packet.payload.clone()) {
+                if content.starts_with(COVER_TRAFFIC_PREFIX) {
+                    return;
+                }
+
+                let message_id = format!(
+                    "{}-{}-{}",
+                    packet.sender_id_str, packet.timestamp, packet.msg_type as u8
+                );
+                if !bloom.check(&message_id) {
+                    bloom.set(&message_id);
+
+                    let sender_nick = peers_lock
+                        .get(&packet.sender_id_str)
+                        .and_then(|peer| peer.nickname.clone())
+                        .unwrap_or_else(|| {
+                            let short = packet.sender_id_str.chars().take(4).collect::<String>();
+                            format!("anon{}", short)
+                        });
+
+                    let timestamp = chrono::Local::now();
+                    let structured_msg = format!(
+                        "__CHANNEL__:#public:{}:{}:{}",
+                        sender_nick,
+                        timestamp.format("%H%M"),
+                        content
+                    );
+                    let _ = ui_tx.send(structured_msg).await;
+                }
+
+                if packet.ttl > 1 {
+                    time::sleep(Duration::from_millis(rand::thread_rng().gen_range(10..50))).await;
+                    let mut relay_data = notification_value.to_vec();
+                    relay_data[2] = packet.ttl - 1;
+                    if peripheral
+                        .write(cmd_char, &relay_data, WriteType::WithoutResponse)
+                        .await
+                        .is_err()
+                    {
+                        let _ = ui_tx
+                            .send("[!] Failed to relay message\n".to_string())
+                            .await;
+                    }
+                }
+
+                return;
+            }
+        }
+
         let _ = ui_tx
             .send("[!] Failed to parse message payload\n".to_string())
             .await;
@@ -510,6 +862,8 @@ pub async fn handle_fragment_packet(
     blocked_peers: &HashSet<String>,
     ui_tx: mpsc::Sender<String>,
 ) {
+    let mut should_relay_fragment = true;
+
     if packet.payload.len() >= 13 {
         let mut fragment_id = [0u8; 8];
         fragment_id.copy_from_slice(&packet.payload[0..8]);
@@ -517,6 +871,14 @@ pub async fn handle_fragment_packet(
         let total = ((packet.payload[10] as u16) << 8) | (packet.payload[11] as u16);
         let original_type = packet.payload[12];
         let fragment_data = packet.payload[13..].to_vec();
+
+        if total == 0 || total > 10000 || index >= total {
+            return;
+        }
+
+        if original_type == MessageType::FileTransfer as u8 {
+            should_relay_fragment = false;
+        }
 
         if let Some((complete_data, _)) = fragment_collector.add_fragment(
             fragment_id,
@@ -527,7 +889,16 @@ pub async fn handle_fragment_packet(
             packet.sender_id_str.clone(),
         ) {
             if let Ok(reassembled) = parse_bitchat_packet(&complete_data) {
-                if reassembled.msg_type == MessageType::Message {
+                if reassembled.msg_type == MessageType::FileTransfer {
+                    handle_file_transfer_packet(
+                        &reassembled,
+                        peers_lock,
+                        bloom,
+                        my_peer_id,
+                        ui_tx.clone(),
+                    )
+                    .await;
+                } else if reassembled.msg_type == MessageType::Message {
                     if let Some(fp) =
                         encryption_service.get_peer_fingerprint(&reassembled.sender_id_str)
                     {
@@ -628,13 +999,50 @@ pub async fn handle_fragment_packet(
                                 ));
                             }
                         }
+                    } else if !is_private_message {
+                        if let Ok(content) = String::from_utf8(reassembled.payload.clone()) {
+                            if content.starts_with(COVER_TRAFFIC_PREFIX) {
+                                return;
+                            }
+
+                            let message_id = format!(
+                                "{}-{}-{}",
+                                reassembled.sender_id_str,
+                                reassembled.timestamp,
+                                reassembled.msg_type as u8
+                            );
+                            if !bloom.check(&message_id) {
+                                bloom.set(&message_id);
+
+                                let sender_nick = peers_lock
+                                    .get(&reassembled.sender_id_str)
+                                    .and_then(|peer| peer.nickname.clone())
+                                    .unwrap_or_else(|| {
+                                        let short = reassembled
+                                            .sender_id_str
+                                            .chars()
+                                            .take(4)
+                                            .collect::<String>();
+                                        format!("anon{}", short)
+                                    });
+
+                                let timestamp = chrono::Local::now();
+                                let structured_msg = format!(
+                                    "__CHANNEL__:#public:{}:{}:{}",
+                                    sender_nick,
+                                    timestamp.format("%H%M"),
+                                    content
+                                );
+                                let _ = ui_tx.send(structured_msg).await;
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    if packet.ttl > 1 {
+    if should_relay_fragment && packet.ttl > 1 {
         time::sleep(Duration::from_millis(rand::thread_rng().gen_range(10..50))).await;
         let mut relay_data = notification_value.to_vec();
         relay_data[2] = packet.ttl - 1;
@@ -1431,39 +1839,65 @@ pub async fn handle_noise_encrypted_message(
     blocked_peers: &HashSet<String>,
     ui_tx: mpsc::Sender<String>,
 ) {
-    write_noise_debug_log(&format!("[DEBUG] Starting handle_noise_encrypted_message for peer: {}", packet.sender_id_str));
-    write_noise_debug_log(&format!("[DEBUG] Packet payload length: {}", packet.payload.len()));
-    write_noise_debug_log(&format!("[DEBUG] Packet first 16 bytes: {:?}", &packet.payload[..std::cmp::min(16, packet.payload.len())]));
+    write_noise_debug_log(&format!(
+        "[DEBUG] Starting handle_noise_encrypted_message for peer: {}",
+        packet.sender_id_str
+    ));
+    write_noise_debug_log(&format!(
+        "[DEBUG] Packet payload length: {}",
+        packet.payload.len()
+    ));
+    write_noise_debug_log(&format!(
+        "[DEBUG] Packet first 16 bytes: {:?}",
+        &packet.payload[..std::cmp::min(16, packet.payload.len())]
+    ));
 
     // Check if we have an established session
     if !noise_manager.is_session_ready(&packet.sender_id_str) {
-        write_noise_debug_log(&format!("[DEBUG] No established session for peer: {}", packet.sender_id_str));
+        write_noise_debug_log(&format!(
+            "[DEBUG] No established session for peer: {}",
+            packet.sender_id_str
+        ));
         return;
     }
 
-    write_noise_debug_log(&format!("[DEBUG] Checking if session is established for peer: {}", packet.sender_id_str));
-    write_noise_debug_log(&format!("[DEBUG] Session is established, about to decrypt message, payload length: {}", packet.payload.len()));
+    write_noise_debug_log(&format!(
+        "[DEBUG] Checking if session is established for peer: {}",
+        packet.sender_id_str
+    ));
+    write_noise_debug_log(&format!(
+        "[DEBUG] Session is established, about to decrypt message, payload length: {}",
+        packet.payload.len()
+    ));
 
     // Decrypt the message using Noise
     match noise_manager.decrypt_message(&packet.sender_id_str, &packet.payload) {
         Ok(decrypted_data) => {
-            write_noise_debug_log(&format!("[DEBUG] Successfully decrypted message, length: {}", decrypted_data.len()));
-            
+            write_noise_debug_log(&format!(
+                "[DEBUG] Successfully decrypted message, length: {}",
+                decrypted_data.len()
+            ));
+
             // FIXED: Parse the decrypted data as a BitchatPacket
             write_noise_debug_log("[DEBUG] About to parse decrypted message as BitchatPacket");
             match crate::packet_parser::parse_bitchat_packet(&decrypted_data) {
                 Ok(inner_packet) => {
-                    write_noise_debug_log(&format!("[DEBUG] Successfully parsed inner packet: {:?}", inner_packet.msg_type));
-                    
+                    write_noise_debug_log(&format!(
+                        "[DEBUG] Successfully parsed inner packet: {:?}",
+                        inner_packet.msg_type
+                    ));
+
                     // FIXED: Process the inner packet based on its type
                     match inner_packet.msg_type {
                         crate::data_structures::MessageType::Message => {
                             // FIXED: Parse the inner packet's payload as a BitchatMessage
                             write_noise_debug_log("[DEBUG] About to parse inner message payload");
-                            match crate::payload_handling::parse_bitchat_message_payload(&inner_packet.payload) {
+                            match crate::payload_handling::parse_bitchat_message_payload(
+                                &inner_packet.payload,
+                            ) {
                                 Ok(message) => {
                                     write_noise_debug_log(&format!("[DEBUG] Successfully parsed inner message: sender={}, content={}", message.sender, message.content));
-                                    
+
                                     // Process the message normally (same logic as regular message handling)
                                     handle_decrypted_message(
                                         &inner_packet,
@@ -1482,28 +1916,38 @@ pub async fn handle_noise_encrypted_message(
                                         my_peer_id,
                                         blocked_peers,
                                         ui_tx.clone(),
-                                    ).await;
-                                },
+                                    )
+                                    .await;
+                                }
                                 Err(e) => {
-                                    write_noise_debug_log(&format!("[DEBUG] Failed to parse inner message payload: {:?}", e));
+                                    write_noise_debug_log(&format!(
+                                        "[DEBUG] Failed to parse inner message payload: {:?}",
+                                        e
+                                    ));
                                 }
                             }
-                        },
+                        }
                         _ => {
-                            write_noise_debug_log(&format!("[DEBUG] Unexpected inner packet type: {:?}", inner_packet.msg_type));
+                            write_noise_debug_log(&format!(
+                                "[DEBUG] Unexpected inner packet type: {:?}",
+                                inner_packet.msg_type
+                            ));
                         }
                     }
-                },
+                }
                 Err(e) => {
-                    write_noise_debug_log(&format!("[DEBUG] Failed to parse decrypted data as BitchatPacket: {:?}", e));
+                    write_noise_debug_log(&format!(
+                        "[DEBUG] Failed to parse decrypted data as BitchatPacket: {:?}",
+                        e
+                    ));
                 }
             }
-        },
+        }
         Err(e) => {
             write_noise_debug_log(&format!("[DEBUG] Failed to decrypt message: {:?}", e));
         }
     }
-    
+
     write_noise_debug_log("[DEBUG] Completed handle_noise_encrypted_message");
 }
 
@@ -1531,7 +1975,9 @@ async fn handle_decrypted_message(
 
         // Add the sender to peers list if not already there
         if !peers_lock.contains_key(&inner_packet.sender_id_str) {
-            let peer_entry = peers_lock.entry(inner_packet.sender_id_str.clone()).or_default();
+            let peer_entry = peers_lock
+                .entry(inner_packet.sender_id_str.clone())
+                .or_default();
             peer_entry.nickname = Some(message.sender.clone());
             let _ = ui_tx.send(format!("{} connected\n", message.sender)).await;
         }
@@ -1569,9 +2015,10 @@ async fn handle_decrypted_message(
         };
 
         let timestamp = chrono::Local::now();
-        
+
         // This is a private message since it was Noise-encrypted
-        chat_context.last_private_sender = Some((inner_packet.sender_id_str.clone(), message.sender.clone()));
+        chat_context.last_private_sender =
+            Some((inner_packet.sender_id_str.clone(), message.sender.clone()));
         chat_context.add_dm(&message.sender, &inner_packet.sender_id_str);
 
         // Send structured message for TUI
@@ -1592,38 +2039,61 @@ pub async fn handle_noise_identity_announce(
     noise_manager: &mut NoiseSessionManager,
     ui_tx: mpsc::Sender<String>,
 ) {
-    write_noise_debug_log(&format!("[DEBUG] Starting handle_noise_identity_announce for peer: {}", packet.sender_id_str));
-    
+    write_noise_debug_log(&format!(
+        "[DEBUG] Starting handle_noise_identity_announce for peer: {}",
+        packet.sender_id_str
+    ));
+
     // Parse the identity announce payload
-    if packet.payload.len() >= 72 { // 32 bytes static key + 32 bytes identity hash + 8 bytes nickname length prefix
+    if packet.payload.len() >= 72 {
+        // 32 bytes static key + 32 bytes identity hash + 8 bytes nickname length prefix
         let static_key_bytes = &packet.payload[0..32];
         let identity_hash = &packet.payload[32..64];
         let nickname_data = &packet.payload[64..];
-        
+
         if let Ok(nickname) = String::from_utf8(nickname_data.to_vec()) {
             let nickname = nickname.trim_end_matches('\0'); // Remove null padding
-            
-            write_noise_debug_log(&format!("[DEBUG] Parsed identity announce - nickname: {}, static key: {:?}", nickname, &static_key_bytes[..8]));
-            
+
+            write_noise_debug_log(&format!(
+                "[DEBUG] Parsed identity announce - nickname: {}, static key: {:?}",
+                nickname,
+                &static_key_bytes[..8]
+            ));
+
             // Update peer info
             let peer_entry = peers_lock.entry(packet.sender_id_str.clone()).or_default();
             peer_entry.nickname = Some(nickname.to_string());
-            
+
             // Store the static key for potential future handshakes
-            if let Err(e) = noise_manager.store_peer_static_key(&packet.sender_id_str, static_key_bytes) {
+            if let Err(e) =
+                noise_manager.store_peer_static_key(&packet.sender_id_str, static_key_bytes)
+            {
                 write_noise_debug_log(&format!("[DEBUG] Failed to store peer static key: {:?}", e));
             } else {
-                write_noise_debug_log(&format!("[DEBUG] Stored static key for peer: {}", packet.sender_id_str));
+                write_noise_debug_log(&format!(
+                    "[DEBUG] Stored static key for peer: {}",
+                    packet.sender_id_str
+                ));
             }
-            
-            let _ = ui_tx.send(format!("[IDENTITY] Peer {} announced identity with nickname: {}\n", packet.sender_id_str, nickname)).await;
+
+            let _ = ui_tx
+                .send(format!(
+                    "[IDENTITY] Peer {} announced identity with nickname: {}\n",
+                    packet.sender_id_str, nickname
+                ))
+                .await;
         } else {
-            write_noise_debug_log(&format!("[DEBUG] Failed to parse nickname from identity announce payload"));
+            write_noise_debug_log(&format!(
+                "[DEBUG] Failed to parse nickname from identity announce payload"
+            ));
         }
     } else {
-        write_noise_debug_log(&format!("[DEBUG] Identity announce payload too short: {} bytes", packet.payload.len()));
+        write_noise_debug_log(&format!(
+            "[DEBUG] Identity announce payload too short: {} bytes",
+            packet.payload.len()
+        ));
     }
-    
+
     write_noise_debug_log("[DEBUG] Completed handle_noise_identity_announce");
 }
 
