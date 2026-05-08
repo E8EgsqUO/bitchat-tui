@@ -18,6 +18,15 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
+fn persistent_channels(chat_context: &ChatContext) -> Vec<String> {
+    chat_context
+        .active_channels
+        .iter()
+        .filter(|channel| !crate::nostr_geo::is_geohash_channel(channel))
+        .cloned()
+        .collect()
+}
+
 pub async fn handle_name_command(
     line: &str,
     nickname: &mut String,
@@ -54,7 +63,7 @@ pub async fn handle_name_command(
         } else {
             *nickname = new_name.to_string();
             // Don't send announcement or message here - let the main loop handle everything via the pending_nickname_update signal
-            let channels_vec: Vec<String> = chat_context.active_channels.iter().cloned().collect();
+            let channels_vec = persistent_channels(chat_context);
             let state_to_save = create_app_state(
                 blocked_peers,
                 channel_creators,
@@ -136,8 +145,7 @@ pub async fn handle_join_command(
                             .encrypted_channel_passwords
                             .insert(channel_name.clone(), encrypted);
                         // FIX: Convert HashSet to Vec before saving state
-                        let channels_vec: Vec<String> =
-                            chat_context.active_channels.iter().cloned().collect();
+                        let channels_vec = persistent_channels(chat_context);
                         let state_to_save = create_app_state(
                             blocked_peers,
                             channel_creators,
@@ -236,7 +244,7 @@ pub async fn handle_exit_command(
     app: &mut crate::tui::app::App,
 ) -> bool {
     if line == "/exit" {
-        let channels_vec: Vec<String> = chat_context.active_channels.iter().cloned().collect();
+        let channels_vec = persistent_channels(chat_context);
         let state_to_save = create_app_state(
             blocked_peers,
             channel_creators,
@@ -683,8 +691,7 @@ pub async fn handle_block_command(
             if let Some(peer_id) = peer_id_to_block {
                 if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&peer_id) {
                     blocked_peers.insert(fingerprint);
-                    let channels_vec: Vec<String> =
-                        chat_context.active_channels.iter().cloned().collect();
+                    let channels_vec = persistent_channels(chat_context);
                     let state_to_save = create_app_state(
                         blocked_peers,
                         channel_creators,
@@ -780,8 +787,7 @@ pub async fn handle_unblock_command(
         if let Some(peer_id) = peer_id_to_unblock {
             if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&peer_id) {
                 if blocked_peers.remove(&fingerprint) {
-                    let channels_vec: Vec<String> =
-                        chat_context.active_channels.iter().cloned().collect();
+                    let channels_vec = persistent_channels(chat_context);
                     let state_to_save = create_app_state(
                         blocked_peers,
                         channel_creators,

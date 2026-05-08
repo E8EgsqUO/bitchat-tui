@@ -152,10 +152,18 @@ fn get_help_text(app: &App) -> Vec<Span> {
             ));
         }
         crate::tui::app::TuiPhase::Connected => {
-            if app.connected {
-                spans.push(Span::raw(" • "));
-                spans.push(Span::styled("Connected", Style::default().fg(Color::Green)));
-            }
+            spans.push(Span::raw(" • "));
+            let status_style = if app.connected {
+                Style::default().fg(Color::Green)
+            } else if app.mesh_status == "Scanning" {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Red)
+            };
+            spans.push(Span::styled(
+                format!("Mesh: {}", app.mesh_status),
+                status_style,
+            ));
         }
         crate::tui::app::TuiPhase::Error(_) => {
             spans.push(Span::raw(" • "));

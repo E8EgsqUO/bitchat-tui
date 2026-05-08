@@ -19,7 +19,7 @@ pub fn sidebar_visible_items(app: &App) -> Vec<(usize, Option<usize>)> {
             let count = match section {
                 0 => 1, // Public: always 1 item
                 1 => app.channels.len(),
-                2 => app.people.len(),
+                2 => app.visible_people_count(),
                 3 => app.blocked.len(),
                 4 => 2, // Settings: Nickname, Network
                 _ => 0,
@@ -41,6 +41,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let mut flat_idx = 0;
 
     for (i, section_title) in section_titles.iter().enumerate() {
+        let section_label = if i == 2 && app.current_people_are_geohash() {
+            "People (seen)"
+        } else {
+            *section_title
+        };
         let is_selected = app.sidebar_flat_selected == flat_idx;
         let mut style = if is_selected && app.focus_area == FocusArea::Sidebar {
             Style::default().bg(Color::Blue).fg(Color::White)
@@ -64,7 +69,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
         let section_line = Line::from(vec![
             Span::styled(
-                format!("{} {}", icons[i], section_title),
+                format!("{} {}", icons[i], section_label),
                 Style::default().bold(),
             ),
             unread_indicator,
@@ -74,9 +79,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         flat_idx += 1;
 
         if app.sidebar_state.expanded[i] {
-            let list: Vec<(&str, Color, bool)> = match i {
+            let list: Vec<(String, Color, bool)> = match i {
                 0 => vec![(
-                    &"Public Chat",
+                    "Public Chat".to_string(),
                     Color::Yellow,
                     app.sidebar_state.public_selected.unwrap_or(false),
                 )], // Public section
@@ -86,19 +91,19 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     .enumerate()
                     .map(|(idx, s)| {
                         (
-                            s.as_str(),
+                            s.clone(),
                             Color::Cyan,
                             app.sidebar_state.channel_selected == Some(idx),
                         )
                     })
                     .collect(),
                 2 => app
-                    .people
+                    .visible_people()
                     .iter()
                     .enumerate()
                     .map(|(idx, s)| {
                         (
-                            s.as_str(),
+                            s.clone(),
                             Color::Green,
                             app.sidebar_state.people_selected == Some(idx),
                         )
@@ -107,7 +112,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 3 => app
                     .blocked
                     .iter()
-                    .map(|s| (s.as_str(), Color::Red, false))
+                    .map(|s| (s.clone(), Color::Red, false))
                     .collect(),
                 _ => vec![],
             };
@@ -118,8 +123,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 // Add unread count for individual items
                 let unread_count = match i {
                     0 => app.get_unread_count("#public"), // Public
-                    1 => app.get_unread_count(item_str),  // Channels
-                    2 => app.get_unread_count(&format!("dm:{}", item_str)), // People (DMs)
+                    1 => app.get_unread_count(&item_str), // Channels
+                    2 => {
+                        if app.current_people_are_geohash() {
+                            0
+                        } else {
+                            app.get_unread_count(&format!("dm:{}", item_str))
+                        }
+                    }
                     _ => 0,
                 };
 
@@ -138,18 +149,18 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 if is_selected && app.focus_area == FocusArea::Sidebar {
                     // Cursor selection: blue background, white text
                     spans.push(Span::styled(
-                        item_str,
+                        item_str.clone(),
                         Style::default().bg(Color::Blue).fg(Color::White),
                     ));
                 } else if is_active_conv {
                     // Active conversation: green background, white text (only for the item text)
                     spans.push(Span::styled(
-                        item_str,
+                        item_str.clone(),
                         Style::default().bg(Color::Green).fg(Color::White),
                     ));
                 } else {
                     // Normal item: colored text
-                    spans.push(Span::styled(item_str, Style::default().fg(color)));
+                    spans.push(Span::styled(item_str.clone(), Style::default().fg(color)));
                 }
 
                 spans.push(unread_indicator);
@@ -181,15 +192,13 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 };
                 items.push(ListItem::new(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled("Status: ", style),
+                    Span::styled("Mesh: ", style),
                     Span::styled(
-                        if app.connected {
-                            "Connected"
-                        } else {
-                            "Offline"
-                        },
+                        app.mesh_status.as_str(),
                         if app.connected {
                             Style::default().fg(Color::Green)
+                        } else if app.mesh_status == "Scanning" {
+                            Style::default().fg(Color::Yellow)
                         } else {
                             Style::default().fg(Color::Red)
                         },

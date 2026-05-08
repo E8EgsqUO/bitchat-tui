@@ -62,9 +62,6 @@ fn handle_sidebar_events(app: &mut App, key_event: KeyEvent) {
         KeyCode::Enter => {
             if let Some(&(section_idx, child_opt)) = visible_items.get(app.sidebar_flat_selected) {
                 if let Some(child_idx) = child_opt {
-                    app.sidebar_state.people_selected = None;
-                    app.sidebar_state.channel_selected = None;
-                    app.sidebar_state.public_selected = None;
                     match section_idx {
                         0 => {
                             app.sidebar_state.public_selected = Some(true);
@@ -76,7 +73,9 @@ fn handle_sidebar_events(app: &mut App, key_event: KeyEvent) {
                             }
                         }
                         2 => {
-                            if let Some(person_name) = app.people.get(child_idx) {
+                            if app.current_people_are_geohash() {
+                                app.add_log_message("system: Nostr geohash People shows participants seen in this channel. Direct messages over Nostr are not supported yet.".to_string());
+                            } else if let Some(person_name) = app.visible_person_at(child_idx) {
                                 app.switch_to_dm(person_name.clone());
                             }
                         }

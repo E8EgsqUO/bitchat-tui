@@ -13,7 +13,7 @@ mod tui;
 use crossterm::event as crossterm_event;
 use crossterm::event::Event as CrosstermEvent;
 use std::time::Duration as StdDuration;
-use tui::app::{App, TuiPhase};
+use tui::app::App;
 use tui::event;
 use tui::tui as tui_mod;
 use tui::ui;
@@ -220,24 +220,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut _characteristics = None;
     let mut cmd_char = None;
     let mut post_connect_initialized = false;
-    let mut my_peer_id = String::new();
-    let mut app_state: Option<persistence::AppState> = None;
-    let mut nickname = String::new();
-    let mut encryption_service = None;
-    let mut peers: Option<Arc<Mutex<HashMap<String, Peer>>>> = None;
-    let mut bloom: Option<Bloom<String>> = None;
-    let mut fragment_collector: Option<FragmentCollector> = None;
-    let mut delivery_tracker: Option<DeliveryTracker> = None;
-    let mut chat_context: Option<ChatContext> = None;
-    let mut channel_keys: Option<HashMap<String, [u8; 32]>> = None;
+    let encryption = Arc::new(EncryptionService::new());
+    let my_peer_id = encryption.derive_peer_id();
+    let mut app_state: Option<persistence::AppState> = Some(saved_state.clone());
+    let mut nickname = saved_nickname_clone.clone();
+    let mut encryption_service = Some(encryption);
+    let peers: Option<Arc<Mutex<HashMap<String, Peer>>>> =
+        Some(Arc::new(Mutex::new(HashMap::new())));
+    let mut bloom: Option<Bloom<String>> = Some(Bloom::new_for_fp_rate(500, 0.01));
+    let mut fragment_collector: Option<FragmentCollector> = Some(FragmentCollector::new());
+    let mut delivery_tracker: Option<DeliveryTracker> = Some(DeliveryTracker::new());
+    let mut chat_context: Option<ChatContext> = Some(ChatContext::new());
+    let mut channel_keys: Option<HashMap<String, [u8; 32]>> = Some(HashMap::new());
     let mut _chat_messages: Option<HashMap<String, Vec<String>>> = None;
-    let mut blocked_peers: Option<HashSet<String>> = None;
-    let mut channel_creators: Option<HashMap<String, String>> = None;
-    let mut password_protected_channels: Option<HashSet<String>> = None;
-    let mut channel_key_commitments: Option<HashMap<String, String>> = None;
-    let mut discovered_channels: Option<HashSet<String>> = None;
-    let mut _favorites: Option<HashSet<String>> = None;
-    let mut _identity_key: Option<Vec<u8>> = None;
+    let mut blocked_peers: Option<HashSet<String>> = Some(saved_state.blocked_peers.clone());
+    let mut channel_creators: Option<HashMap<String, String>> =
+        Some(saved_state.channel_creators.clone());
+    let mut password_protected_channels: Option<HashSet<String>> =
+        Some(saved_state.password_protected_channels.clone());
+    let mut channel_key_commitments: Option<HashMap<String, String>> =
+        Some(saved_state.channel_key_commitments.clone());
+    let mut discovered_channels: Option<HashSet<String>> = Some(HashSet::new());
+    let mut _favorites: Option<HashSet<String>> = Some(saved_state.favorites.clone());
+    let mut _identity_key: Option<Vec<u8>> = saved_state.identity_key.clone();
     let mut create_app_state: Option<
         Box<
             dyn Fn(
@@ -255,6 +260,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     > = None;
     let mut noise_session_manager: Option<NoiseSessionManager> = None;
 
+    if let Some(state) = app_state.as_mut() {
+        let original_len = state.joined_channels.len();
+        state.joined_channels.retain(|raw_channel| {
+            let trimmed = raw_channel.trim();
+            let channel = if trimmed.starts_with('#') {
+                trimmed.to_string()
+            } else {
+                format!("#{}", trimmed)
+            };
+            !nostr_geo::is_geohash_channel(&channel)
+        });
+        if state.joined_channels.len() != original_len {
+            let _ = save_state(state);
+        }
+    }
+
+    for raw_channel in &saved_state.joined_channels {
+        let trimmed = raw_channel.trim();
+        if trimmed.is_empty() || trimmed == "#public" {
+            continue;
+        }
+
+        let channel = if trimmed.starts_with('#') {
+            trimmed.to_string()
+        } else {
+            format!("#{}", trimmed)
+        };
+
+        if nostr_geo::is_geohash_channel(&channel) {
+            continue;
+        }
+
+        if !app.channels.contains(&channel) {
+            app.channels.push(channel.clone());
+        }
+        app.channel_messages.entry(channel.clone()).or_default();
+        discovered_channels
+            .as_mut()
+            .unwrap()
+            .insert(channel.clone());
+        chat_context.as_mut().unwrap().add_channel(&channel);
+    }
+
     let mut last_tick = std::time::Instant::now();
     let tick_rate = StdDuration::from_millis(100);
     'mainloop: loop {
@@ -270,7 +318,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else if msg.starts_with("__ERROR__") {
                 let err = msg.trim_start_matches("__ERROR__").to_string();
-                app.transition_to_error(err);
+                app.connected = false;
+                app.mesh_status = "Offline".to_string();
+                app.add_log_message(format!(
+                    "system: Bluetooth mesh unavailable: {}. Nostr geohash channels remain available, for example /j #ws.",
+                    err
+                ));
             } else if matches!(app.phase, tui::app::TuiPhase::Connecting) {
                 app.add_popup_message(msg);
             } else {
@@ -293,13 +346,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 notification_stream = Some(peripheral.notifications().await.unwrap());
                 _characteristics = Some(chars);
                 cmd_char = Some(cmd);
-                // All the rest of the state initialization from the old main goes here
-                // ...
-                // Generate identity and derive the routing peer ID from the announced Noise key.
-                app_state = Some(saved_state.clone());
-                nickname = saved_nickname_clone.clone();
-                let encryption = Arc::new(EncryptionService::new());
-                my_peer_id = encryption.derive_peer_id();
+                // Announce the existing mesh identity once Bluetooth is available.
+                let encryption = encryption_service.as_ref().unwrap();
                 let announce_payload = create_announcement_payload(
                     &nickname,
                     &encryption.get_static_public_key_data(),
@@ -322,7 +370,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(announce_signature),
                     announce_timestamp,
                 );
-                encryption_service = Some(encryption);
                 let announce_write_type = if cfg!(target_os = "windows") {
                     WriteType::WithResponse
                 } else {
@@ -335,30 +382,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         announce_write_type,
                     )
                     .await;
-                // ... (rest of state initialization as before)
-                // Set up all the state variables as in the old main
-                peers = Some(Arc::new(Mutex::new(HashMap::new())));
-                bloom = Some(Bloom::new_for_fp_rate(500, 0.01));
-                fragment_collector = Some(FragmentCollector::new());
-                delivery_tracker = Some(DeliveryTracker::new());
-                chat_context = Some(ChatContext::new());
-                channel_keys = Some(HashMap::new());
                 _chat_messages = Some(HashMap::new());
-                blocked_peers = Some(app_state.as_ref().unwrap().blocked_peers.clone());
-                channel_creators = Some(app_state.as_ref().unwrap().channel_creators.clone());
-                password_protected_channels = Some(
-                    app_state
-                        .as_ref()
-                        .unwrap()
-                        .password_protected_channels
-                        .clone(),
-                );
-                channel_key_commitments =
-                    Some(app_state.as_ref().unwrap().channel_key_commitments.clone());
-                discovered_channels = Some(HashSet::new());
-                _favorites = Some(app_state.as_ref().unwrap().favorites.clone());
-                _identity_key = app_state.as_ref().unwrap().identity_key.clone();
-                // ...
                 // Set up the create_app_state closure
                 let favs = _favorites.clone();
                 let id_key = _identity_key.clone();
@@ -848,8 +872,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app_state.as_ref(),
                 create_app_state.as_ref(),
             ) {
-                let channels_vec: Vec<String> =
-                    chat_context.active_channels.iter().cloned().collect();
+                let channels_vec: Vec<String> = chat_context
+                    .active_channels
+                    .iter()
+                    .filter(|channel| !nostr_geo::is_geohash_channel(channel))
+                    .cloned()
+                    .collect();
                 let state_to_save = create_app_state(
                     blocked_peers,
                     channel_creators,
@@ -887,32 +915,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if app.pending_connection_retry {
             app.pending_connection_retry = false;
 
-            // Reset all connection-related state
+            // Reset only Bluetooth connection state; Nostr/UI chat state remains usable.
             peripheral = None;
             notification_stream = None;
             _characteristics = None;
             cmd_char = None;
             post_connect_initialized = false;
-            my_peer_id = String::new();
-            app_state = None;
-            nickname = String::new();
-            encryption_service = None;
-            peers = None;
-            bloom = None;
-            fragment_collector = None;
-            delivery_tracker = None;
-            chat_context = None;
-            channel_keys = None;
-            _chat_messages = None;
-            blocked_peers = None;
-            channel_creators = None;
-            password_protected_channels = None;
-            channel_key_commitments = None;
-            discovered_channels = None;
-            _favorites = None;
-            _identity_key = None;
-            create_app_state = None;
             noise_session_manager = None;
+
+            if let Some(handle) = bt_handle.take() {
+                handle.abort();
+            }
 
             // Spawn new Bluetooth connection setup
             let ui_tx_clone = ui_tx.clone();
@@ -935,13 +948,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ui_tx = ui_tx.clone();
             // Handle /exit immediately to avoid panics during connecting phase
             if line.trim() == "/exit" {
+                if let (
+                    Some(chat_context),
+                    Some(blocked_peers),
+                    Some(channel_creators),
+                    Some(password_protected_channels),
+                    Some(channel_key_commitments),
+                    Some(app_state),
+                    Some(create_app_state),
+                ) = (
+                    chat_context.as_ref(),
+                    blocked_peers.as_ref(),
+                    channel_creators.as_ref(),
+                    password_protected_channels.as_ref(),
+                    channel_key_commitments.as_ref(),
+                    app_state.as_ref(),
+                    create_app_state.as_ref(),
+                ) {
+                    let channels_vec: Vec<String> = chat_context
+                        .active_channels
+                        .iter()
+                        .filter(|channel| !nostr_geo::is_geohash_channel(channel))
+                        .cloned()
+                        .collect();
+                    let state_to_save = create_app_state(
+                        blocked_peers,
+                        channel_creators,
+                        &channels_vec,
+                        password_protected_channels,
+                        channel_key_commitments,
+                        &app_state.encrypted_channel_passwords,
+                        &nickname,
+                    );
+                    if let Err(e) = save_state(&state_to_save) {
+                        app.add_log_message(format!(
+                            "system: Warning: Could not save state: {}",
+                            e
+                        ));
+                    }
+                }
                 app.should_quit = true;
                 break 'mainloop;
-            }
-            // Check if we're in connecting phase (popup is shown) and show wait message for any command
-            if matches!(app.phase, TuiPhase::Connecting) && line.starts_with("/") {
-                app.add_log_message("system: Please wait for Bluetooth connection to be established before using commands.".to_string());
-                continue;
             }
             if line == "/help" {
                 let help_text = terminal_ux::get_help_text();
@@ -955,33 +1002,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            // Check if we're connected before handling commands that require connection
-            if !app.connected && !line.starts_with("/help") && !line.starts_with("/exit") {
-                app.add_log_message("system: Please wait for Bluetooth connection to be established before using commands.".to_string());
-                continue;
-            }
-
-            if handle_name_command(
-                &line,
-                &mut nickname,
-                &my_peer_id,
-                peripheral.as_ref().unwrap(),
-                cmd_char.as_ref().unwrap(),
-                blocked_peers.as_ref().unwrap(),
-                channel_creators.as_ref().unwrap(),
-                chat_context.as_mut().unwrap(),
-                password_protected_channels.as_ref().unwrap(),
-                channel_key_commitments.as_ref().unwrap(),
-                app_state.as_ref().unwrap(),
-                create_app_state.as_ref().unwrap().as_ref(),
-                ui_tx.clone(),
-            )
-            .await
-            {
-                // Set the pending nickname update signal to trigger TUI update
-                app.pending_nickname_update = Some(nickname.clone());
-                continue;
-            }
             if line.starts_with("/j ") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 let mut channel_name = parts.get(1).unwrap_or(&"").to_string();
@@ -992,6 +1012,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !channel_name.is_empty() {
                     let is_geohash_channel = nostr_geo::is_geohash_channel(&channel_name);
                     let has_password_arg = parts.len() > 2;
+
+                    if is_geohash_channel && !has_password_arg {
+                        app.join_channel(channel_name.clone());
+                        app.add_log_message(format!(
+                            "system: Joined geohash channel {} over Nostr",
+                            channel_name
+                        ));
+                        chat_context
+                            .as_mut()
+                            .unwrap()
+                            .switch_to_channel(&channel_name);
+                        discovered_channels
+                            .as_mut()
+                            .unwrap()
+                            .insert(channel_name.clone());
+                        if let Err(e) = nostr_geo_client
+                            .join_channel(&channel_name, &nickname)
+                            .await
+                        {
+                            app.add_log_message(format!(
+                                "system: Failed to join Nostr geohash channel {}: {}",
+                                channel_name, e
+                            ));
+                        }
+                        app.switch_to_channel(channel_name.clone());
+                        continue;
+                    }
+
+                    if !app.connected {
+                        app.add_log_message(format!(
+                            "system: Bluetooth mesh is offline, so channel {} is unavailable. Use a geohash channel such as /j #ws for Nostr.",
+                            channel_name
+                        ));
+                        continue;
+                    }
+
                     // Update TUI state
                     app.join_channel(channel_name.clone());
 
@@ -1032,17 +1088,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await
                     {
-                        if is_geohash_channel && !has_password_arg {
-                            if let Err(e) = nostr_geo_client
-                                .join_channel(&channel_name, &nickname)
-                                .await
-                            {
-                                app.add_log_message(format!(
-                                    "system: Failed to join Nostr geohash channel {}: {}",
-                                    channel_name, e
-                                ));
-                            }
-                        }
                         // Explicitly switch UI to the joined channel after successful join
                         app.switch_to_channel(channel_name.clone());
                         continue;
@@ -1053,6 +1098,125 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await;
                     continue;
                 }
+            }
+
+            if line == "/clear" {
+                app.pending_clear_conversation = true;
+                continue;
+            }
+
+            if line == "/status" {
+                let peer_count = peers.as_ref().unwrap().lock().await.len();
+                let channel_count = chat_context
+                    .as_ref()
+                    .unwrap()
+                    .active_channels
+                    .iter()
+                    .filter(|channel| !nostr_geo::is_geohash_channel(channel))
+                    .count();
+                let geohash_count = app
+                    .channels
+                    .iter()
+                    .filter(|channel| nostr_geo::is_geohash_channel(channel))
+                    .count();
+                let dm_count = chat_context.as_ref().unwrap().active_dms.len();
+
+                let status_lines = vec![
+                    "━━━ Connection Status ━━━".to_string(),
+                    "▶ Mesh".to_string(),
+                    format!("  Status: {}", app.mesh_status),
+                    format!("  Connected peers: {}", peer_count),
+                    format!("  Active mesh channels: {}", channel_count),
+                    "▶ Nostr".to_string(),
+                    format!("  Geohash channels this session: {}", geohash_count),
+                    "▶ Your Info".to_string(),
+                    format!("  Active DMs: {}", dm_count),
+                    format!("  Nickname: {}", nickname),
+                    format!("  ID: {}", my_peer_id),
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string(),
+                ];
+
+                for line in status_lines {
+                    app.add_log_message(format!("system: {}", line));
+                }
+                continue;
+            }
+
+            if line == "/r" || line == "/retry" {
+                app.trigger_connection_retry();
+                app.add_log_message("system: Restarting Bluetooth mesh scan...".to_string());
+                continue;
+            }
+
+            if !app.connected && !line.trim_start().starts_with('/') {
+                let current_ui_channel = if app.sidebar_state.people_selected.is_some()
+                    && !app.current_people_are_geohash()
+                {
+                    None
+                } else {
+                    Some(app.get_selected_channel_name())
+                };
+
+                if let Some(channel) = current_ui_channel {
+                    if nostr_geo::is_geohash_channel(&channel)
+                        && !password_protected_channels
+                            .as_ref()
+                            .unwrap()
+                            .contains(&channel)
+                    {
+                        chat_context.as_mut().unwrap().switch_to_channel(&channel);
+                        let nostr_geo_client = nostr_geo_client.clone();
+                        let ui_tx = ui_tx.clone();
+                        let channel = channel.clone();
+                        let message = line.clone();
+                        let nickname = nickname.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = nostr_geo_client
+                                .send_message(&channel, &message, &nickname)
+                                .await
+                            {
+                                let _ = ui_tx
+                                    .send(format!(
+                                        "system: Failed to send geohash message on {}: {}",
+                                        channel, e
+                                    ))
+                                    .await;
+                            }
+                        });
+                        continue;
+                    }
+                }
+
+                app.add_log_message("system: Bluetooth mesh is offline. Join a Nostr geohash channel such as /j #ws, or wait for mesh discovery to finish.".to_string());
+                continue;
+            }
+
+            // Check if we're connected before handling commands that require connection
+            if !app.connected && !line.starts_with("/help") && !line.starts_with("/j ") {
+                app.add_log_message("system: Bluetooth mesh is still offline. Nostr geohash channels are available with /j #ws.".to_string());
+                continue;
+            }
+
+            if handle_name_command(
+                &line,
+                &mut nickname,
+                &my_peer_id,
+                peripheral.as_ref().unwrap(),
+                cmd_char.as_ref().unwrap(),
+                blocked_peers.as_ref().unwrap(),
+                channel_creators.as_ref().unwrap(),
+                chat_context.as_mut().unwrap(),
+                password_protected_channels.as_ref().unwrap(),
+                channel_key_commitments.as_ref().unwrap(),
+                app_state.as_ref().unwrap(),
+                create_app_state.as_ref().unwrap().as_ref(),
+                ui_tx.clone(),
+            )
+            .await
+            {
+                // Set the pending nickname update signal to trigger TUI update
+                app.pending_nickname_update = Some(nickname.clone());
+                continue;
             }
             if handle_exit_command(
                 &line,
@@ -1261,32 +1425,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.add_log_message("system: Type /help to see available commands.".to_string());
                 continue;
             }
-            // Check if we're connected before handling regular messages
-            if !app.connected {
-                app.add_log_message("system: Please wait for Bluetooth connection to be established before sending messages.".to_string());
-                continue;
+            let current_ui_channel = if app.sidebar_state.people_selected.is_some()
+                && !app.current_people_are_geohash()
+            {
+                None
+            } else {
+                Some(app.get_selected_channel_name())
+            };
+
+            if let Some(channel) = current_ui_channel {
+                if nostr_geo::is_geohash_channel(&channel)
+                    && !password_protected_channels
+                        .as_ref()
+                        .unwrap()
+                        .contains(&channel)
+                {
+                    chat_context.as_mut().unwrap().switch_to_channel(&channel);
+                    let nostr_geo_client = nostr_geo_client.clone();
+                    let ui_tx = ui_tx.clone();
+                    let channel = channel.clone();
+                    let message = line.clone();
+                    let nickname = nickname.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = nostr_geo_client
+                            .send_message(&channel, &message, &nickname)
+                            .await
+                        {
+                            let _ = ui_tx
+                                .send(format!(
+                                    "system: Failed to send geohash message on {}: {}",
+                                    channel, e
+                                ))
+                                .await;
+                        }
+                    });
+                    continue;
+                }
             }
 
-            if let ChatMode::PrivateDM {
-                nickname: target_nickname,
-                peer_id: target_peer_id,
-            } = &chat_context.as_ref().unwrap().current_mode
-            {
-                if let Err(e) = handle_private_dm_message(
-                    &line,
-                    target_peer_id,
-                    &mut noise_session_manager,
-                    peripheral.as_ref().unwrap(),
-                    cmd_char.as_ref().unwrap(),
-                    &my_peer_id,
-                    ui_tx.clone(),
-                )
-                .await
-                {
-                    app.add_log_message(format!("system: Failed to send DM: {}", e));
-                }
-                continue;
-            }
             if let ChatMode::Channel(channel) = &chat_context.as_ref().unwrap().current_mode {
                 if nostr_geo::is_geohash_channel(channel)
                     && !password_protected_channels
@@ -1314,6 +1490,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                     continue;
                 }
+            }
+
+            // Check if we're connected before handling Bluetooth mesh messages
+            if !app.connected {
+                app.add_log_message("system: Bluetooth mesh is offline. Join a Nostr geohash channel such as /j #ws, or wait for mesh discovery to finish.".to_string());
+                continue;
+            }
+
+            if let ChatMode::PrivateDM {
+                nickname: target_nickname,
+                peer_id: target_peer_id,
+            } = &chat_context.as_ref().unwrap().current_mode
+            {
+                if let Err(e) = handle_private_dm_message(
+                    &line,
+                    target_peer_id,
+                    &mut noise_session_manager,
+                    peripheral.as_ref().unwrap(),
+                    cmd_char.as_ref().unwrap(),
+                    &my_peer_id,
+                    ui_tx.clone(),
+                )
+                .await
+                {
+                    app.add_log_message(format!("system: Failed to send DM: {}", e));
+                }
+                continue;
             }
             handle_regular_message(
                 &line,

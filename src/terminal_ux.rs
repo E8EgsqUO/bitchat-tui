@@ -160,6 +160,7 @@ pub fn get_help_text() -> String {
         "  /name <name>           Change your nickname",
         "  /status                  Show connection info",
         "  /clear                   Clear the screen",
+        "  /r                       Restart Bluetooth mesh scan",
         "  /exit                    Quit BitChat\n",
         "▶ Navigation",
         "  /public                  Go to public chat\n",

@@ -1207,7 +1207,12 @@ pub async fn handle_channel_announce_message(
 
         chat_context.add_channel(channel);
 
-        let channels_vec: Vec<String> = chat_context.active_channels.iter().cloned().collect();
+        let channels_vec: Vec<String> = chat_context
+            .active_channels
+            .iter()
+            .filter(|channel| !crate::nostr_geo::is_geohash_channel(channel))
+            .cloned()
+            .collect();
         let state_to_save = create_app_state(
             blocked_peers,
             channel_creators,

@@ -16,11 +16,11 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
 const GEO_RELAY_CSV_URL: &str =
-    "https://raw.githubusercontent.com/permissionlesstech/georelays/refs/heads/main/nostr_relays.csv";
+    "https://raw.githubusercontent.com/permissionlesstech/georelays/main/nostr_relays.csv";
 const GEOHASH_ALPHABET: &str = "0123456789bcdefghjkmnpqrstuvwxyz";
 const SUBSCRIBE_SINCE_SECONDS: i64 = 300;
 const RECONNECT_DELAY_SECONDS: u64 = 10;
-const PUBLISH_TIMEOUT_SECONDS: u64 = 6;
+const PUBLISH_TIMEOUT_SECONDS: u64 = 8;
 
 const DEFAULT_RELAYS: &[&str] = &[
     "wss://bitchat.nostr1.com",
@@ -28,6 +28,42 @@ const DEFAULT_RELAYS: &[&str] = &[
     "wss://nos.lol",
     "wss://relay.primal.net",
     "wss://relay.wellorder.net",
+];
+
+const EMBEDDED_WS_RELAYS: &[&str] = &[
+    "wss://nostr-relay.zeabur.app",
+    "wss://relay.henryxplace.eu.org:9988",
+    "wss://nostr.ps1829.com",
+    "wss://relay.mulatta.io",
+    "wss://ms.chinacounty.com",
+    "wss://relay.notoshi.win",
+    "wss://relay.ru.ac.th",
+    "wss://relay02.lnfi.network",
+    "wss://relay01.lnfi.network",
+    "wss://yabu.me",
+    "wss://relay.homeinhk.xyz",
+    "wss://nostr.middling.mydns.jp",
+    "wss://relay-arg.zombi.cloudrodion.com",
+    "wss://nostr-01.yakihonne.com",
+    "wss://relay.islandbitcoin.com",
+];
+
+const EMBEDDED_GEO_RELAYS: &[(&str, f64, f64)] = &[
+    ("nostr-relay.zeabur.app", 22.3193, 114.1694),
+    ("relay.henryxplace.eu.org:9988", 22.3193, 114.1694),
+    ("nostr.ps1829.com", 22.3193, 114.1694),
+    ("relay.mulatta.io", 22.3193, 114.1694),
+    ("ms.chinacounty.com", 22.3193, 114.1694),
+    ("relay.homeinhk.xyz", 22.3193, 114.1694),
+    ("nostr-01.yakihonne.com", 22.3193, 114.1694),
+    ("relay02.lnfi.network", 1.3521, 103.8198),
+    ("relay01.lnfi.network", 1.3521, 103.8198),
+    ("relay.notoshi.win", 13.7563, 100.5018),
+    ("relay.ru.ac.th", 13.7563, 100.5018),
+    ("yabu.me", 35.6762, 139.6503),
+    ("nostr.middling.mydns.jp", 35.6762, 139.6503),
+    ("relay.islandbitcoin.com", 35.6762, 139.6503),
+    ("relay-arg.zombi.cloudrodion.com", -34.6037, -58.3816),
 ];
 
 #[derive(Clone)]
@@ -174,6 +210,7 @@ impl NostrGeoClient {
         .await;
 
         let mut sent_count = 0usize;
+        let total_count = publish_results.len();
         for (relay, result) in publish_results {
             match result {
                 Ok(()) => sent_count += 1,
@@ -183,6 +220,10 @@ impl NostrGeoClient {
                 )),
             }
         }
+        write_nostr_debug_log(&format!(
+            "publish result: geohash=#{}, event={}, sent={}, total={}",
+            geohash, event_id, sent_count, total_count
+        ));
 
         if sent_count == 0 {
             Err("Failed to publish geohash message to any Nostr relay".to_string())
@@ -239,6 +280,10 @@ async fn subscribe_once(
         .send(WsMessage::Text(req.to_string()))
         .await
         .map_err(|e| e.to_string())?;
+    write_nostr_debug_log(&format!(
+        "subscribe connected: relay={}, geohash=#{}, since={}",
+        relay, geohash, since
+    ));
 
     while let Some(message) = read.next().await {
         let message = message.map_err(|e| e.to_string())?;
@@ -302,6 +347,10 @@ async fn handle_relay_text(
         timestamp.format("%H%M"),
         event.content
     );
+    write_nostr_debug_log(&format!(
+        "received event: geohash=#{}, sender={}, event={}",
+        geohash, sender, event.id
+    ));
     let _ = inner.ui_tx.send(structured).await;
 }
 
@@ -422,7 +471,7 @@ async fn resolve_relays(geohash: &str) -> Vec<String> {
         Ok(entries) => closest_relays(&entries, geohash, relay_count_for_geohash(geohash)),
         Err(e) => {
             write_nostr_debug_log(&format!("relay CSV fetch failed: {}", e));
-            default_relays()
+            fallback_geo_relays(geohash)
         }
     }
 }
@@ -493,6 +542,44 @@ fn closest_relays(entries: &[RelayEntry], geohash: &str, count: usize) -> Vec<St
         .into_iter()
         .take(count)
         .map(|(_, entry)| format!("wss://{}", entry.host))
+        .collect()
+}
+
+fn fallback_geo_relays(geohash: &str) -> Vec<String> {
+    if geohash == "ws" {
+        let relays = EMBEDDED_WS_RELAYS
+            .iter()
+            .filter_map(|relay| normalize_relay_url(relay))
+            .collect::<Vec<_>>();
+        write_nostr_debug_log(&format!(
+            "using embedded #ws georelay fallback: relays={}",
+            relays.join(",")
+        ));
+        return relays;
+    }
+
+    let entries = embedded_geo_relays();
+    let relays = closest_relays(&entries, geohash, relay_count_for_geohash(geohash));
+    if relays.is_empty() {
+        default_relays()
+    } else {
+        write_nostr_debug_log(&format!(
+            "using embedded georelay fallback: geohash=#{}, relays={}",
+            geohash,
+            relays.join(",")
+        ));
+        relays
+    }
+}
+
+fn embedded_geo_relays() -> Vec<RelayEntry> {
+    EMBEDDED_GEO_RELAYS
+        .iter()
+        .map(|(host, lat, lon)| RelayEntry {
+            host: (*host).to_string(),
+            lat: *lat,
+            lon: *lon,
+        })
         .collect()
 }
 
@@ -612,6 +699,16 @@ mod tests {
         assert_eq!(relay_count_for_geohash("ws"), 15);
         assert_eq!(relay_count_for_geohash("dr5r"), 10);
         assert_eq!(relay_count_for_geohash("dr5ru"), 5);
+    }
+
+    #[test]
+    fn uses_embedded_ws_relay_fallback() {
+        let relays = fallback_geo_relays("ws");
+        assert_eq!(relays.len(), 15);
+        assert!(relays.iter().all(|relay| relay.starts_with("wss://")));
+        assert!(relays
+            .iter()
+            .any(|relay| relay.contains("relay.homeinhk.xyz")));
     }
 
     #[test]

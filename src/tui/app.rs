@@ -49,6 +49,7 @@ impl SidebarMenuState {
     }
 }
 
+#[allow(dead_code)]
 pub enum TuiPhase {
     Connecting,
     Connected,
@@ -77,8 +78,10 @@ pub struct App {
     #[allow(dead_code)]
     pub network_name: String,
     pub connected: bool,
+    pub mesh_status: String,
     pub channels: Vec<String>,
     pub people: Vec<String>,
+    pub geohash_people: HashMap<String, Vec<String>>,
     pub blocked: Vec<String>,
 
     // Message storage
@@ -126,7 +129,7 @@ impl App {
 
         let mut app = Self {
             input: Input::default(),
-            phase: TuiPhase::Connecting,
+            phase: TuiPhase::Connected,
             should_quit: false,
             focus_area: FocusArea::InputBox,
             sidebar_flat_selected: 0,
@@ -135,8 +138,10 @@ impl App {
             nickname,
             network_name: "BitChat Mesh".to_string(),
             connected: false,
+            mesh_status: "Scanning".to_string(),
             channels,
             people: Vec::new(),
+            geohash_people: HashMap::new(),
             blocked: Vec::new(),
             channel_messages,
             dm_messages: HashMap::new(),
@@ -159,28 +164,6 @@ impl App {
         app
     }
 
-    // Gets the currently selected conversation messages
-    pub fn get_current_messages(&self) -> (&[Message], Option<String>, Option<String>) {
-        if let Some(user_idx) = self.sidebar_state.people_selected {
-            if let Some(user) = self.people.get(user_idx) {
-                let messages = self
-                    .dm_messages
-                    .get(user)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                return (messages, Some(user.clone()), None);
-            }
-        }
-
-        let ch = self.get_selected_channel_name();
-        let messages = self
-            .channel_messages
-            .get(&ch)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        (messages, None, Some(ch))
-    }
-
     pub fn get_selected_channel_name(&self) -> String {
         if self.sidebar_state.public_selected.unwrap_or(false) {
             return "#public".to_string();
@@ -194,11 +177,51 @@ impl App {
         "#public".to_string()
     }
 
+    pub fn current_people_are_geohash(&self) -> bool {
+        crate::nostr_geo::is_geohash_channel(&self.get_selected_channel_name())
+    }
+
+    pub fn visible_people(&self) -> Vec<String> {
+        let channel = self.get_selected_channel_name();
+        if crate::nostr_geo::is_geohash_channel(&channel) {
+            self.geohash_people
+                .get(&channel)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            self.people.clone()
+        }
+    }
+
+    pub fn visible_people_count(&self) -> usize {
+        self.visible_people().len()
+    }
+
+    pub fn visible_person_at(&self, idx: usize) -> Option<String> {
+        self.visible_people().get(idx).cloned()
+    }
+
+    fn add_geohash_person(&mut self, channel: &str, sender: &str) {
+        if sender == self.nickname || sender == "system" || sender.trim().is_empty() {
+            return;
+        }
+
+        let people = self.geohash_people.entry(channel.to_string()).or_default();
+        if !people.iter().any(|person| person == sender) {
+            people.push(sender.to_string());
+            people.sort();
+        }
+    }
+
     pub fn update_current_conversation(&mut self) {
         if let Some(user_idx) = self.sidebar_state.people_selected {
-            if let Some(user) = self.people.get(user_idx) {
-                self.current_conv = Some((Some(user.clone()), None));
-                return;
+            if !self.current_people_are_geohash() {
+                if let Some(user) = self.people.get(user_idx) {
+                    self.current_conv = Some((Some(user.clone()), None));
+                    return;
+                }
+            } else if self.visible_person_at(user_idx).is_some() {
+                self.sidebar_state.people_selected = None;
             }
         }
 
@@ -215,6 +238,29 @@ impl App {
         }
 
         self.current_conv = Some((None, Some("#public".to_string())));
+    }
+
+    pub fn get_current_messages(&self) -> (&[Message], Option<String>, Option<String>) {
+        if let Some(user_idx) = self.sidebar_state.people_selected {
+            if !self.current_people_are_geohash() {
+                if let Some(user) = self.people.get(user_idx) {
+                    let messages = self
+                        .dm_messages
+                        .get(user)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    return (messages, Some(user.clone()), None);
+                }
+            }
+        }
+
+        let ch = self.get_selected_channel_name();
+        let messages = self
+            .channel_messages
+            .get(&ch)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        (messages, None, Some(ch))
     }
 
     pub fn add_log_message(&mut self, raw_message: String) {
@@ -270,6 +316,12 @@ impl App {
                 let sender = parts[2].to_string();
                 let timestamp_raw = parts[3].to_string();
                 let content = parts[4].to_string();
+                if crate::nostr_geo::is_geohash_channel(&channel) {
+                    if !self.channels.contains(&channel) {
+                        self.channels.push(channel.clone());
+                    }
+                    self.add_geohash_person(&channel, &sender);
+                }
 
                 let timestamp = if timestamp_raw.len() == 4 {
                     format!("{}:{}", &timestamp_raw[0..2], &timestamp_raw[2..4])
@@ -452,6 +504,7 @@ impl App {
     pub fn transition_to_connected(&mut self) {
         self.phase = TuiPhase::Connected;
         self.connected = true;
+        self.mesh_status = "Connected".to_string();
         let mut final_messages = self
             .popup_messages
             .drain(..)
@@ -472,6 +525,8 @@ impl App {
         let cleaned_error =
             String::from_utf8(strip_ansi_escapes::strip(&error)).unwrap_or_default();
         self.phase = TuiPhase::Error(cleaned_error);
+        self.connected = false;
+        self.mesh_status = "Offline".to_string();
     }
 
     pub fn add_popup_message(&mut self, message: String) {
@@ -587,11 +642,16 @@ impl App {
                 .iter()
                 .map(|ch| self.get_unread_count(ch))
                 .sum(),
-            2 => self
-                .people
-                .iter()
-                .map(|person| self.get_unread_count(&format!("dm:{}", person)))
-                .sum(),
+            2 => {
+                if self.current_people_are_geohash() {
+                    0
+                } else {
+                    self.people
+                        .iter()
+                        .map(|person| self.get_unread_count(&format!("dm:{}", person)))
+                        .sum()
+                }
+            }
             _ => 0,
         }
     }
@@ -617,8 +677,9 @@ impl App {
 
     pub fn trigger_connection_retry(&mut self) {
         self.pending_connection_retry = true;
-        self.phase = TuiPhase::Connecting;
+        self.phase = TuiPhase::Connected;
         self.connected = false;
+        self.mesh_status = "Scanning".to_string();
         self.popup_messages.clear();
     }
 
@@ -657,7 +718,7 @@ impl App {
                 let count = match section {
                     0 => 1,
                     1 => self.channels.len(),
-                    2 => self.people.len(),
+                    2 => self.visible_people_count(),
                     3 => self.blocked.len(),
                     4 => 2,
                     _ => 0,
@@ -665,7 +726,10 @@ impl App {
                 let is_current_section = match section {
                     0 => self.sidebar_state.public_selected.unwrap_or(false),
                     1 => self.sidebar_state.channel_selected.is_some(),
-                    2 => self.sidebar_state.people_selected.is_some(),
+                    2 => {
+                        self.sidebar_state.people_selected.is_some()
+                            && !self.current_people_are_geohash()
+                    }
                     _ => false,
                 };
                 if is_current_section {
