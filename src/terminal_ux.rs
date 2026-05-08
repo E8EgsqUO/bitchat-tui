@@ -168,7 +168,7 @@ pub fn get_help_text() -> String {
         "  /dm <name> [msg]       Start or send a private message",
         "  /reply                   Reply to last private message\n",
         "▶ Channels",
-        "  /j #channel [pwd]      Join/create a channel",
+        "  /j #channel            Join/create a channel",
         "  /leave                   Leave current channel",
         "  /pass <pwd>            Set channel password (owner only)",
         "  /transfer @user        Transfer ownership (owner only)\n",

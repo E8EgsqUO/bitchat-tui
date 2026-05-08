@@ -74,7 +74,9 @@ fn handle_sidebar_events(app: &mut App, key_event: KeyEvent) {
                         }
                         2 => {
                             if app.current_people_are_geohash() {
-                                app.add_log_message("system: Nostr geohash People shows participants seen in this channel. Direct messages over Nostr are not supported yet.".to_string());
+                                if let Some(person_name) = app.visible_person_at(child_idx) {
+                                    app.switch_to_geohash_dm(person_name);
+                                }
                             } else if let Some(person_name) = app.visible_person_at(child_idx) {
                                 app.switch_to_dm(person_name.clone());
                             }

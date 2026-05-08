@@ -149,6 +149,7 @@ name = "bitchat-tui"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "base64",
  "bloomfilter",
  "btleplug",
  "chacha20poly1305",

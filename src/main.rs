@@ -1094,7 +1094,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else {
                     let _ = ui_tx
-                        .send("\x1b[93m⚠ Usage: /j #<channel> [password]\x1b[0m\n".to_string())
+                        .send("\x1b[93m⚠ Usage: /j #<channel>\x1b[0m\n".to_string())
                         .await;
                     continue;
                 }
@@ -1148,7 +1148,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
+            if line == "/leave" {
+                let selected_channel = app
+                    .current_geohash_dm()
+                    .map(|(channel, _, _)| channel)
+                    .unwrap_or_else(|| app.get_selected_channel_name());
+                if nostr_geo::is_geohash_channel(&selected_channel) {
+                    if let Err(e) = nostr_geo_client.leave_channel(&selected_channel).await {
+                        app.add_log_message(format!(
+                            "system: Failed to leave Nostr geohash channel {}: {}",
+                            selected_channel, e
+                        ));
+                    } else {
+                        if let Some(chat_context) = chat_context.as_mut() {
+                            chat_context.remove_channel(&selected_channel);
+                            chat_context.switch_to_public();
+                        }
+                        app.leave_geohash_channel(&selected_channel);
+                        app.add_log_message(format!(
+                            "system: Left geohash channel {}",
+                            selected_channel
+                        ));
+                    }
+                    continue;
+                }
+            }
+
             if !app.connected && !line.trim_start().starts_with('/') {
+                if let Some((channel, target_nickname, recipient_pubkey)) = app.current_geohash_dm()
+                {
+                    let nostr_geo_client = nostr_geo_client.clone();
+                    let ui_tx = ui_tx.clone();
+                    let message = line.clone();
+                    let my_peer_id = my_peer_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = nostr_geo_client
+                            .send_private_message(
+                                &channel,
+                                &recipient_pubkey,
+                                &message,
+                                &my_peer_id,
+                            )
+                            .await
+                        {
+                            let _ = ui_tx
+                                .send(format!(
+                                    "system: Failed to send geohash DM to {}: {}",
+                                    target_nickname, e
+                                ))
+                                .await;
+                        }
+                    });
+                    continue;
+                }
+
                 let current_ui_channel = if app.sidebar_state.people_selected.is_some()
                     && !app.current_people_are_geohash()
                 {
@@ -1425,6 +1478,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.add_log_message("system: Type /help to see available commands.".to_string());
                 continue;
             }
+
+            if let Some((channel, target_nickname, recipient_pubkey)) = app.current_geohash_dm() {
+                let nostr_geo_client = nostr_geo_client.clone();
+                let ui_tx = ui_tx.clone();
+                let message = line.clone();
+                let my_peer_id = my_peer_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = nostr_geo_client
+                        .send_private_message(&channel, &recipient_pubkey, &message, &my_peer_id)
+                        .await
+                    {
+                        let _ = ui_tx
+                            .send(format!(
+                                "system: Failed to send geohash DM to {}: {}",
+                                target_nickname, e
+                            ))
+                            .await;
+                    }
+                });
+                continue;
+            }
+
             let current_ui_channel = if app.sidebar_state.people_selected.is_some()
                 && !app.current_people_are_geohash()
             {

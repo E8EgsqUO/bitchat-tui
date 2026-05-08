@@ -82,6 +82,7 @@ pub struct App {
     pub channels: Vec<String>,
     pub people: Vec<String>,
     pub geohash_people: HashMap<String, Vec<String>>,
+    pub geohash_people_pubkeys: HashMap<String, HashMap<String, String>>,
     pub blocked: Vec<String>,
 
     // Message storage
@@ -142,6 +143,7 @@ impl App {
             channels,
             people: Vec::new(),
             geohash_people: HashMap::new(),
+            geohash_people_pubkeys: HashMap::new(),
             blocked: Vec::new(),
             channel_messages,
             dm_messages: HashMap::new(),
@@ -201,9 +203,48 @@ impl App {
         self.visible_people().get(idx).cloned()
     }
 
-    fn add_geohash_person(&mut self, channel: &str, sender: &str) {
+    fn geohash_dm_key(channel: &str, target: &str) -> String {
+        format!("geo:{}:{}", channel, target)
+    }
+
+    fn parse_geohash_dm_key(key: &str) -> Option<(String, String)> {
+        let rest = key.strip_prefix("geo:")?;
+        let (channel, target) = rest.split_once(':')?;
+        Some((channel.to_string(), target.to_string()))
+    }
+
+    pub fn display_dm_target(&self, target: &str) -> String {
+        if let Some((channel, nickname)) = Self::parse_geohash_dm_key(target) {
+            format!("{} in {}", nickname, channel)
+        } else {
+            target.to_string()
+        }
+    }
+
+    pub fn current_geohash_dm(&self) -> Option<(String, String, String)> {
+        let (dm_target, _) = self.current_conv.clone().unwrap_or((None, None));
+        let target_key = dm_target?;
+        let (channel, nickname) = Self::parse_geohash_dm_key(&target_key)?;
+        let pubkey = self
+            .geohash_people_pubkeys
+            .get(&channel)?
+            .get(&nickname)?
+            .clone();
+        Some((channel, nickname, pubkey))
+    }
+
+    fn add_geohash_person(&mut self, channel: &str, sender: &str, pubkey: Option<&str>) {
         if sender == self.nickname || sender == "system" || sender.trim().is_empty() {
             return;
+        }
+
+        if let Some(pubkey) = pubkey {
+            if !pubkey.trim().is_empty() {
+                self.geohash_people_pubkeys
+                    .entry(channel.to_string())
+                    .or_default()
+                    .insert(sender.to_string(), pubkey.to_string());
+            }
         }
 
         let people = self.geohash_people.entry(channel.to_string()).or_default();
@@ -221,7 +262,12 @@ impl App {
                     return;
                 }
             } else if self.visible_person_at(user_idx).is_some() {
-                self.sidebar_state.people_selected = None;
+                let channel = self.get_selected_channel_name();
+                if let Some(user) = self.visible_person_at(user_idx) {
+                    let target_key = Self::geohash_dm_key(&channel, &user);
+                    self.current_conv = Some((Some(target_key), Some(channel)));
+                    return;
+                }
             }
         }
 
@@ -251,6 +297,15 @@ impl App {
                         .unwrap_or(&[]);
                     return (messages, Some(user.clone()), None);
                 }
+            } else if let Some(user) = self.visible_person_at(user_idx) {
+                let channel = self.get_selected_channel_name();
+                let target_key = Self::geohash_dm_key(&channel, &user);
+                let messages = self
+                    .dm_messages
+                    .get(&target_key)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                return (messages, Some(target_key), None);
             }
         }
 
@@ -309,6 +364,62 @@ impl App {
             }
         }
 
+        if trimmed.starts_with("__GEO_PERSON__:") {
+            let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
+            if parts.len() >= 4 {
+                let channel = parts[1].to_string();
+                let sender = parts[2].to_string();
+                let pubkey = parts[3].to_string();
+                if !self.channels.contains(&channel) {
+                    self.channels.push(channel.clone());
+                }
+                self.add_geohash_person(&channel, &sender, Some(&pubkey));
+                return;
+            }
+        }
+
+        if trimmed.starts_with("__GEO_DM__:") {
+            let parts: Vec<&str> = trimmed.splitn(6, ':').collect();
+            if parts.len() >= 6 {
+                let channel = parts[1].to_string();
+                let sender = parts[2].to_string();
+                let pubkey = parts[3].to_string();
+                let timestamp_raw = parts[4].to_string();
+                let content = parts[5].to_string();
+
+                if !self.channels.contains(&channel) {
+                    self.channels.push(channel.clone());
+                }
+                self.add_geohash_person(&channel, &sender, Some(&pubkey));
+
+                let timestamp = if timestamp_raw.len() == 4 {
+                    format!("{}:{}", &timestamp_raw[0..2], &timestamp_raw[2..4])
+                } else {
+                    timestamp_raw
+                };
+
+                let target_key = Self::geohash_dm_key(&channel, &sender);
+                let msg = Message {
+                    sender,
+                    timestamp,
+                    content,
+                    is_self: false,
+                };
+
+                self.dm_messages
+                    .entry(target_key.clone())
+                    .or_default()
+                    .push(msg);
+
+                if self.current_conv.as_ref().and_then(|(dm, _)| dm.as_ref()) != Some(&target_key) {
+                    self.add_unread_message(format!("dm:{}", target_key));
+                }
+
+                self.scroll_to_bottom_current_conversation();
+                return;
+            }
+        }
+
         if trimmed.starts_with("__CHANNEL__:") {
             let parts: Vec<&str> = trimmed.splitn(5, ':').collect();
             if parts.len() >= 5 {
@@ -320,7 +431,7 @@ impl App {
                     if !self.channels.contains(&channel) {
                         self.channels.push(channel.clone());
                     }
-                    self.add_geohash_person(&channel, &sender);
+                    self.add_geohash_person(&channel, &sender, None);
                 }
 
                 let timestamp = if timestamp_raw.len() == 4 {
@@ -591,6 +702,47 @@ impl App {
         }
     }
 
+    pub fn switch_to_geohash_dm(&mut self, target_nickname: String) {
+        let channel = self.get_selected_channel_name();
+        if !crate::nostr_geo::is_geohash_channel(&channel) {
+            return;
+        }
+
+        let Some(channel_idx) = self.channels.iter().position(|c| c == &channel) else {
+            return;
+        };
+        let Some(person_idx) = self
+            .geohash_people
+            .get(&channel)
+            .and_then(|people| people.iter().position(|p| p == &target_nickname))
+        else {
+            return;
+        };
+
+        self.sidebar_state.public_selected = None;
+        self.sidebar_state.channel_selected = Some(channel_idx);
+        self.sidebar_state.people_selected = Some(person_idx);
+        self.current_conv = Some((
+            Some(Self::geohash_dm_key(&channel, &target_nickname)),
+            Some(channel),
+        ));
+        self.update_sidebar_flat_selection();
+        self.mark_current_conversation_as_read();
+    }
+
+    pub fn leave_geohash_channel(&mut self, channel: &str) {
+        self.channels.retain(|c| c != channel);
+        self.geohash_people.remove(channel);
+        self.geohash_people_pubkeys.remove(channel);
+        self.channel_messages.remove(channel);
+        self.dm_messages.retain(|key, _| {
+            Self::parse_geohash_dm_key(key)
+                .map(|(dm_channel, _)| dm_channel != channel)
+                .unwrap_or(true)
+        });
+        self.switch_to_public();
+    }
+
     pub fn mark_current_conversation_as_read(&mut self) {
         let (messages, dm_target, channel_name) = self.get_current_messages();
         let conversation_key = if let Some(target) = dm_target {
@@ -644,7 +796,14 @@ impl App {
                 .sum(),
             2 => {
                 if self.current_people_are_geohash() {
-                    0
+                    self.visible_people()
+                        .iter()
+                        .map(|person| {
+                            let key =
+                                Self::geohash_dm_key(&self.get_selected_channel_name(), person);
+                            self.get_unread_count(&format!("dm:{}", key))
+                        })
+                        .sum()
                 } else {
                     self.people
                         .iter()
@@ -726,10 +885,7 @@ impl App {
                 let is_current_section = match section {
                     0 => self.sidebar_state.public_selected.unwrap_or(false),
                     1 => self.sidebar_state.channel_selected.is_some(),
-                    2 => {
-                        self.sidebar_state.people_selected.is_some()
-                            && !self.current_people_are_geohash()
-                    }
+                    2 => self.sidebar_state.people_selected.is_some(),
                     _ => false,
                 };
                 if is_current_section {

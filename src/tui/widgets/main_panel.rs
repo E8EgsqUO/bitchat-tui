@@ -31,7 +31,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     // --- Header Rendering ---
     let header_text = if let Some(user) = dm_target {
-        format!("Direct Message with {}", user)
+        format!("Direct Message with {}", app.display_dm_target(&user))
     } else if let Some(channel) = channel_name {
         if channel == "#public" {
             "Public Chat".to_string()

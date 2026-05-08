@@ -89,7 +89,7 @@ fn get_help_text(app: &App) -> Vec<Span> {
                 spans.extend_from_slice(&[
                     Span::raw(" • "),
                     Span::styled(
-                        format!("DM with {}", target),
+                        format!("DM with {}", app.display_dm_target(&target)),
                         Style::default().fg(Color::Cyan),
                     ),
                 ]);
