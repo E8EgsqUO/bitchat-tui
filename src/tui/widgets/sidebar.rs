@@ -124,13 +124,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 let unread_count = match i {
                     0 => app.get_unread_count("#public"), // Public
                     1 => app.get_unread_count(&item_str), // Channels
-                    2 => {
-                        if app.current_people_are_geohash() {
-                            0
-                        } else {
-                            app.get_unread_count(&format!("dm:{}", item_str))
-                        }
-                    }
+                    2 => app.get_visible_person_unread_count(&item_str),
                     _ => 0,
                 };
 

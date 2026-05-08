@@ -780,6 +780,15 @@ impl App {
             .unwrap_or(0)
     }
 
+    pub fn get_visible_person_unread_count(&self, person: &str) -> usize {
+        if self.current_people_are_geohash() {
+            let key = Self::geohash_dm_key(&self.get_selected_channel_name(), person);
+            self.get_unread_count(&format!("dm:{}", key))
+        } else {
+            self.get_unread_count(&format!("dm:{}", person))
+        }
+    }
+
     pub fn get_section_unread_count(&self, section: usize) -> usize {
         match section {
             0 => {
@@ -798,16 +807,12 @@ impl App {
                 if self.current_people_are_geohash() {
                     self.visible_people()
                         .iter()
-                        .map(|person| {
-                            let key =
-                                Self::geohash_dm_key(&self.get_selected_channel_name(), person);
-                            self.get_unread_count(&format!("dm:{}", key))
-                        })
+                        .map(|person| self.get_visible_person_unread_count(person))
                         .sum()
                 } else {
                     self.people
                         .iter()
-                        .map(|person| self.get_unread_count(&format!("dm:{}", person)))
+                        .map(|person| self.get_visible_person_unread_count(person))
                         .sum()
                 }
             }
@@ -934,5 +939,41 @@ impl App {
 
         // Ensure minimum height and reasonable maximum
         std::cmp::max(3, std::cmp::min(lines_needed + 2, 10)) // +2 for borders, max 10 lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_unread_geohash_dm_for_visible_people() {
+        let mut app = App::new_with_nickname("me".to_string());
+
+        app.join_channel("#ws".to_string());
+        app.add_log_message("__GEO_DM__:#ws:anon7301:pubkey:1201:first".to_string());
+        app.add_log_message("__GEO_DM__:#ws:anon7301:pubkey:1202:second".to_string());
+
+        assert_eq!(app.get_visible_person_unread_count("anon7301"), 2);
+        assert_eq!(app.get_section_unread_count(2), 2);
+
+        app.switch_to_geohash_dm("anon7301".to_string());
+
+        assert_eq!(app.get_visible_person_unread_count("anon7301"), 0);
+        assert_eq!(app.get_section_unread_count(2), 0);
+    }
+
+    #[test]
+    fn counts_unread_mesh_dm_for_visible_people() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.people.push("anon7301".to_string());
+
+        app.add_log_message("__DM__:anon7301:1201:hello".to_string());
+
+        assert_eq!(app.get_visible_person_unread_count("anon7301"), 1);
+
+        app.switch_to_dm("anon7301".to_string());
+
+        assert_eq!(app.get_visible_person_unread_count("anon7301"), 0);
     }
 }
