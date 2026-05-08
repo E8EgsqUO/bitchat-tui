@@ -10,6 +10,7 @@ use crate::packet_creation::{
 };
 use crate::payload_handling::{
     create_bitchat_message_payload_full, create_encrypted_channel_message_payload,
+    create_private_noise_payload,
 };
 use crate::terminal_ux::{format_message_display, ChatContext};
 use btleplug::api::{Peripheral, WriteType};
@@ -174,39 +175,29 @@ pub async fn handle_private_dm_message(
         // Send encrypted message
         write_noise_debug_log("[DEBUG] About to encrypt message");
 
-        // Create message payload with type marker (matches Swift implementation)
+        // Create iOS-compatible Noise private message payload.
         write_noise_debug_log(&format!(
-            "[DEBUG] Creating message payload for message: '{}'",
+            "[DEBUG] Creating private Noise payload for message: '{}'",
             message
         ));
-        let (message_payload, message_id) =
-            create_bitchat_message_payload_full("User", message, None, true, my_peer_id);
+        let message_id = Uuid::new_v4().to_string();
+        let noise_payload = create_private_noise_payload(&message_id, message)
+            .map_err(|e| format!("Failed to create private Noise payload: {}", e))?;
         write_noise_debug_log(&format!(
-            "[DEBUG] Created message payload, length: {}, message_id: {}",
-            message_payload.len(),
+            "[DEBUG] Created private Noise payload, length: {}, message_id: {}",
+            noise_payload.len(),
             message_id
-        ));
-
-        // Add type marker at the beginning (matches Swift implementation)
-        let mut payload_with_type = Vec::new();
-        payload_with_type.push(MessageType::Message as u8); // Type marker
-        payload_with_type.extend_from_slice(&message_payload);
-
-        write_noise_debug_log(&format!(
-            "[DEBUG] Created payload with type marker, total length: {}, first byte: 0x{:02X}",
-            payload_with_type.len(),
-            payload_with_type[0]
         ));
         write_noise_debug_log(&format!(
             "[DEBUG] Payload bytes: {:?}",
-            &payload_with_type[..std::cmp::min(32, payload_with_type.len())]
+            &noise_payload[..std::cmp::min(32, noise_payload.len())]
         ));
 
         write_noise_debug_log(&format!(
             "[DEBUG] About to encrypt message with Noise for peer: {}",
             target_peer_id
         ));
-        match noise_manager.encrypt_message(target_peer_id, &payload_with_type) {
+        match noise_manager.encrypt_message(target_peer_id, &noise_payload) {
             Ok(encrypted_data) => {
                 write_noise_debug_log(&format!(
                     "[DEBUG] Message encrypted successfully, length: {}, first 16 bytes: {:?}",

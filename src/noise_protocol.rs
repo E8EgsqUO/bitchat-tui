@@ -227,12 +227,9 @@ impl NoiseCipherState {
             return None;
         }
 
-        // Extract 4-byte nonce (little-endian to match Swift)
+        // Extract 4-byte nonce (big-endian to match iOS transport payloads)
         let nonce_data = &combined_payload[..NONCE_SIZE_BYTES];
-        let mut extracted_nonce: u64 = 0;
-        for (i, &byte) in nonce_data.iter().enumerate() {
-            extracted_nonce |= (byte as u64) << (i * 8);
-        }
+        let extracted_nonce = u32::from_be_bytes(nonce_data.try_into().ok()?) as u64;
 
         // Extract ciphertext (remaining bytes)
         let ciphertext = combined_payload[NONCE_SIZE_BYTES..].to_vec();
@@ -240,13 +237,9 @@ impl NoiseCipherState {
         Some((extracted_nonce, ciphertext))
     }
 
-    /// Convert nonce to 4-byte array (little-endian to match Swift)
+    /// Convert nonce to 4-byte array (big-endian to match iOS transport payloads)
     fn nonce_to_bytes(&self, nonce: u64) -> Vec<u8> {
-        let mut bytes = vec![0u8; NONCE_SIZE_BYTES];
-        let nonce_le = nonce.to_le_bytes();
-        // Copy only the first 4 bytes from the 8-byte u64
-        bytes.copy_from_slice(&nonce_le[..NONCE_SIZE_BYTES]);
-        bytes
+        (nonce as u32).to_be_bytes().to_vec()
     }
 
     pub fn encrypt(
@@ -346,8 +339,7 @@ impl NoiseCipherState {
             let (nonce, encrypted_payload): (u64, Vec<u8>) = if self.use_extracted_nonce {
                 match self.extract_nonce_from_ciphertext_payload(ciphertext) {
                     Some((n, payload)) => {
-                        // FIXED: Only validate nonce for non-zero nonces in transport mode
-                        if n > 0 && !self.is_valid_nonce(n) {
+                        if !self.is_valid_nonce(n) {
                             log_noise_protocol_event(
                                 "CIPHER_DECRYPT_REPLAY_DETECTED",
                                 &format!("Replay attack detected: nonce {} rejected", n),
@@ -385,8 +377,8 @@ impl NoiseCipherState {
                         ),
                     );
 
-                    if self.use_extracted_nonce && nonce > 0 {
-                        // Update replay window after successful decryption (but only for non-zero nonces)
+                    if self.use_extracted_nonce {
+                        // Update replay window after successful decryption.
                         self.mark_nonce_as_seen(nonce);
                     } else if !self.use_extracted_nonce {
                         self.nonce += 1;
@@ -1250,6 +1242,35 @@ impl NoiseHandshakeState {
 
     pub fn get_handshake_hash(&self) -> Vec<u8> {
         self.symmetric_state.get_handshake_hash()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_nonce_prefix_is_big_endian() {
+        let cipher = NoiseCipherState::new();
+
+        assert_eq!(cipher.nonce_to_bytes(1), vec![0, 0, 0, 1]);
+        assert_eq!(cipher.nonce_to_bytes(258), vec![0, 0, 1, 2]);
+        assert_eq!(
+            cipher
+                .extract_nonce_from_ciphertext_payload(&[0, 0, 0, 2, 9, 8])
+                .unwrap(),
+            (2, vec![9, 8])
+        );
+    }
+
+    #[test]
+    fn replay_window_tracks_zero_nonce() {
+        let mut cipher = NoiseCipherState::new();
+
+        assert!(cipher.is_valid_nonce(0));
+        cipher.mark_nonce_as_seen(0);
+        assert!(!cipher.is_valid_nonce(0));
+        assert!(cipher.is_valid_nonce(1));
     }
 }
 

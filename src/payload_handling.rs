@@ -49,6 +49,80 @@ pub fn unpad_message(data: &[u8]) -> Vec<u8> {
     data[..unpadded_len].to_vec()
 }
 
+pub const NOISE_PAYLOAD_PRIVATE_MESSAGE: u8 = 0x01;
+pub const NOISE_PAYLOAD_READ_RECEIPT: u8 = 0x02;
+pub const NOISE_PAYLOAD_DELIVERED: u8 = 0x03;
+
+pub fn create_private_noise_payload(
+    message_id: &str,
+    content: &str,
+) -> Result<Vec<u8>, &'static str> {
+    let message_id_bytes = message_id.as_bytes();
+    let content_bytes = content.as_bytes();
+
+    if message_id_bytes.len() > u8::MAX as usize {
+        return Err("Private message ID too long");
+    }
+    if content_bytes.len() > u8::MAX as usize {
+        return Err("Private message content too long");
+    }
+
+    let mut data = Vec::with_capacity(1 + 2 + message_id_bytes.len() + 2 + content_bytes.len());
+    data.push(NOISE_PAYLOAD_PRIVATE_MESSAGE);
+    data.push(0x00);
+    data.push(message_id_bytes.len() as u8);
+    data.extend_from_slice(message_id_bytes);
+    data.push(0x01);
+    data.push(content_bytes.len() as u8);
+    data.extend_from_slice(content_bytes);
+
+    Ok(data)
+}
+
+pub fn parse_private_noise_payload(data: &[u8]) -> Result<(String, String), &'static str> {
+    let mut offset = 0;
+    let mut message_id = None;
+    let mut content = None;
+
+    while offset < data.len() {
+        if data.len().saturating_sub(offset) < 2 {
+            return Err("Private message TLV truncated");
+        }
+
+        let field_type = data[offset];
+        let field_len = data[offset + 1] as usize;
+        offset += 2;
+
+        if data.len().saturating_sub(offset) < field_len {
+            return Err("Private message TLV length exceeds payload");
+        }
+
+        let field = &data[offset..offset + field_len];
+        offset += field_len;
+
+        match field_type {
+            0x00 => {
+                message_id = Some(
+                    String::from_utf8(field.to_vec())
+                        .map_err(|_| "Invalid UTF-8 in private message ID")?,
+                );
+            }
+            0x01 => {
+                content = Some(
+                    String::from_utf8(field.to_vec())
+                        .map_err(|_| "Invalid UTF-8 in private message content")?,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Ok((
+        message_id.ok_or("Missing private message ID")?,
+        content.ok_or("Missing private message content")?,
+    ))
+}
+
 pub fn parse_bitchat_message_payload(data: &[u8]) -> Result<BitchatMessage, &'static str> {
     debug_full_println!(
         "[PARSE] Parsing message payload, size: {} bytes",
@@ -416,4 +490,26 @@ pub fn create_encrypted_channel_message_payload(
     data.extend_from_slice(channel.as_bytes());
 
     (data, id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_noise_payload_round_trips() {
+        let payload = create_private_noise_payload("msg-1", "hello").unwrap();
+
+        assert_eq!(payload[0], NOISE_PAYLOAD_PRIVATE_MESSAGE);
+        let (message_id, content) = parse_private_noise_payload(&payload[1..]).unwrap();
+        assert_eq!(message_id, "msg-1");
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn private_noise_payload_rejects_long_content() {
+        let content = "x".repeat(256);
+
+        assert!(create_private_noise_payload("msg-1", &content).is_err());
+    }
 }

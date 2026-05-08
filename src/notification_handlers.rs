@@ -13,6 +13,7 @@ use tokio::time;
 
 use std::fs::OpenOptions;
 use std::io::Write;
+use uuid::Uuid;
 
 use crate::data_structures::{
     BitchatMessage, BitchatPacket, DebugLevel, DeliveryAck, DeliveryTracker, FragmentCollector,
@@ -24,7 +25,11 @@ use crate::noise_session::NoiseSessionManager;
 use crate::packet_creation::{create_bitchat_packet, create_bitchat_packet_with_recipient};
 use crate::packet_delivery::{create_delivery_ack, should_send_ack};
 use crate::packet_parser::{generate_keys_and_payload, parse_bitchat_packet};
-use crate::payload_handling::{parse_bitchat_message_payload, unpad_message};
+use crate::payload_handling::{
+    create_private_noise_payload, parse_bitchat_message_payload, parse_private_noise_payload,
+    unpad_message, NOISE_PAYLOAD_DELIVERED, NOISE_PAYLOAD_PRIVATE_MESSAGE,
+    NOISE_PAYLOAD_READ_RECEIPT,
+};
 use crate::persistence::{save_state, AppState, EncryptedPassword};
 use crate::terminal_ux::{ChatContext, ChatMode};
 
@@ -1345,11 +1350,11 @@ pub async fn handle_noise_handshake_init(
                 ));
 
                 if let Some(response_data) = response {
-                    // NEW â€“ wrap the Noise payload in a BitchatPacket
+                    // Wrap the Noise payload in a BitchatPacket.
                     let response_packet = create_bitchat_packet_with_recipient(
                         my_peer_id,
                         Some(&packet.sender_id_str), // send it **only** to the peer that asked
-                        MessageType::NoiseHandshakeResp, // msgType  = 0x11
+                        MessageType::NoiseHandshakeInit,
                         response_data,
                         None, // no signature
                     );
@@ -1367,6 +1372,21 @@ pub async fn handle_noise_handshake_init(
                                     packet.sender_id_str
                                 ))
                                 .await;
+                            if noise_session_manager.has_established_session(&packet.sender_id_str)
+                            {
+                                write_noise_debug_log(
+                                    "[DEBUG] Handshake established after response, sending pending messages",
+                                );
+                                send_pending_messages(
+                                    noise_session_manager,
+                                    peripheral,
+                                    cmd_char,
+                                    my_peer_id,
+                                    &packet.sender_id_str,
+                                    ui_tx.clone(),
+                                )
+                                .await;
+                            }
                         }
                         Err(e) => {
                             write_noise_debug_log(&format!(
@@ -1386,6 +1406,20 @@ pub async fn handle_noise_handshake_init(
                             packet.sender_id_str
                         ))
                         .await;
+                    if noise_session_manager.has_established_session(&packet.sender_id_str) {
+                        write_noise_debug_log(
+                            "[DEBUG] Handshake completed, sending pending messages",
+                        );
+                        send_pending_messages(
+                            noise_session_manager,
+                            peripheral,
+                            cmd_char,
+                            my_peer_id,
+                            &packet.sender_id_str,
+                            ui_tx.clone(),
+                        )
+                        .await;
+                    }
                 }
             }
             Err(e) => {
@@ -1426,11 +1460,11 @@ pub async fn handle_noise_handshake_init(
                         ));
 
                         if let Some(response_data) = response {
-                            // NEW â€“ wrap the Noise payload in a BitchatPacket
+                            // Wrap the Noise payload in a BitchatPacket.
                             let response_packet = create_bitchat_packet_with_recipient(
                                 my_peer_id,
                                 Some(&packet.sender_id_str), // send it **only** to the peer that asked
-                                MessageType::NoiseHandshakeResp, // msgType  = 0x11
+                                MessageType::NoiseHandshakeInit,
                                 response_data,
                                 None, // no signature
                             );
@@ -1450,6 +1484,22 @@ pub async fn handle_noise_handshake_init(
                                             packet.sender_id_str
                                         ))
                                         .await;
+                                    if noise_session_manager
+                                        .has_established_session(&packet.sender_id_str)
+                                    {
+                                        write_noise_debug_log(
+                                            "[DEBUG] Handshake established after response, sending pending messages",
+                                        );
+                                        send_pending_messages(
+                                            noise_session_manager,
+                                            peripheral,
+                                            cmd_char,
+                                            my_peer_id,
+                                            &packet.sender_id_str,
+                                            ui_tx.clone(),
+                                        )
+                                        .await;
+                                    }
                                 }
                                 Err(e) => {
                                     write_noise_debug_log(&format!(
@@ -1474,6 +1524,21 @@ pub async fn handle_noise_handshake_init(
                                     packet.sender_id_str
                                 ))
                                 .await;
+                            if noise_session_manager.has_established_session(&packet.sender_id_str)
+                            {
+                                write_noise_debug_log(
+                                    "[DEBUG] Handshake completed, sending pending messages",
+                                );
+                                send_pending_messages(
+                                    noise_session_manager,
+                                    peripheral,
+                                    cmd_char,
+                                    my_peer_id,
+                                    &packet.sender_id_str,
+                                    ui_tx.clone(),
+                                )
+                                .await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -1538,11 +1603,11 @@ pub async fn handle_noise_handshake_resp(
             ));
 
             if let Some(response_data) = response {
-                // NEW â€“ wrap the Noise payload in a BitchatPacket
+                // Wrap the Noise payload in a BitchatPacket.
                 let response_packet = create_bitchat_packet_with_recipient(
                     my_peer_id,
                     Some(&packet.sender_id_str), // send it **only** to the peer that asked
-                    MessageType::NoiseHandshakeResp, // msgType  = 0x11
+                    MessageType::NoiseHandshakeInit,
                     response_data,
                     None, // no signature
                 );
@@ -1560,6 +1625,20 @@ pub async fn handle_noise_handshake_resp(
                                 packet.sender_id_str
                             ))
                             .await;
+                        if noise_session_manager.has_established_session(&packet.sender_id_str) {
+                            write_noise_debug_log(
+                                "[DEBUG] Handshake established after response, sending pending messages",
+                            );
+                            send_pending_messages(
+                                noise_session_manager,
+                                peripheral,
+                                cmd_char,
+                                my_peer_id,
+                                &packet.sender_id_str,
+                                ui_tx.clone(),
+                            )
+                            .await;
+                        }
                     }
                     Err(e) => {
                         write_noise_debug_log(&format!(
@@ -1613,11 +1692,11 @@ pub async fn handle_noise_handshake_resp(
                             ));
 
                             if let Some(response_data) = response {
-                                // NEW â€“ wrap the Noise payload in a BitchatPacket
+                                // Wrap the Noise payload in a BitchatPacket.
                                 let response_packet = create_bitchat_packet_with_recipient(
                                     my_peer_id,
                                     Some(&packet.sender_id_str), // send it **only** to the peer that asked
-                                    MessageType::NoiseHandshakeResp, // msgType  = 0x11
+                                    MessageType::NoiseHandshakeInit,
                                     response_data,
                                     None, // no signature
                                 );
@@ -1637,6 +1716,22 @@ pub async fn handle_noise_handshake_resp(
                                                 packet.sender_id_str
                                             ))
                                             .await;
+                                        if noise_session_manager
+                                            .has_established_session(&packet.sender_id_str)
+                                        {
+                                            write_noise_debug_log(
+                                                "[DEBUG] Handshake established after response, sending pending messages",
+                                            );
+                                            send_pending_messages(
+                                                noise_session_manager,
+                                                peripheral,
+                                                cmd_char,
+                                                my_peer_id,
+                                                &packet.sender_id_str,
+                                                ui_tx.clone(),
+                                            )
+                                            .await;
+                                        }
                                     }
                                     Err(e) => {
                                         write_noise_debug_log(&format!(
@@ -1749,12 +1844,28 @@ async fn send_pending_messages(
                 i, message_content
             ));
 
-            match noise_session_manager.encrypt_message(target_peer_id, message_content.as_bytes())
-            {
+            let message_id = Uuid::new_v4().to_string();
+            let noise_payload = match create_private_noise_payload(&message_id, message_content) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    write_noise_debug_log(&format!(
+                        "[DEBUG] Failed to create pending private Noise payload {}: {}",
+                        i, e
+                    ));
+                    let _ = ui_tx
+                        .send(format!("[!] Failed to encode pending message: {}\n", e))
+                        .await;
+                    continue;
+                }
+            };
+
+            match noise_session_manager.encrypt_message(target_peer_id, &noise_payload) {
                 Ok(encrypted) => {
                     write_noise_debug_log(&format!(
-                        "[DEBUG] Successfully encrypted pending message {}, length: {}",
+                        "[DEBUG] Successfully encrypted pending message {}, id: {}, payload length: {}, encrypted length: {}",
                         i,
+                        message_id,
+                        noise_payload.len(),
                         encrypted.len()
                     ));
 
@@ -1878,7 +1989,89 @@ pub async fn handle_noise_encrypted_message(
                 decrypted_data.len()
             ));
 
-            // FIXED: Parse the decrypted data as a BitchatPacket
+            if let Some((&payload_type, payload_data)) = decrypted_data.split_first() {
+                match payload_type {
+                    NOISE_PAYLOAD_PRIVATE_MESSAGE => {
+                        write_noise_debug_log(
+                            "[DEBUG] Decrypted payload is iOS private Noise message",
+                        );
+
+                        match parse_private_noise_payload(payload_data) {
+                            Ok((message_id, content)) => {
+                                if blocked_peers.contains(&packet.sender_id_str) {
+                                    write_noise_debug_log(&format!(
+                                        "[DEBUG] Ignoring private Noise message from blocked peer: {}",
+                                        packet.sender_id_str
+                                    ));
+                                    return;
+                                }
+
+                                if bloom.check(&message_id) {
+                                    write_noise_debug_log(&format!(
+                                        "[DEBUG] Duplicate private Noise message ignored: {}",
+                                        message_id
+                                    ));
+                                    return;
+                                }
+                                bloom.set(&message_id);
+
+                                let sender_nick = peers_lock
+                                    .get(&packet.sender_id_str)
+                                    .and_then(|peer| peer.nickname.clone())
+                                    .unwrap_or_else(|| {
+                                        let short = packet
+                                            .sender_id_str
+                                            .chars()
+                                            .take(4)
+                                            .collect::<String>();
+                                        format!("anon{}", short)
+                                    });
+
+                                let peer_entry =
+                                    peers_lock.entry(packet.sender_id_str.clone()).or_default();
+                                if peer_entry.nickname.is_none() {
+                                    peer_entry.nickname = Some(sender_nick.clone());
+                                }
+
+                                let timestamp = chrono::Local::now();
+                                chat_context.last_private_sender =
+                                    Some((packet.sender_id_str.clone(), sender_nick.clone()));
+                                chat_context.add_dm(&sender_nick, &packet.sender_id_str);
+
+                                let structured_msg = format!(
+                                    "__DM__:{}:{}:{}",
+                                    sender_nick,
+                                    timestamp.format("%H%M"),
+                                    content
+                                );
+                                let _ = ui_tx.send(structured_msg).await;
+                                write_noise_debug_log(&format!(
+                                    "[DEBUG] Displayed private Noise message: {}",
+                                    message_id
+                                ));
+                                return;
+                            }
+                            Err(e) => {
+                                write_noise_debug_log(&format!(
+                                    "[DEBUG] Failed to parse iOS private Noise payload, trying legacy packet parser: {}",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                    NOISE_PAYLOAD_READ_RECEIPT => {
+                        write_noise_debug_log("[DEBUG] Ignoring Noise read receipt payload");
+                        return;
+                    }
+                    NOISE_PAYLOAD_DELIVERED => {
+                        write_noise_debug_log("[DEBUG] Ignoring Noise delivered payload");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Parse legacy Rust encrypted payloads as full Bitchat packets.
             write_noise_debug_log("[DEBUG] About to parse decrypted message as BitchatPacket");
             match crate::packet_parser::parse_bitchat_packet(&decrypted_data) {
                 Ok(inner_packet) => {
@@ -1944,7 +2137,11 @@ pub async fn handle_noise_encrypted_message(
             }
         }
         Err(e) => {
-            write_noise_debug_log(&format!("[DEBUG] Failed to decrypt message: {:?}", e));
+            if matches!(e, NoiseError::ReplayDetected) {
+                write_noise_debug_log("[DEBUG] Ignoring duplicate/replayed Noise message");
+            } else {
+                write_noise_debug_log(&format!("[DEBUG] Failed to decrypt message: {:?}", e));
+            }
         }
     }
 
