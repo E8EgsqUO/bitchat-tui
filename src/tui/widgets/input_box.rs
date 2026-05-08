@@ -5,6 +5,7 @@ use ratatui::{
     style::Style,
     widgets::{Block, Borders, Paragraph},
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::tui::app::{App, FocusArea};
 
@@ -17,7 +18,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Create wrapped text for the input
     let input_text = app.input.value();
-    let available_width = area.width.saturating_sub(2) as usize; // Account for borders
+    let available_width = (area.width.saturating_sub(2) as usize).max(1); // Account for borders
 
     // Split text into lines based on available width
     let lines = wrap_text(&input_text, available_width);
@@ -34,7 +35,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(input, area);
 
     // Calculate cursor position for multi-line input
-    let cursor_pos = app.input.visual_cursor();
+    let cursor_pos = app.input.cursor();
     let (cursor_line, cursor_col) =
         calculate_cursor_position(&input_text, cursor_pos, available_width);
 
@@ -44,74 +45,130 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WrappedSegment {
+    start: usize,
+    end: usize,
+    width: usize,
+    text: String,
+}
+
 fn wrap_text(text: &str, max_width: usize) -> Vec<ratatui::text::Line<'static>> {
-    if text.is_empty() {
-        return vec![ratatui::text::Line::from("")];
+    wrap_segments(text, max_width)
+        .into_iter()
+        .map(|segment| ratatui::text::Line::from(segment.text))
+        .collect()
+}
+
+fn wrap_segments(text: &str, max_width: usize) -> Vec<WrappedSegment> {
+    let max_width = max_width.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![WrappedSegment {
+            start: 0,
+            end: 0,
+            width: 0,
+            text: String::new(),
+        }];
     }
 
     let mut lines = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut current_pos = 0;
+    let mut start = 0usize;
+    let mut current = String::new();
+    let mut width = 0usize;
+    let mut idx = 0usize;
 
-    while current_pos < chars.len() {
-        let remaining_chars = chars.len() - current_pos;
-        let max_chars_for_line = max_width.min(remaining_chars);
-
-        // Find the best break point
-        let break_point = if max_chars_for_line == remaining_chars {
-            max_chars_for_line
-        } else {
-            // Look for the last space in the available range
-            let search_range = &chars[current_pos..current_pos + max_chars_for_line];
-            if let Some(last_space_idx) = search_range.iter().rposition(|&c| c == ' ') {
-                last_space_idx + 1
-            } else {
-                max_chars_for_line
-            }
-        };
-
-        let line_chars = &chars[current_pos..current_pos + break_point];
-        let line_content: String = line_chars.iter().collect();
-        lines.push(ratatui::text::Line::from(line_content));
-
-        current_pos += break_point;
-        if current_pos < chars.len() && chars[current_pos] == ' ' {
-            current_pos += 1; // Skip leading space on continuation lines
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if ch == '\n' {
+            lines.push(WrappedSegment {
+                start,
+                end: idx,
+                width,
+                text: std::mem::take(&mut current),
+            });
+            idx += 1;
+            start = idx;
+            width = 0;
+            continue;
         }
+
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width > 0 && width + ch_width > max_width {
+            lines.push(WrappedSegment {
+                start,
+                end: idx,
+                width,
+                text: std::mem::take(&mut current),
+            });
+            start = idx;
+            width = 0;
+            continue;
+        }
+
+        current.push(ch);
+        width += ch_width;
+        idx += 1;
     }
 
-    if lines.is_empty() {
-        lines.push(ratatui::text::Line::from(""));
+    lines.push(WrappedSegment {
+        start,
+        end: chars.len(),
+        width,
+        text: current,
+    });
+
+    if width >= max_width {
+        lines.push(WrappedSegment {
+            start: chars.len(),
+            end: chars.len(),
+            width: 0,
+            text: String::new(),
+        });
     }
 
     lines
 }
 
-fn calculate_cursor_position(text: &str, cursor_pos: usize, max_width: usize) -> (usize, usize) {
-    if text.is_empty() {
-        return (0, 0);
-    }
-
+fn calculate_cursor_position(text: &str, cursor_chars: usize, max_width: usize) -> (usize, usize) {
     let chars: Vec<char> = text.chars().collect();
-    let cursor_chars = chars.len().min(cursor_pos);
+    let cursor_chars = cursor_chars.min(chars.len());
+    let segments = wrap_segments(text, max_width);
 
-    let mut line = 0;
-    let mut col = 0;
-    let mut _char_count = 0;
-
-    for &ch in &chars[..cursor_chars] {
-        if ch == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-            if col >= max_width {
-                line += 1;
-                col = 0;
+    for (line_idx, segment) in segments.iter().enumerate() {
+        if cursor_chars >= segment.start && cursor_chars <= segment.end {
+            if cursor_chars == segment.end
+                && segment.width >= max_width.max(1)
+                && line_idx + 1 < segments.len()
+            {
+                return (line_idx + 1, 0);
             }
+
+            let col = chars[segment.start..cursor_chars]
+                .iter()
+                .map(|ch| UnicodeWidthChar::width(*ch).unwrap_or(0))
+                .sum::<usize>();
+            return (line_idx, col);
         }
-        _char_count += 1;
     }
 
-    (line, col)
+    let last_idx = segments.len().saturating_sub(1);
+    let last_width = segments.last().map(|segment| segment.width).unwrap_or(0);
+    (last_idx, last_width)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_uses_display_width_for_wide_chars() {
+        assert_eq!(calculate_cursor_position("你好啊", 3, 20), (0, 6));
+    }
+
+    #[test]
+    fn cursor_wraps_at_display_width() {
+        assert_eq!(calculate_cursor_position("你好吗", 2, 4), (1, 0));
+        assert_eq!(calculate_cursor_position("你好吗", 3, 4), (1, 2));
+    }
 }

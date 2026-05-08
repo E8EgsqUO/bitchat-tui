@@ -4,6 +4,7 @@ use chrono;
 use regex::Regex;
 use std::collections::HashMap;
 use tui_input::Input;
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -689,20 +690,24 @@ impl App {
         }
 
         // Calculate how many lines the input text would need
-        let chars: Vec<char> = input_text.chars().collect();
         let mut lines_needed = 1;
-        let mut current_line_length = 0;
+        let mut current_line_width = 0usize;
+        let max_line_width = available_width.saturating_sub(2).max(1); // Account for borders
 
-        for &ch in &chars {
+        for ch in input_text.chars() {
             if ch == '\n' {
                 lines_needed += 1;
-                current_line_length = 0;
+                current_line_width = 0;
             } else {
-                current_line_length += 1;
-                if current_line_length >= available_width.saturating_sub(2) {
-                    // Account for borders
+                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if current_line_width > 0 && current_line_width + ch_width > max_line_width {
                     lines_needed += 1;
-                    current_line_length = 0;
+                    current_line_width = 0;
+                }
+                current_line_width += ch_width;
+                if current_line_width >= max_line_width {
+                    lines_needed += 1;
+                    current_line_width = 0;
                 }
             }
         }

@@ -48,6 +48,7 @@ mod fragmentation;
 mod message_handlers;
 mod noise_protocol;
 mod noise_session;
+mod nostr_geo;
 mod notification_handlers;
 mod packet_creation;
 mod packet_delivery;
@@ -187,10 +188,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| "anonymous".to_string());
     let saved_nickname_clone = saved_nickname.clone();
+    let nostr_identity_seed = saved_state
+        .identity_key
+        .clone()
+        .or_else(|| saved_state.noise_static_key.clone())
+        .unwrap_or_default();
 
     // Initialize the TUI with the saved nickname
     let mut terminal = tui_mod::init().expect("Failed to initialize TUI");
     let mut app = App::new_with_nickname(saved_nickname);
+    let nostr_geo_client = nostr_geo::NostrGeoClient::new(ui_tx.clone(), nostr_identity_seed);
 
     // Spawn Bluetooth connection setup in the background
     let ui_tx_clone = ui_tx.clone();
@@ -977,9 +984,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if line.starts_with("/j ") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                let channel_name = parts.get(1).unwrap_or(&"").to_string();
+                let mut channel_name = parts.get(1).unwrap_or(&"").to_string();
+                if !channel_name.is_empty() && !channel_name.starts_with('#') {
+                    channel_name = format!("#{}", channel_name);
+                }
 
-                if !channel_name.is_empty() && channel_name.starts_with('#') {
+                if !channel_name.is_empty() {
+                    let is_geohash_channel = nostr_geo::is_geohash_channel(&channel_name);
+                    let has_password_arg = parts.len() > 2;
                     // Update TUI state
                     app.join_channel(channel_name.clone());
 
@@ -991,7 +1003,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let has_password = channel_keys.as_ref().unwrap().contains_key(&channel_name);
 
                     // Send appropriate system message to TUI
-                    let system_msg = if is_password_protected && has_password {
+                    let system_msg = if is_geohash_channel && !has_password_arg {
+                        format!("Joined geohash channel {} over Nostr", channel_name)
+                    } else if is_password_protected && has_password {
                         format!("Joined password-protected channel {}", channel_name)
                     } else {
                         format!("Joined channel {}", channel_name)
@@ -1018,6 +1032,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await
                     {
+                        if is_geohash_channel && !has_password_arg {
+                            if let Err(e) = nostr_geo_client
+                                .join_channel(&channel_name, &nickname)
+                                .await
+                            {
+                                app.add_log_message(format!(
+                                    "system: Failed to join Nostr geohash channel {}: {}",
+                                    channel_name, e
+                                ));
+                            }
+                        }
                         // Explicitly switch UI to the joined channel after successful join
                         app.switch_to_channel(channel_name.clone());
                         continue;
@@ -1261,6 +1286,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.add_log_message(format!("system: Failed to send DM: {}", e));
                 }
                 continue;
+            }
+            if let ChatMode::Channel(channel) = &chat_context.as_ref().unwrap().current_mode {
+                if nostr_geo::is_geohash_channel(channel)
+                    && !password_protected_channels
+                        .as_ref()
+                        .unwrap()
+                        .contains(channel)
+                {
+                    let nostr_geo_client = nostr_geo_client.clone();
+                    let ui_tx = ui_tx.clone();
+                    let channel = channel.clone();
+                    let message = line.clone();
+                    let nickname = nickname.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = nostr_geo_client
+                            .send_message(&channel, &message, &nickname)
+                            .await
+                        {
+                            let _ = ui_tx
+                                .send(format!(
+                                    "system: Failed to send geohash message on {}: {}",
+                                    channel, e
+                                ))
+                                .await;
+                        }
+                    });
+                    continue;
+                }
             }
             handle_regular_message(
                 &line,
