@@ -123,7 +123,7 @@ Supported proxy formats:
 - `/public` switch to public chat
 - `/dm <name> [msg]` open a DM or send an initial message
 - `/reply` reply to the last private sender
-- `/j #channel [password]` join a channel
+- `/j #channel` join a channel
 - `/leave` leave the current channel
 - `/transfer @user` transfer channel ownership
 - `/channels` list discovered channels
