@@ -77,12 +77,17 @@ fn parse_announcement_nickname(payload: &[u8]) -> Option<String> {
 }
 
 const MAX_FILE_TRANSFER_BYTES: usize = 1024 * 1024;
+const TUI_FILE_TRANSFER_MIME: &str = "application/vnd.bitchat-tui.file";
+const TUI_FILE_TRANSFER_MAGIC: &[u8] = b"bitchat-tui-file-v1";
 
 #[derive(Debug)]
 struct FileTransferPacket {
     file_name: Option<String>,
     file_size: Option<u64>,
     mime_type: Option<String>,
+    original_mime_type: Option<String>,
+    channel: Option<String>,
+    is_tui_file: bool,
     content: Vec<u8>,
 }
 
@@ -104,6 +109,9 @@ fn decode_file_transfer_payload(data: &[u8]) -> Option<FileTransferPacket> {
     let mut file_name = None;
     let mut file_size = None;
     let mut mime_type = None;
+    let mut original_mime_type = None;
+    let mut channel = None;
+    let mut is_tui_file = false;
     let mut content = Vec::new();
 
     while offset < data.len() {
@@ -147,8 +155,19 @@ fn decode_file_transfer_payload(data: &[u8]) -> Option<FileTransferPacket> {
                 }
                 content.extend_from_slice(value);
             }
+            0x05 => channel = String::from_utf8(value.to_vec()).ok(),
+            0x06 => original_mime_type = String::from_utf8(value.to_vec()).ok(),
+            0x7F => {
+                if value == TUI_FILE_TRANSFER_MAGIC {
+                    is_tui_file = true;
+                }
+            }
             _ => {}
         }
+    }
+
+    if mime_type.as_deref() == Some(TUI_FILE_TRANSFER_MIME) {
+        is_tui_file = true;
     }
 
     if content.is_empty() || content.len() > MAX_FILE_TRANSFER_BYTES {
@@ -159,11 +178,21 @@ fn decode_file_transfer_payload(data: &[u8]) -> Option<FileTransferPacket> {
         file_name,
         file_size,
         mime_type,
+        original_mime_type,
+        channel,
+        is_tui_file,
         content,
     })
 }
 
-fn mime_category(mime: Option<&str>) -> (&'static str, &'static str, &'static str, &'static str) {
+fn mime_category(
+    mime: Option<&str>,
+    is_tui_file: bool,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    if is_tui_file {
+        return ("files/incoming", "[file] ", "bin", "file");
+    }
+
     match mime.unwrap_or("").to_ascii_lowercase().as_str() {
         "image/jpeg" | "image/jpg" => ("images/incoming", "[image] ", "jpg", "image"),
         "image/png" => ("images/incoming", "[image] ", "png", "image"),
@@ -247,7 +276,12 @@ fn unique_path(directory: &Path, file_name: &str) -> PathBuf {
 }
 
 fn save_received_file(packet: &FileTransferPacket) -> std::io::Result<(PathBuf, &'static str)> {
-    let (subdir, prefix, extension, default_prefix) = mime_category(packet.mime_type.as_deref());
+    let effective_mime = packet
+        .original_mime_type
+        .as_deref()
+        .or(packet.mime_type.as_deref());
+    let (subdir, prefix, extension, default_prefix) =
+        mime_category(effective_mime, packet.is_tui_file);
     let base_dir = std::env::current_dir()?.join("received_files").join(subdir);
     fs::create_dir_all(&base_dir)?;
     let file_name = sanitize_file_name(packet.file_name.as_deref(), default_prefix, extension);
@@ -338,8 +372,14 @@ pub async fn handle_file_transfer_packet(
             content
         )
     } else {
+        let channel = file_packet
+            .channel
+            .as_deref()
+            .filter(|channel| channel.starts_with('#'))
+            .unwrap_or("#public");
         format!(
-            "__CHANNEL__:#public:{}:{}:{}",
+            "__CHANNEL__:{}:{}:{}:{}",
+            channel,
             sender_nick,
             timestamp.format("%H%M"),
             content

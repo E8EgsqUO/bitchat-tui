@@ -142,6 +142,23 @@ pub async fn send_packet_with_fragmentation(
     packet: Vec<u8>,
     my_peer_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    send_packet_with_fragmentation_as(
+        peripheral,
+        cmd_char,
+        packet,
+        my_peer_id,
+        MessageType::Message,
+    )
+    .await
+}
+
+pub async fn send_packet_with_fragmentation_as(
+    peripheral: &btleplug::platform::Peripheral,
+    cmd_char: &btleplug::api::Characteristic,
+    packet: Vec<u8>,
+    my_peer_id: &str,
+    original_msg_type: MessageType,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Swift's logic: if packet > 500 bytes, fragment it
     if packet.len() > 500 {
         debug_full_println!(
@@ -199,7 +216,7 @@ pub async fn send_packet_with_fragmentation(
             fragment_payload.push(index_bytes[1]);
             fragment_payload.push(total_bytes[0]);
             fragment_payload.push(total_bytes[1]);
-            fragment_payload.push(MessageType::Message as u8); // Original packet type
+            fragment_payload.push(original_msg_type as u8); // Original packet type
             fragment_payload.extend_from_slice(chunk);
 
             debug_full_println!(
@@ -209,7 +226,7 @@ pub async fn send_packet_with_fragmentation(
                 index_bytes[1],
                 total_bytes[0],
                 total_bytes[1],
-                MessageType::Message as u8
+                original_msg_type as u8
             );
             debug_full_println!(
                 "[DEBUG] Fragment payload size: {} bytes",
@@ -241,7 +258,7 @@ pub async fn send_packet_with_fragmentation(
             );
             debug_full_println!(
                 "[DEBUG]   Original type (1 byte): {} = {:02X}",
-                MessageType::Message as u8,
+                original_msg_type as u8,
                 fragment_payload[12]
             );
             debug_full_println!(
@@ -295,7 +312,7 @@ pub async fn send_packet_with_fragmentation(
 
                     if frag_index == index as u16
                         && frag_total == total_fragments
-                        && frag_orig_type == MessageType::Message as u8
+                        && frag_orig_type == original_msg_type as u8
                     {
                         debug_full_println!("[DEBUG] ✅ Fragment payload verification passed");
                     } else {

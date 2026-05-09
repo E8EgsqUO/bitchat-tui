@@ -115,6 +115,47 @@ fn encode_unpadded_packet(
     data
 }
 
+fn encode_unpadded_packet_v2(
+    sender_id_str: &str,
+    recipient_id_str: Option<&str>,
+    msg_type: MessageType,
+    payload: &[u8],
+    signature: Option<&[u8]>,
+    ttl: u8,
+    timestamp_ms: u64,
+) -> Vec<u8> {
+    let mut data = Vec::new();
+
+    data.push(2u8);
+    data.push(msg_type as u8);
+    data.push(ttl);
+    data.extend_from_slice(&timestamp_ms.to_be_bytes());
+
+    let mut flags: u8 = 0;
+    if recipient_id_str.is_some() {
+        flags |= FLAG_HAS_RECIPIENT;
+    }
+    if signature.is_some() {
+        flags |= FLAG_HAS_SIGNATURE;
+    }
+    data.push(flags);
+
+    data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    data.extend_from_slice(&id_bytes_from_str(sender_id_str));
+
+    if let Some(recipient) = recipient_id_str {
+        data.extend_from_slice(&id_bytes_from_str(recipient));
+    }
+
+    data.extend_from_slice(payload);
+
+    if let Some(sig) = signature {
+        data.extend_from_slice(&sig[..std::cmp::min(sig.len(), 64)]);
+    }
+
+    data
+}
+
 pub fn create_bitchat_packet_for_signing(
     sender_id_str: &str,
     recipient_id_str: Option<&str>,
@@ -146,6 +187,50 @@ pub fn create_bitchat_packet_for_signing_at(
         0,
         timestamp_ms,
     );
+    let optimal_size = optimal_block_size_for_padding(data.len());
+    pad_message_to_size(data, optimal_size)
+}
+
+pub fn create_file_transfer_packet_for_signing_at(
+    sender_id_str: &str,
+    recipient_id_str: Option<&str>,
+    payload: &[u8],
+    timestamp_ms: u64,
+) -> Vec<u8> {
+    let data = encode_unpadded_packet_v2(
+        sender_id_str,
+        recipient_id_str,
+        MessageType::FileTransfer,
+        payload,
+        None,
+        0,
+        timestamp_ms,
+    );
+    let optimal_size = optimal_block_size_for_padding(data.len());
+    pad_message_to_size(data, optimal_size)
+}
+
+pub fn create_file_transfer_packet_with_recipient_at(
+    sender_id_str: &str,
+    recipient_id_str: Option<&str>,
+    payload: Vec<u8>,
+    signature: Option<Vec<u8>>,
+    timestamp_ms: u64,
+) -> Vec<u8> {
+    let data = encode_unpadded_packet_v2(
+        sender_id_str,
+        recipient_id_str,
+        MessageType::FileTransfer,
+        &payload,
+        signature.as_deref(),
+        DEFAULT_TTL,
+        timestamp_ms,
+    );
+
+    if cfg!(target_os = "windows") {
+        return data;
+    }
+
     let optimal_size = optimal_block_size_for_padding(data.len());
     pad_message_to_size(data, optimal_size)
 }
@@ -529,5 +614,28 @@ mod tests {
         assert_eq!(payload[40], 0x03);
         assert_eq!(payload[41], 32);
         assert_eq!(&payload[42..74], &[2; 32]);
+    }
+
+    #[test]
+    fn file_transfer_packet_uses_v2_four_byte_payload_length() {
+        let payload = vec![7u8; 70_000];
+        let timestamp = 0x0102_0304_0506_0708;
+        let data = create_file_transfer_packet_with_recipient_at(
+            "0102030405060708",
+            Some("1112131415161718"),
+            payload.clone(),
+            None,
+            timestamp,
+        );
+
+        assert_eq!(data[0], 2);
+        assert_eq!(data[1], MessageType::FileTransfer as u8);
+        assert_eq!(data[2], DEFAULT_TTL);
+        assert_eq!(&data[3..11], &timestamp.to_be_bytes());
+        assert_eq!(data[11], FLAG_HAS_RECIPIENT);
+        assert_eq!(&data[12..16], &(payload.len() as u32).to_be_bytes());
+        assert_eq!(&data[16..24], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&data[24..32], &[17, 18, 19, 20, 21, 22, 23, 24]);
+        assert_eq!(&data[32..32 + payload.len()], payload.as_slice());
     }
 }

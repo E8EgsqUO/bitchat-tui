@@ -1,7 +1,7 @@
 // src/tui/tui.rs
 
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -13,14 +13,24 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Initializes the terminal for TUI rendering.
 pub fn init() -> io::Result<Tui> {
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     enable_raw_mode()?;
     Terminal::new(CrosstermBackend::new(stdout()))
 }
 
 /// Restores the terminal to its original state.
 pub fn restore() -> io::Result<()> {
-    execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     disable_raw_mode()?;
     Ok(())
 }

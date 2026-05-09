@@ -120,6 +120,8 @@ fn get_help_text(app: &App) -> Vec<Span> {
                     Span::raw(": Switch focus • "),
                     Span::styled("Enter", Style::default().fg(Color::Yellow)),
                     Span::raw(": Send message • "),
+                    Span::styled("PgUp/PgDn", Style::default().fg(Color::Yellow)),
+                    Span::raw(": History • "),
                     Span::styled("Ctrl+C", Style::default().fg(Color::Yellow)),
                     Span::raw(": Exit"),
                 ]);

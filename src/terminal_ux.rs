@@ -166,6 +166,7 @@ pub fn get_help_text() -> String {
         "  /public                  Go to public chat\n",
         "▶ Messaging",
         "  /dm <name> [msg]       Start or send a private message",
+        "  /file [@user] <path>   Send a TUI-to-TUI mesh file",
         "  /reply                   Reply to last private message\n",
         "▶ Channels",
         "  /j #channel            Join/create a channel",

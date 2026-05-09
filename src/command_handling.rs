@@ -1,9 +1,11 @@
 use crate::data_structures::{DebugLevel, DeliveryTracker, MessageType, Peer, DEBUG_LEVEL};
 use crate::encryption::EncryptionService;
-use crate::fragmentation::send_packet_with_fragmentation;
+use crate::fragmentation::{send_packet_with_fragmentation, send_packet_with_fragmentation_as};
 use crate::noise_session::NoiseSessionManager;
 use crate::packet_creation::{
     create_bitchat_packet, create_bitchat_packet_with_recipient_and_signature,
+    create_file_transfer_packet_for_signing_at, create_file_transfer_packet_with_recipient_at,
+    current_timestamp_ms,
 };
 use crate::packet_delivery::send_channel_announce;
 use crate::payload_handling::create_bitchat_message_payload_full;
@@ -14,9 +16,14 @@ use btleplug::platform::Peripheral;
 use chrono;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+
+const MAX_FILE_TRANSFER_BYTES: u64 = 1024 * 1024;
+const TUI_FILE_TRANSFER_MIME: &str = "application/vnd.bitchat-tui.file";
+const TUI_FILE_TRANSFER_MAGIC: &[u8] = b"bitchat-tui-file-v1";
 
 fn persistent_channels(chat_context: &ChatContext) -> Vec<String> {
     chat_context
@@ -25,6 +32,143 @@ fn persistent_channels(chat_context: &ChatContext) -> Vec<String> {
         .filter(|channel| !crate::nostr_geo::is_geohash_channel(channel))
         .cloned()
         .collect()
+}
+
+struct FileCommand<'a> {
+    target_nickname: Option<&'a str>,
+    path: &'a str,
+}
+
+fn trim_path_quotes(path: &str) -> &str {
+    let path = path.trim();
+    if path.len() >= 2
+        && ((path.starts_with('"') && path.ends_with('"'))
+            || (path.starts_with('\'') && path.ends_with('\'')))
+    {
+        &path[1..path.len() - 1]
+    } else {
+        path
+    }
+}
+
+fn parse_file_command(line: &str) -> Result<Option<FileCommand<'_>>, &'static str> {
+    let Some(rest) = line.strip_prefix("/file") else {
+        return Ok(None);
+    };
+
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return Ok(None);
+    }
+
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err("Usage: /file [@user] <path>");
+    }
+
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("");
+
+    if let Some(target) = first.strip_prefix('@') {
+        if target.is_empty() {
+            return Err("Usage: /file [@user] <path>");
+        }
+        let Some(path) = parts.next().map(str::trim_start) else {
+            return Err("Usage: /file [@user] <path>");
+        };
+        let path = trim_path_quotes(path);
+        if path.is_empty() {
+            return Err("Usage: /file [@user] <path>");
+        }
+        Ok(Some(FileCommand {
+            target_nickname: Some(target),
+            path,
+        }))
+    } else {
+        let path = trim_path_quotes(rest);
+        if path.is_empty() {
+            return Err("Usage: /file [@user] <path>");
+        }
+        Ok(Some(FileCommand {
+            target_nickname: None,
+            path,
+        }))
+    }
+}
+
+fn push_tlv_u16(payload: &mut Vec<u8>, field_type: u8, value: &[u8]) -> Result<(), String> {
+    if value.len() > u16::MAX as usize {
+        return Err("File metadata is too large".to_string());
+    }
+    payload.push(field_type);
+    payload.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    payload.extend_from_slice(value);
+    Ok(())
+}
+
+fn infer_mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+fn create_file_transfer_payload(
+    path: &Path,
+    content: &[u8],
+    channel: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "File path must include a valid file name".to_string())?;
+
+    let mut payload = Vec::with_capacity(file_name.len() + content.len() + 64);
+    push_tlv_u16(&mut payload, 0x7F, TUI_FILE_TRANSFER_MAGIC)?;
+    push_tlv_u16(&mut payload, 0x01, file_name.as_bytes())?;
+
+    payload.push(0x02);
+    payload.extend_from_slice(&8u16.to_be_bytes());
+    payload.extend_from_slice(&(content.len() as u64).to_be_bytes());
+
+    push_tlv_u16(&mut payload, 0x03, TUI_FILE_TRANSFER_MIME.as_bytes())?;
+    push_tlv_u16(&mut payload, 0x06, infer_mime_type(path).as_bytes())?;
+
+    payload.push(0x04);
+    payload.extend_from_slice(&(content.len() as u32).to_be_bytes());
+    payload.extend_from_slice(content);
+
+    if let Some(channel) = channel {
+        push_tlv_u16(&mut payload, 0x05, channel.as_bytes())?;
+    }
+
+    Ok(payload)
+}
+
+fn format_file_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 pub async fn handle_name_command(
@@ -615,6 +759,179 @@ pub async fn handle_dm_command(
         }
     }
     false
+}
+
+pub async fn handle_file_command(
+    line: &str,
+    chat_context: &ChatContext,
+    peers: &Arc<Mutex<HashMap<String, Peer>>>,
+    password_protected_channels: &HashSet<String>,
+    encryption_service: &EncryptionService,
+    my_peer_id: &str,
+    peripheral: &Peripheral,
+    cmd_char: &btleplug::api::Characteristic,
+    ui_tx: mpsc::Sender<String>,
+    app: &mut crate::tui::app::App,
+) -> bool {
+    let command = match parse_file_command(line) {
+        Ok(Some(command)) => command,
+        Ok(None) => return false,
+        Err(usage) => {
+            app.add_log_message(format!("system: {}", usage));
+            app.add_log_message("system: Example: /file @alice ./photo.png".to_string());
+            return true;
+        }
+    };
+
+    let path = Path::new(command.path);
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            app.add_log_message(format!(
+                "system: Cannot read file '{}': {}",
+                command.path, e
+            ));
+            return true;
+        }
+    };
+
+    if !metadata.is_file() {
+        app.add_log_message(format!("system: '{}' is not a regular file", command.path));
+        return true;
+    }
+
+    let file_size = metadata.len();
+    if file_size == 0 {
+        app.add_log_message("system: Empty files are not supported yet".to_string());
+        return true;
+    }
+    if file_size > MAX_FILE_TRANSFER_BYTES {
+        app.add_log_message(format!(
+            "system: File is too large: {}. Maximum is {}.",
+            format_file_size(file_size),
+            format_file_size(MAX_FILE_TRANSFER_BYTES)
+        ));
+        return true;
+    }
+
+    let content = match tokio::fs::read(path).await {
+        Ok(content) => content,
+        Err(e) => {
+            app.add_log_message(format!("system: Failed to read '{}': {}", command.path, e));
+            return true;
+        }
+    };
+
+    let (recipient_peer_id, recipient_nickname) = if let Some(target_nickname) =
+        command.target_nickname
+    {
+        let peer_id = {
+            peers
+                .lock()
+                .await
+                .iter()
+                .find(|(_, peer)| peer.nickname.as_deref() == Some(target_nickname))
+                .map(|(id, _)| id.clone())
+        };
+
+        match peer_id {
+            Some(peer_id) => (Some(peer_id), Some(target_nickname.to_string())),
+            None => {
+                app.add_log_message(format!(
+                    "system: User '{}' not found. They may be offline or using a different nickname.",
+                    target_nickname
+                ));
+                return true;
+            }
+        }
+    } else if let ChatMode::PrivateDM { nickname, peer_id } = &chat_context.current_mode {
+        (Some(peer_id.clone()), Some(nickname.clone()))
+    } else {
+        (None, None)
+    };
+
+    let channel = if recipient_peer_id.is_none() {
+        chat_context.current_mode.get_channel()
+    } else {
+        None
+    };
+
+    if let Some(channel) = channel {
+        if crate::nostr_geo::is_geohash_channel(channel) {
+            app.add_log_message(
+                "system: /file is only available on the Bluetooth mesh, not in Nostr geohash channels."
+                    .to_string(),
+            );
+            return true;
+        }
+
+        if password_protected_channels.contains(channel) {
+            app.add_log_message(format!(
+                "system: File transfer is not supported in password-protected channel {}.",
+                channel
+            ));
+            return true;
+        }
+    }
+
+    let payload = match create_file_transfer_payload(path, &content, channel) {
+        Ok(payload) => payload,
+        Err(e) => {
+            app.add_log_message(format!("system: Failed to prepare file transfer: {}", e));
+            return true;
+        }
+    };
+
+    let timestamp = current_timestamp_ms();
+    let signing_payload = create_file_transfer_packet_for_signing_at(
+        my_peer_id,
+        recipient_peer_id.as_deref(),
+        &payload,
+        timestamp,
+    );
+    let signature = encryption_service.sign(&signing_payload);
+    let packet = create_file_transfer_packet_with_recipient_at(
+        my_peer_id,
+        recipient_peer_id.as_deref(),
+        payload,
+        Some(signature),
+        timestamp,
+    );
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command.path);
+
+    match send_packet_with_fragmentation_as(
+        peripheral,
+        cmd_char,
+        packet,
+        my_peer_id,
+        MessageType::FileTransfer,
+    )
+    .await
+    {
+        Ok(()) => {
+            let display = format!("[file] {} ({})", file_name, format_file_size(file_size));
+            if let Some(target_nickname) = recipient_nickname {
+                app.add_dm_message(target_nickname.clone(), display);
+                app.add_log_message(format!("system: Sent file to {}", target_nickname));
+            } else {
+                app.add_sent_message(display);
+            }
+        }
+        Err(e) => {
+            let _ = ui_tx
+                .send(format!(
+                    "\n\x1b[91m❌ File transfer failed\x1b[0m\n\x1b[90m{}\x1b[0m\n",
+                    e
+                ))
+                .await;
+        }
+    }
+
+    true
 }
 
 pub async fn handle_block_command(

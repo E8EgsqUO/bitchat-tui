@@ -68,9 +68,9 @@ use crate::noise_session::NoiseSessionManager;
 use crate::notification_handlers::handle_handshake_request_message;
 use command_handling::{
     handle_block_command, handle_channels_command, handle_clear_command, handle_dm_command,
-    handle_exit_command, handle_fingerprint_command, handle_join_command, handle_leave_command,
-    handle_name_command, handle_online_command, handle_public_command, handle_reply_command,
-    handle_transfer_command, handle_unblock_command,
+    handle_exit_command, handle_file_command, handle_fingerprint_command, handle_join_command,
+    handle_leave_command, handle_name_command, handle_online_command, handle_public_command,
+    handle_reply_command, handle_transfer_command, handle_unblock_command,
 };
 use encryption::EncryptionService;
 use message_handlers::{handle_private_dm_message, handle_regular_message};
@@ -248,6 +248,7 @@ fn mesh_only_command_in_geohash(line: &str) -> Option<&'static str> {
     let command = line.split_whitespace().next().unwrap_or("");
     match command {
         "/reply" => Some("/reply"),
+        "/file" => Some("/file"),
         "/transfer" => Some("/transfer"),
         "/block" => Some("/block"),
         "/unblock" => Some("/unblock"),
@@ -881,8 +882,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 3. Handle input events
         if crossterm_event::poll(tick_rate.saturating_sub(last_tick.elapsed())).unwrap_or(false) {
-            if let CrosstermEvent::Key(key_event) = crossterm_event::read().unwrap() {
-                event::handle_key_event(&mut app, key_event, &input_tx);
+            match crossterm_event::read().unwrap() {
+                CrosstermEvent::Key(key_event) => {
+                    event::handle_key_event(&mut app, key_event, &input_tx);
+                }
+                CrosstermEvent::Paste(pasted) => {
+                    event::handle_paste_event(&mut app, &pasted);
+                }
+                _ => {}
             }
         }
         // 4. Handle pending channel switches
@@ -1583,6 +1590,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 continue;
             }
+            if handle_file_command(
+                &line,
+                chat_context.as_ref().unwrap(),
+                peers.as_ref().unwrap(),
+                password_protected_channels.as_ref().unwrap(),
+                encryption_service.as_ref().unwrap(),
+                &my_peer_id,
+                peripheral.as_ref().unwrap(),
+                cmd_char.as_ref().unwrap(),
+                ui_tx.clone(),
+                &mut app,
+            )
+            .await
+            {
+                continue;
+            }
             if handle_block_command(
                 &line,
                 blocked_peers.as_mut().unwrap(),
@@ -1901,6 +1924,10 @@ mod tests {
         assert_eq!(
             mesh_only_command_in_geohash("/transfer @alice"),
             Some("/transfer")
+        );
+        assert_eq!(
+            mesh_only_command_in_geohash("/file @alice ./photo.png"),
+            Some("/file")
         );
         assert_eq!(
             mesh_only_command_in_geohash("/block @alice"),
