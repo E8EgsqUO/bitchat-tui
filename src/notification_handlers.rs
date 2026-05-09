@@ -365,10 +365,7 @@ pub async fn handle_announce_message(
 
     if is_new_peer {
         let _ = ui_tx
-            .send(format!(
-                "\r\x1b[K\x1b[33m{} connected\x1b[0m\n> ",
-                peer_nickname
-            ))
+            .send(format!("__PEER_CONNECTED__:{}", peer_nickname))
             .await;
     }
 
@@ -635,8 +632,10 @@ pub async fn handle_message_packet(
                         ))
                         .await;
                 }
-                // Send connected message to TUI so it updates the people list
-                let _ = ui_tx.send(format!("{} connected\n", sender_nick)).await;
+                // Send structured peer discovery to TUI so it updates the people list.
+                let _ = ui_tx
+                    .send(format!("__PEER_CONNECTED__:{}", sender_nick))
+                    .await;
             }
 
             if let Some(channel) = &message.channel {
@@ -955,8 +954,10 @@ pub async fn handle_fragment_packet(
                                         ))
                                         .await;
                                 }
-                                // Send connected message to TUI so it updates the people list
-                                let _ = ui_tx.send(format!("{} connected\n", message.sender)).await;
+                                // Send structured peer discovery to TUI so it updates the people list.
+                                let _ = ui_tx
+                                    .send(format!("__PEER_CONNECTED__:{}", message.sender))
+                                    .await;
                             }
 
                             let sender_nick = &message.sender;
@@ -2181,7 +2182,9 @@ async fn handle_decrypted_message(
                 .entry(inner_packet.sender_id_str.clone())
                 .or_default();
             peer_entry.nickname = Some(message.sender.clone());
-            let _ = ui_tx.send(format!("{} connected\n", message.sender)).await;
+            let _ = ui_tx
+                .send(format!("__PEER_CONNECTED__:{}", message.sender))
+                .await;
         }
 
         // Handle channel discovery

@@ -233,6 +233,33 @@ impl App {
         Some((channel, nickname, pubkey))
     }
 
+    pub fn current_geohash_context_channel(&self) -> Option<String> {
+        if let Some((channel, _, _)) = self.current_geohash_dm() {
+            return Some(channel);
+        }
+
+        let channel = self.get_selected_channel_name();
+        if crate::nostr_geo::is_geohash_channel(&channel) {
+            Some(channel)
+        } else {
+            None
+        }
+    }
+
+    pub fn geohash_people_for_channel(&self, channel: &str) -> Vec<String> {
+        self.geohash_people
+            .get(channel)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn geohash_person_pubkey(&self, channel: &str, nickname: &str) -> Option<String> {
+        self.geohash_people_pubkeys
+            .get(channel)?
+            .get(nickname)
+            .cloned()
+    }
+
     fn add_geohash_person(&mut self, channel: &str, sender: &str, pubkey: Option<&str>) {
         if sender == self.nickname || sender == "system" || sender.trim().is_empty() {
             return;
@@ -251,6 +278,24 @@ impl App {
         if !people.iter().any(|person| person == sender) {
             people.push(sender.to_string());
             people.sort();
+        }
+    }
+
+    fn add_mesh_person(&mut self, name: &str) {
+        let name = name.trim().trim_start_matches('@');
+        if name.is_empty() || name == self.nickname || name == "system" {
+            return;
+        }
+        if name.len() > 20
+            || !name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return;
+        }
+        if !self.people.iter().any(|person| person == name) {
+            self.people.push(name.to_string());
+            self.people.sort();
         }
     }
 
@@ -471,11 +516,8 @@ impl App {
             }
         }
 
-        if let Some(captures) = Regex::new(r"(\w+) connected").unwrap().captures(trimmed) {
-            let name = captures.get(1).unwrap().as_str().to_string();
-            if !self.people.contains(&name) {
-                self.people.push(name);
-            }
+        if let Some(name) = trimmed.strip_prefix("__PEER_CONNECTED__:") {
+            self.add_mesh_person(name);
             return;
         }
 
@@ -975,5 +1017,24 @@ mod tests {
         app.switch_to_dm("anon7301".to_string());
 
         assert_eq!(app.get_visible_person_unread_count("anon7301"), 0);
+    }
+
+    #[test]
+    fn structured_peer_connected_updates_people() {
+        let mut app = App::new_with_nickname("me".to_string());
+
+        app.add_log_message("__PEER_CONNECTED__:anon7301".to_string());
+
+        assert_eq!(app.people, vec!["anon7301".to_string()]);
+    }
+
+    #[test]
+    fn not_connected_text_does_not_create_person() {
+        let mut app = App::new_with_nickname("me".to_string());
+
+        app.add_log_message("system: Bluetooth mesh unavailable: Not connected".to_string());
+        app.add_log_message("Not connected".to_string());
+
+        assert!(app.people.is_empty());
     }
 }

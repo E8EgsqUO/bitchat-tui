@@ -10,6 +10,7 @@
 - Unread counters in the sidebar for channels and people
 - Message fragmentation and reassembly for larger payloads
 - Windows, Linux, and macOS builds with the same Rust codebase
+- Graceful fallback when Bluetooth mesh discovery fails, with geohash chat still available
 
 ## Requirements
 
@@ -76,12 +77,18 @@ If the Bluetooth mesh connection stalls or drops, press `r` on the error screen 
 - Once inside a geohash channel, the sidebar shows the local people list for that region.
 - Direct messages work from the `People` list in the geohash view.
 - Use `/leave` to leave the geohash channel and return to public chat.
+- `/w`, `/online`, `/channels`, `/name`, and `/public` work in geohash mode.
+- `/reply`, `/transfer`, `/block`, and `/unblock` are mesh-only commands.
 
 ### Direct Messages
 
-- Use `/dm <name>` for mesh direct messages.
+- Use `/dm <name>` to open a direct message.
+- Use `/dm <name> <message>` to send a direct message immediately.
+- In a geohash channel, `/dm` uses the people seen in that region.
+- In mesh mode, `/dm` uses visible Bluetooth mesh peers.
 - In the sidebar, select a person to open or continue a DM.
 - Unread DM counts appear next to names in `People`.
+- `/pass` has been removed from this fork.
 
 ## Proxy Support
 
@@ -118,7 +125,6 @@ Supported proxy formats:
 - `/reply` reply to the last private sender
 - `/j #channel [password]` join a channel
 - `/leave` leave the current channel
-- `/pass <password>` set a channel password
 - `/transfer @user` transfer channel ownership
 - `/channels` list discovered channels
 - `/w` or `/online` show visible users
@@ -155,3 +161,4 @@ BITCHAT_TUI_FILE_LOG=0
 - If Bluetooth mesh is unavailable, geohash channels remain usable.
 - `r` is still useful as a recovery action when the Bluetooth scan needs to be restarted.
 - Proxy settings apply to Nostr relay traffic, not Bluetooth mesh traffic.
+- `/reply`, `/transfer`, `/block`, and `/unblock` are Bluetooth mesh commands. In geohash channels, use the `People` list or `/dm <name>` for direct messages.

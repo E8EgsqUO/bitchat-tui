@@ -66,8 +66,8 @@ use crate::notification_handlers::handle_handshake_request_message;
 use command_handling::{
     handle_block_command, handle_channels_command, handle_clear_command, handle_dm_command,
     handle_exit_command, handle_fingerprint_command, handle_join_command, handle_leave_command,
-    handle_name_command, handle_online_command, handle_pass_command, handle_public_command,
-    handle_reply_command, handle_transfer_command, handle_unblock_command,
+    handle_name_command, handle_online_command, handle_public_command, handle_reply_command,
+    handle_transfer_command, handle_unblock_command,
 };
 use encryption::EncryptionService;
 use message_handlers::{handle_private_dm_message, handle_regular_message};
@@ -83,9 +83,52 @@ use packet_creation::{
     create_bitchat_packet_with_signature_at, current_timestamp_ms,
 };
 use packet_parser::parse_bitchat_packet;
-use persistence::{load_state, save_state, AppState};
+use persistence::{load_state, save_state, AppState, EncryptedPassword};
 use terminal_ux::{ChatContext, ChatMode};
 use x25519_dalek::StaticSecret;
+
+type AppStateFactory = Box<
+    dyn Fn(
+            &HashSet<String>,
+            &HashMap<String, String>,
+            &Vec<String>,
+            &HashSet<String>,
+            &HashMap<String, String>,
+            &HashMap<String, EncryptedPassword>,
+            &str,
+        ) -> AppState
+        + Send
+        + Sync,
+>;
+
+fn build_app_state_factory(
+    favorites: Option<HashSet<String>>,
+    identity_key: Option<Vec<u8>>,
+    noise_static_key: Option<Vec<u8>>,
+) -> AppStateFactory {
+    Box::new(
+        move |blocked,
+              creators,
+              channels,
+              protected,
+              commitments,
+              encrypted_passwords,
+              current_nickname| {
+            AppState {
+                nickname: Some(current_nickname.to_string()),
+                blocked_peers: blocked.clone(),
+                channel_creators: creators.clone(),
+                joined_channels: channels.clone(),
+                password_protected_channels: protected.clone(),
+                channel_key_commitments: commitments.clone(),
+                favorites: favorites.clone().unwrap_or_default(),
+                identity_key: identity_key.clone(),
+                noise_static_key: noise_static_key.clone(),
+                encrypted_channel_passwords: encrypted_passwords.clone(),
+            }
+        },
+    )
+}
 
 // This function now takes a UI channel sender to direct its output.
 // It still reads from stdin directly but sends user input over its own channel.
@@ -174,6 +217,41 @@ async fn setup_bluetooth_connection(
     Ok(peripheral)
 }
 
+fn parse_dm_command(line: &str) -> Option<(String, Option<String>)> {
+    let mut parts = line.splitn(3, ' ');
+    if parts.next()? != "/dm" {
+        return None;
+    }
+
+    let target = parts.next()?.trim().trim_start_matches('@');
+    if target.is_empty() {
+        return None;
+    }
+
+    let message = parts
+        .next()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(ToOwned::to_owned);
+
+    Some((target.to_string(), message))
+}
+
+fn is_pass_command(line: &str) -> bool {
+    line == "/pass" || line.starts_with("/pass ")
+}
+
+fn mesh_only_command_in_geohash(line: &str) -> Option<&'static str> {
+    let command = line.split_whitespace().next().unwrap_or("");
+    match command {
+        "/reply" => Some("/reply"),
+        "/transfer" => Some("/transfer"),
+        "/block" => Some("/block"),
+        "/unblock" => Some("/unblock"),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Channel for user input from the TUI input box
@@ -243,21 +321,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut discovered_channels: Option<HashSet<String>> = Some(HashSet::new());
     let mut _favorites: Option<HashSet<String>> = Some(saved_state.favorites.clone());
     let mut _identity_key: Option<Vec<u8>> = saved_state.identity_key.clone();
-    let mut create_app_state: Option<
-        Box<
-            dyn Fn(
-                    &HashSet<String>,
-                    &HashMap<String, String>,
-                    &Vec<String>,
-                    &HashSet<String>,
-                    &HashMap<String, String>,
-                    &HashMap<String, persistence::EncryptedPassword>,
-                    &str,
-                ) -> AppState
-                + Send
-                + Sync,
-        >,
-    > = None;
+    let create_app_state: Option<AppStateFactory> = Some(build_app_state_factory(
+        _favorites.clone(),
+        _identity_key.clone(),
+        app_state
+            .as_ref()
+            .and_then(|state| state.noise_static_key.clone()),
+    ));
     let mut noise_session_manager: Option<NoiseSessionManager> = None;
 
     if let Some(state) = app_state.as_mut() {
@@ -333,19 +403,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Post-connection initialization (only once)
         if !post_connect_initialized && matches!(app.phase, tui::app::TuiPhase::Connected) {
-            if let Some(peripheral) = &peripheral {
+            if let Some(current_peripheral) = peripheral.as_ref().cloned() {
                 // Discover services, get characteristics, subscribe, etc.
-                let _ = peripheral.discover_services().await;
-                let chars = peripheral.characteristics();
-                let cmd = chars
+                if let Err(e) = current_peripheral.discover_services().await {
+                    app.connected = false;
+                    app.mesh_status = "Offline".to_string();
+                    app.add_log_message(format!(
+                        "system: Bluetooth mesh unavailable: service discovery failed: {}. Nostr geohash channels remain available, for example /j #ws.",
+                        e
+                    ));
+                    let _ = current_peripheral.disconnect().await;
+                    peripheral = None;
+                    notification_stream = None;
+                    _characteristics = None;
+                    cmd_char = None;
+                    post_connect_initialized = true;
+                    continue;
+                }
+
+                let chars = current_peripheral.characteristics();
+                let Some(cmd) = chars
                     .iter()
                     .find(|c| c.uuid == BITCHAT_CHARACTERISTIC_UUID)
-                    .expect("Characteristic not found.")
-                    .clone();
-                let _ = peripheral.subscribe(&cmd).await;
-                notification_stream = Some(peripheral.notifications().await.unwrap());
+                    .cloned()
+                else {
+                    let available = chars
+                        .iter()
+                        .map(|c| c.uuid.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    app.connected = false;
+                    app.mesh_status = "Offline".to_string();
+                    app.add_log_message(format!(
+                        "system: Bluetooth mesh unavailable: required bitchat characteristic {} was not found. Available characteristics: {}. Nostr geohash channels remain available, for example /j #ws.",
+                        BITCHAT_CHARACTERISTIC_UUID,
+                        if available.is_empty() { "none" } else { &available }
+                    ));
+                    let _ = current_peripheral.disconnect().await;
+                    peripheral = None;
+                    notification_stream = None;
+                    _characteristics = None;
+                    cmd_char = None;
+                    post_connect_initialized = true;
+                    continue;
+                };
+
+                if let Err(e) = current_peripheral.subscribe(&cmd).await {
+                    app.connected = false;
+                    app.mesh_status = "Offline".to_string();
+                    app.add_log_message(format!(
+                        "system: Bluetooth mesh unavailable: failed to subscribe to bitchat characteristic: {}. Nostr geohash channels remain available, for example /j #ws.",
+                        e
+                    ));
+                    let _ = current_peripheral.disconnect().await;
+                    peripheral = None;
+                    notification_stream = None;
+                    _characteristics = None;
+                    cmd_char = None;
+                    post_connect_initialized = true;
+                    continue;
+                }
+
+                let notifications = match current_peripheral.notifications().await {
+                    Ok(notifications) => notifications,
+                    Err(e) => {
+                        app.connected = false;
+                        app.mesh_status = "Offline".to_string();
+                        app.add_log_message(format!(
+                            "system: Bluetooth mesh unavailable: failed to open notifications: {}. Nostr geohash channels remain available, for example /j #ws.",
+                            e
+                        ));
+                        let _ = current_peripheral.disconnect().await;
+                        peripheral = None;
+                        notification_stream = None;
+                        _characteristics = None;
+                        cmd_char = None;
+                        post_connect_initialized = true;
+                        continue;
+                    }
+                };
+
+                notification_stream = Some(notifications);
                 _characteristics = Some(chars);
-                cmd_char = Some(cmd);
+                cmd_char = Some(cmd.clone());
                 // Announce the existing mesh identity once Bluetooth is available.
                 let encryption = encryption_service.as_ref().unwrap();
                 let announce_payload = create_announcement_payload(
@@ -375,40 +515,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     WriteType::WithoutResponse
                 };
-                let _ = peripheral
-                    .write(
-                        &cmd_char.as_ref().unwrap(),
-                        &announce_packet,
-                        announce_write_type,
-                    )
+                let _ = current_peripheral
+                    .write(&cmd, &announce_packet, announce_write_type)
                     .await;
                 _chat_messages = Some(HashMap::new());
-                // Set up the create_app_state closure
-                let favs = _favorites.clone();
-                let id_key = _identity_key.clone();
-                let noise_static_key = app_state.as_ref().unwrap().noise_static_key.clone();
-                create_app_state = Some(Box::new(
-                    move |blocked,
-                          creators,
-                          channels,
-                          protected,
-                          commitments,
-                          encrypted_passwords,
-                          current_nickname| {
-                        AppState {
-                            nickname: Some(current_nickname.to_string()),
-                            blocked_peers: blocked.clone(),
-                            channel_creators: creators.clone(),
-                            joined_channels: channels.clone(),
-                            password_protected_channels: protected.clone(),
-                            channel_key_commitments: commitments.clone(),
-                            favorites: favs.clone().unwrap_or_default(),
-                            identity_key: id_key.clone(),
-                            noise_static_key: noise_static_key.clone(),
-                            encrypted_channel_passwords: encrypted_passwords.clone(),
-                        }
-                    },
-                ));
                 post_connect_initialized = true;
 
                 // Initialize TUI blocked list with current blocked users
@@ -1174,6 +1284,145 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            if handle_name_command(
+                &line,
+                &mut nickname,
+                blocked_peers.as_ref().unwrap(),
+                channel_creators.as_ref().unwrap(),
+                chat_context.as_mut().unwrap(),
+                password_protected_channels.as_ref().unwrap(),
+                channel_key_commitments.as_ref().unwrap(),
+                app_state.as_ref().unwrap(),
+                create_app_state.as_ref().unwrap().as_ref(),
+                ui_tx.clone(),
+            )
+            .await
+            {
+                app.pending_nickname_update = Some(nickname.clone());
+                continue;
+            }
+
+            if line == "/public" {
+                chat_context.as_mut().unwrap().switch_to_public();
+                app.switch_to_public();
+                continue;
+            }
+
+            if is_pass_command(&line) {
+                app.add_log_message(
+                    "system: /pass has been removed. Use normal mesh channels or Nostr geohash channels without this command."
+                        .to_string(),
+                );
+                continue;
+            }
+
+            if let Some(geohash_channel) = app.current_geohash_context_channel() {
+                if line == "/online" || line == "/w" {
+                    let mut people = app.geohash_people_for_channel(&geohash_channel);
+                    people.sort();
+                    if people.is_empty() {
+                        app.add_log_message(format!(
+                            "system: No people seen in {} yet.",
+                            geohash_channel
+                        ));
+                    } else {
+                        app.add_log_message(format!(
+                            "system: People seen in {}: {}",
+                            geohash_channel,
+                            people.join(", ")
+                        ));
+                    }
+                    continue;
+                }
+
+                if line == "/channels" {
+                    let mut mesh_channels: Vec<String> = chat_context
+                        .as_ref()
+                        .unwrap()
+                        .active_channels
+                        .iter()
+                        .filter(|channel| !nostr_geo::is_geohash_channel(channel))
+                        .cloned()
+                        .collect();
+                    let mut geohash_channels: Vec<String> = app
+                        .channels
+                        .iter()
+                        .filter(|channel| nostr_geo::is_geohash_channel(channel))
+                        .cloned()
+                        .collect();
+                    mesh_channels.sort();
+                    geohash_channels.sort();
+                    let mesh_text = if mesh_channels.is_empty() {
+                        "none".to_string()
+                    } else {
+                        mesh_channels.join(", ")
+                    };
+                    let geohash_text = if geohash_channels.is_empty() {
+                        "none".to_string()
+                    } else {
+                        geohash_channels.join(", ")
+                    };
+                    app.add_log_message(format!("system: Mesh channels: {}", mesh_text));
+                    app.add_log_message(format!("system: Geohash channels: {}", geohash_text));
+                    continue;
+                }
+
+                if line.starts_with("/dm") {
+                    let Some((target_nickname, maybe_message)) = parse_dm_command(&line) else {
+                        app.add_log_message("system: Usage: /dm <name> [message]".to_string());
+                        continue;
+                    };
+
+                    let Some(recipient_pubkey) =
+                        app.geohash_person_pubkey(&geohash_channel, &target_nickname)
+                    else {
+                        app.add_log_message(format!(
+                            "system: User '{}' has not been seen in {} with a Nostr key yet.",
+                            target_nickname, geohash_channel
+                        ));
+                        continue;
+                    };
+
+                    app.switch_to_geohash_dm(target_nickname.clone());
+
+                    if let Some(message) = maybe_message {
+                        app.add_sent_message(message.clone());
+                        let nostr_geo_client = nostr_geo_client.clone();
+                        let ui_tx = ui_tx.clone();
+                        let channel = geohash_channel.clone();
+                        let target_for_error = target_nickname.clone();
+                        let my_peer_id = my_peer_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = nostr_geo_client
+                                .send_private_message(
+                                    &channel,
+                                    &recipient_pubkey,
+                                    &message,
+                                    &my_peer_id,
+                                )
+                                .await
+                            {
+                                let _ = ui_tx
+                                    .send(format!(
+                                        "system: Failed to send geohash DM to {}: {}",
+                                        target_for_error, e
+                                    ))
+                                    .await;
+                            }
+                        });
+                    }
+                    continue;
+                }
+
+                if let Some(command) = mesh_only_command_in_geohash(&line) {
+                    app.add_log_message(format!(
+                        "system: {} is only available on the Bluetooth mesh. It is not supported in Nostr geohash channels.",
+                        command
+                    ));
+                    continue;
+                }
+            }
+
             if !app.connected && !line.trim_start().starts_with('/') {
                 if let Some((channel, target_nickname, recipient_pubkey)) = app.current_geohash_dm()
                 {
@@ -1250,27 +1499,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            if handle_name_command(
-                &line,
-                &mut nickname,
-                &my_peer_id,
-                peripheral.as_ref().unwrap(),
-                cmd_char.as_ref().unwrap(),
-                blocked_peers.as_ref().unwrap(),
-                channel_creators.as_ref().unwrap(),
-                chat_context.as_mut().unwrap(),
-                password_protected_channels.as_ref().unwrap(),
-                channel_key_commitments.as_ref().unwrap(),
-                app_state.as_ref().unwrap(),
-                create_app_state.as_ref().unwrap().as_ref(),
-                ui_tx.clone(),
-            )
-            .await
-            {
-                // Set the pending nickname update signal to trigger TUI update
-                app.pending_nickname_update = Some(nickname.clone());
-                continue;
-            }
             if handle_exit_command(
                 &line,
                 blocked_peers.as_ref().unwrap(),
@@ -1423,27 +1651,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 // Update TUI to reflect public chat mode (since leaving a channel switches to public)
                 app.switch_to_public();
-                continue;
-            }
-            if handle_pass_command(
-                &line,
-                chat_context.as_ref().unwrap(),
-                channel_creators.as_mut().unwrap(),
-                channel_keys.as_mut().unwrap(),
-                password_protected_channels.as_mut().unwrap(),
-                app_state.as_mut().unwrap(),
-                &my_peer_id,
-                peripheral.as_ref().unwrap(),
-                cmd_char.as_ref().unwrap(),
-                ui_tx.clone(),
-            )
-            .await
-            {
-                // Add system message to TUI to indicate password was set
-                if let ChatMode::Channel(channel) = &chat_context.as_ref().unwrap().current_mode {
-                    let system_msg = format!("Password set for channel {}", channel);
-                    app.add_log_message(format!("system: {}", system_msg));
-                }
                 continue;
             }
             if handle_transfer_command(
@@ -1656,5 +1863,31 @@ mod tests {
         assert_eq!(crate::data_structures::FLAG_IS_COMPRESSED, 0x04);
         assert_eq!(crate::data_structures::SIGNATURE_SIZE, 64);
         assert_eq!(crate::data_structures::BROADCAST_RECIPIENT, [0xFF; 8]);
+    }
+
+    #[test]
+    fn parses_dm_command_for_geohash_handling() {
+        assert_eq!(
+            parse_dm_command("/dm anon7301 hello there"),
+            Some(("anon7301".to_string(), Some("hello there".to_string())))
+        );
+        assert_eq!(
+            parse_dm_command("/dm @anon7301"),
+            Some(("anon7301".to_string(), None))
+        );
+        assert_eq!(parse_dm_command("/dm"), None);
+    }
+
+    #[test]
+    fn detects_mesh_only_commands_inside_geohash() {
+        assert_eq!(
+            mesh_only_command_in_geohash("/transfer @alice"),
+            Some("/transfer")
+        );
+        assert_eq!(
+            mesh_only_command_in_geohash("/block @alice"),
+            Some("/block")
+        );
+        assert_eq!(mesh_only_command_in_geohash("/online"), None);
     }
 }

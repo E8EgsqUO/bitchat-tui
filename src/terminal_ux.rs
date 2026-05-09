@@ -170,7 +170,6 @@ pub fn get_help_text() -> String {
         "▶ Channels",
         "  /j #channel            Join/create a channel",
         "  /leave                   Leave current channel",
-        "  /pass <pwd>            Set channel password (owner only)",
         "  /transfer @user        Transfer ownership (owner only)\n",
         "▶ Discovery",
         "  /channels                List all discovered channels",

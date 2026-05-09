@@ -30,9 +30,6 @@ fn persistent_channels(chat_context: &ChatContext) -> Vec<String> {
 pub async fn handle_name_command(
     line: &str,
     nickname: &mut String,
-    _my_peer_id: &str,
-    _peripheral: &Peripheral,
-    _cmd_char: &btleplug::api::Characteristic,
     blocked_peers: &HashSet<String>,
     channel_creators: &HashMap<String, String>,
     chat_context: &ChatContext,
@@ -892,80 +889,6 @@ pub async fn handle_leave_command(
         } else {
             let _ = ui_tx
                 .send("» You're not in a channel. Use /j #channel to join one.\n".to_string())
-                .await;
-        }
-        return true;
-    }
-    false
-}
-
-pub async fn handle_pass_command(
-    line: &str,
-    chat_context: &ChatContext,
-    channel_creators: &mut HashMap<String, String>,
-    channel_keys: &mut HashMap<String, [u8; 32]>,
-    password_protected_channels: &mut HashSet<String>,
-    app_state: &mut AppState,
-    my_peer_id: &str,
-    peripheral: &Peripheral,
-    cmd_char: &btleplug::api::Characteristic,
-    ui_tx: mpsc::Sender<String>,
-) -> bool {
-    if line.starts_with("/pass ") {
-        if let ChatMode::Channel(channel) = &chat_context.current_mode {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
-                let _ = ui_tx
-                    .send("\x1b[93m⚠ Usage: /pass <new password>\x1b[0m\n".to_string())
-                    .await;
-                return true;
-            }
-            let new_password = parts[1];
-
-            // Only owner can set/change password
-            if channel_creators
-                .get(channel)
-                .map_or(true, |owner| owner == my_peer_id)
-            {
-                if !channel_creators.contains_key(channel) {
-                    channel_creators.insert(channel.clone(), my_peer_id.to_string());
-                }
-                let new_key = EncryptionService::derive_channel_key(new_password, channel);
-                channel_keys.insert(channel.clone(), new_key);
-                password_protected_channels.insert(channel.clone());
-
-                if let Some(identity_key) = &app_state.identity_key {
-                    if let Ok(encrypted) = encrypt_password(new_password, identity_key) {
-                        app_state
-                            .encrypted_channel_passwords
-                            .insert(channel.clone(), encrypted);
-                    }
-                }
-
-                let commitment_hex = hex::encode(Sha256::digest(&new_key));
-                let _ = send_channel_announce(
-                    peripheral,
-                    cmd_char,
-                    my_peer_id,
-                    channel,
-                    true,
-                    Some(&commitment_hex),
-                )
-                .await;
-                let _ = ui_tx
-                    .send(format!(
-                        "» Password set for {}. Others must rejoin with the new password.\n",
-                        channel
-                    ))
-                    .await;
-            } else {
-                let _ = ui_tx
-                    .send("» Only the channel owner can change the password.\n".to_string())
-                    .await;
-            }
-        } else {
-            let _ = ui_tx
-                .send("» You must be in a channel to use /pass.\n".to_string())
                 .await;
         }
         return true;
