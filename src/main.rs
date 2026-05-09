@@ -18,6 +18,9 @@ use tui::event;
 use tui::tui as tui_mod;
 use tui::ui;
 
+const UI_EVENT_BUFFER_SIZE: usize = 4096;
+const MAX_UI_MESSAGES_PER_TICK: usize = 512;
+
 // Debug logging function
 fn write_debug_log(message: &str) {
     if !crate::data_structures::file_logging_enabled() {
@@ -257,7 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Channel for user input from the TUI input box
     let (input_tx, mut input_rx) = mpsc::channel::<String>(10);
     // Channel for all UI output. All parts of the application will send strings here.
-    let (ui_tx, mut ui_rx) = mpsc::channel::<String>(100);
+    let (ui_tx, mut ui_rx) = mpsc::channel::<String>(UI_EVENT_BUFFER_SIZE);
 
     // Load saved state to get the nickname before initializing TUI
     let saved_state = load_state();
@@ -377,7 +380,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tick_rate = StdDuration::from_millis(100);
     'mainloop: loop {
         // 1. Handle UI messages
-        while let Ok(msg) = ui_rx.try_recv() {
+        for _ in 0..MAX_UI_MESSAGES_PER_TICK {
+            let Ok(msg) = ui_rx.try_recv() else {
+                break;
+            };
+
             if msg == "__CONNECTED__" {
                 app.transition_to_connected();
                 // Await the bt_handle to get the peripheral
@@ -1392,6 +1399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let channel = geohash_channel.clone();
                         let target_for_error = target_nickname.clone();
                         let my_peer_id = my_peer_id.clone();
+                        let sender_nickname = nickname.clone();
                         tokio::spawn(async move {
                             if let Err(e) = nostr_geo_client
                                 .send_private_message(
@@ -1399,6 +1407,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &recipient_pubkey,
                                     &message,
                                     &my_peer_id,
+                                    &sender_nickname,
                                 )
                                 .await
                             {
@@ -1430,6 +1439,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let ui_tx = ui_tx.clone();
                     let message = line.clone();
                     let my_peer_id = my_peer_id.clone();
+                    let sender_nickname = nickname.clone();
                     tokio::spawn(async move {
                         if let Err(e) = nostr_geo_client
                             .send_private_message(
@@ -1437,6 +1447,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &recipient_pubkey,
                                 &message,
                                 &my_peer_id,
+                                &sender_nickname,
                             )
                             .await
                         {
@@ -1691,9 +1702,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ui_tx = ui_tx.clone();
                 let message = line.clone();
                 let my_peer_id = my_peer_id.clone();
+                let sender_nickname = nickname.clone();
                 tokio::spawn(async move {
                     if let Err(e) = nostr_geo_client
-                        .send_private_message(&channel, &recipient_pubkey, &message, &my_peer_id)
+                        .send_private_message(
+                            &channel,
+                            &recipient_pubkey,
+                            &message,
+                            &my_peer_id,
+                            &sender_nickname,
+                        )
                         .await
                     {
                         let _ = ui_tx

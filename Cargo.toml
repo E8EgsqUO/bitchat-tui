@@ -50,6 +50,7 @@ ed25519-dalek = { version = "2.0", features = ["rand_core"] }
 aes-gcm = { version = "0.10", features = ["aes"] }
 curve25519-dalek = "4.1.1"
 chacha20poly1305 = "0.10"
+chacha20 = "0.9"
 hmac = "0.12"
 generic-array = "0.14"
 

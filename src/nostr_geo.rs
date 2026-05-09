@@ -1,11 +1,14 @@
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use chacha20::ChaCha20;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key as XChaChaKey, XChaCha20Poly1305, XNonce};
 use chrono::{Local, TimeZone};
 use futures_util::future::join_all;
 use futures_util::{SinkExt, StreamExt};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac as HmacMac};
 use rand::{Rng, RngCore};
 use secp256k1::{
     Keypair, Message as SecpMessage, PublicKey as SecpPublicKey, Scalar, Secp256k1, SecretKey,
@@ -34,9 +37,14 @@ const GEO_RELAY_CSV_URL: &str =
     "https://raw.githubusercontent.com/permissionlesstech/georelays/main/nostr_relays.csv";
 const GEOHASH_ALPHABET: &str = "0123456789bcdefghjkmnpqrstuvwxyz";
 const SUBSCRIBE_SINCE_SECONDS: i64 = 300;
+const DM_SUBSCRIBE_SINCE_SECONDS: i64 = 3_600;
 const RECONNECT_DELAY_SECONDS: u64 = 10;
 const CONNECT_TIMEOUT_SECONDS: u64 = 8;
 const PUBLISH_TIMEOUT_SECONDS: u64 = 8;
+const NIP44_MIN_PLAINTEXT_SIZE: usize = 1;
+const NIP44_MAX_PLAINTEXT_SIZE: usize = 65_535;
+const EMBEDDED_PRIVATE_PAYLOAD_UNSUPPORTED_TYPE: &str =
+    "Embedded private payload has unsupported type";
 
 const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -94,6 +102,7 @@ struct NostrGeoInner {
     joined_geohashes: Mutex<HashSet<String>>,
     relays_by_geohash: Mutex<HashMap<String, Vec<String>>>,
     people_by_pubkey: Mutex<HashMap<String, String>>,
+    publish_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +161,7 @@ impl NostrGeoClient {
                 joined_geohashes: Mutex::new(HashSet::new()),
                 relays_by_geohash: Mutex::new(HashMap::new()),
                 people_by_pubkey: Mutex::new(HashMap::new()),
+                publish_lock: Mutex::new(()),
             }),
         }
     }
@@ -184,6 +194,11 @@ impl NostrGeoClient {
 
         let local_secret = derive_secret_key(&self.inner.identity_seed, &geohash)?;
         let pubkey = xonly_pubkey_from_secret(&local_secret);
+        write_nostr_debug_log(&format!(
+            "geohash identity: geohash=#{}, local_pubkey={}",
+            geohash,
+            &pubkey[..pubkey.len().min(8)]
+        ));
         for relay in subscribe_relays {
             let inner = self.inner.clone();
             let channel = format!("#{}", geohash);
@@ -235,6 +250,7 @@ impl NostrGeoClient {
             .cloned()
             .unwrap_or_else(default_relays);
 
+        let _publish_guard = self.inner.publish_lock.lock().await;
         let publish_results = join_all(relays.into_iter().map(|relay| {
             let event = event.clone();
             async move {
@@ -273,6 +289,7 @@ impl NostrGeoClient {
         recipient_pubkey: &str,
         content: &str,
         sender_peer_id: &str,
+        sender_nickname: &str,
     ) -> Result<(), String> {
         let geohash =
             normalize_geohash(channel).ok_or_else(|| "Invalid geohash channel".to_string())?;
@@ -286,14 +303,29 @@ impl NostrGeoClient {
             recipient_pubkey,
             content,
             sender_peer_id,
+            sender_nickname,
         )?;
         let event_id = event.id.clone();
 
-        let relays = dm_relays();
+        let public_relays = self
+            .inner
+            .relays_by_geohash
+            .lock()
+            .await
+            .get(&geohash)
+            .cloned()
+            .unwrap_or_else(default_relays);
+        let dm_relays = dm_relays();
+        let relays = merge_relays(&public_relays, &dm_relays);
+
+        let _publish_guard = self.inner.publish_lock.lock().await;
         write_nostr_debug_log(&format!(
-            "dm publish start: geohash=#{}, recipient={}, relays={}",
+            "dm publish start: geohash=#{}, recipient={}, event={}, public_relays={}, dm_relays={}, relays={}",
             geohash,
             &recipient_pubkey[..recipient_pubkey.len().min(8)],
+            event_id,
+            public_relays.len(),
+            dm_relays.len(),
             relays.join(",")
         ));
 
@@ -393,21 +425,21 @@ async fn subscribe_once(
     .map_err(|_| format!("connect timeout after {}s", CONNECT_TIMEOUT_SECONDS))??;
     let (mut write, mut read) = ws_stream.split();
     let sub_id = format!("bitchat-tui-{}-{}", geohash, Uuid::new_v4());
-    let since = Local::now()
-        .timestamp()
-        .saturating_sub(SUBSCRIBE_SINCE_SECONDS);
+    let now = Local::now().timestamp();
+    let public_since = now.saturating_sub(SUBSCRIBE_SINCE_SECONDS);
+    let dm_since = now.saturating_sub(DM_SUBSCRIBE_SINCE_SECONDS);
     let req = json!([
         "REQ",
         sub_id,
         {
             "kinds": [20000],
             "#g": [geohash],
-            "since": since
+            "since": public_since
         },
         {
             "kinds": [1059],
             "#p": [local_pubkey],
-            "since": since
+            "since": dm_since
         }
     ]);
 
@@ -416,8 +448,8 @@ async fn subscribe_once(
         .await
         .map_err(|e| e.to_string())?;
     write_nostr_debug_log(&format!(
-        "subscribe connected: relay={}, geohash=#{}, since={}",
-        relay, geohash, since
+        "subscribe connected: relay={}, geohash=#{}, public_since={}, dm_since={}",
+        relay, geohash, public_since, dm_since
     ));
 
     loop {
@@ -532,25 +564,33 @@ async fn handle_private_relay_event(
     }
     drop(seen);
 
-    let (content, sender_pubkey, timestamp) =
+    let (content, sender_pubkey, timestamp, sender_nickname) =
         match decrypt_private_message(event, local_secret).and_then(decode_bitchat_dm_content) {
             Ok(decoded) => decoded,
             Err(e) => {
-                write_nostr_debug_log(&format!(
-                    "failed to decrypt geohash dm: event={}, error={}",
-                    event.id, e
-                ));
+                if e.starts_with(EMBEDDED_PRIVATE_PAYLOAD_UNSUPPORTED_TYPE) {
+                    write_nostr_debug_log(&format!(
+                        "ignored geohash dm control payload: event={}, error={}",
+                        event.id, e
+                    ));
+                } else {
+                    write_nostr_debug_log(&format!(
+                        "failed to decrypt geohash dm: event={}, error={}",
+                        event.id, e
+                    ));
+                }
                 return;
             }
         };
 
-    let sender = inner
-        .people_by_pubkey
-        .lock()
-        .await
-        .get(&sender_pubkey)
-        .cloned()
+    let mut people_by_pubkey = inner.people_by_pubkey.lock().await;
+    let sender = sender_nickname
+        .or_else(|| people_by_pubkey.get(&sender_pubkey).cloned())
         .unwrap_or_else(|| format!("npub{}", sender_pubkey.chars().take(8).collect::<String>()));
+    if !sender.starts_with("npub") {
+        people_by_pubkey.insert(sender_pubkey.clone(), sender.clone());
+    }
+    drop(people_by_pubkey);
 
     let timestamp = Local
         .timestamp_opt(timestamp, 0)
@@ -579,6 +619,16 @@ fn event_has_tag_value(event: &NostrEvent, tag_name: &str, value: &str) -> bool 
     event.tags.iter().any(|tag| {
         tag.first().map(String::as_str) == Some(tag_name)
             && tag.get(1).map(String::as_str) == Some(value)
+    })
+}
+
+fn event_tag_value(event: &Nip17Event, tag_name: &str) -> Option<String> {
+    event.tags.iter().find_map(|tag| {
+        if tag.first().map(String::as_str) == Some(tag_name) {
+            tag.get(1).cloned()
+        } else {
+            None
+        }
     })
 }
 
@@ -905,6 +955,7 @@ fn create_private_message_event(
     recipient_pubkey: &str,
     content: &str,
     sender_peer_id: &str,
+    sender_nickname: &str,
 ) -> Result<NostrEvent, String> {
     let local_secret = derive_secret_key(identity_seed, geohash)?;
     let local_pubkey = xonly_pubkey_from_secret(&local_secret);
@@ -915,14 +966,17 @@ fn create_private_message_event(
         pubkey: local_pubkey,
         created_at: Local::now().timestamp(),
         kind: 14,
-        tags: Vec::new(),
+        tags: vec![vec![
+            "bitchat-nick".to_string(),
+            sanitize_display_field(sender_nickname),
+        ]],
         content: embedded,
         sig: None,
     };
 
     let seal_key = random_secret_key();
     let seal_json = serde_json::to_string(&rumor).map_err(|e| e.to_string())?;
-    let encrypted_seal = nip44_encrypt(&seal_json, recipient_pubkey, &seal_key)?;
+    let encrypted_seal = legacy_nip44_encrypt(&seal_json, recipient_pubkey, &seal_key)?;
     let seal = sign_nip17_event(
         Nip17Event {
             id: String::new(),
@@ -938,7 +992,7 @@ fn create_private_message_event(
 
     let wrap_key = random_secret_key();
     let seal_json = serde_json::to_string(&seal).map_err(|e| e.to_string())?;
-    let encrypted_wrap = nip44_encrypt(&seal_json, recipient_pubkey, &wrap_key)?;
+    let encrypted_wrap = legacy_nip44_encrypt(&seal_json, recipient_pubkey, &wrap_key)?;
     let gift_wrap = sign_nip17_event(
         Nip17Event {
             id: String::new(),
@@ -958,20 +1012,28 @@ fn create_private_message_event(
 fn decrypt_private_message(
     gift_wrap: &NostrEvent,
     local_secret: &SecretKey,
-) -> Result<(String, String, i64), String> {
+) -> Result<(String, String, i64, Option<String>), String> {
     let seal_json = nip44_decrypt(&gift_wrap.content, &gift_wrap.pubkey, local_secret)?;
     let seal: Nip17Event = serde_json::from_str(&seal_json).map_err(|e| e.to_string())?;
     let rumor_json = nip44_decrypt(&seal.content, &seal.pubkey, local_secret)?;
     let rumor: Nip17Event = serde_json::from_str(&rumor_json).map_err(|e| e.to_string())?;
-    Ok((rumor.content, rumor.pubkey, rumor.created_at))
+    let sender_nickname = event_tag_value(&rumor, "bitchat-nick")
+        .map(|value| sanitize_display_field(&value))
+        .filter(|value| !value.starts_with("npub"));
+    Ok((
+        rumor.content,
+        rumor.pubkey,
+        rumor.created_at,
+        sender_nickname,
+    ))
 }
 
 fn decode_bitchat_dm_content(
-    decoded: (String, String, i64),
-) -> Result<(String, String, i64), String> {
-    let (content, sender_pubkey, timestamp) = decoded;
+    decoded: (String, String, i64, Option<String>),
+) -> Result<(String, String, i64, Option<String>), String> {
+    let (content, sender_pubkey, timestamp, sender_nickname) = decoded;
     let Some(encoded) = content.strip_prefix("bitchat1:") else {
-        return Ok((content, sender_pubkey, timestamp));
+        return Ok((content, sender_pubkey, timestamp, sender_nickname));
     };
 
     let packet_bytes = URL_SAFE_NO_PAD
@@ -986,12 +1048,15 @@ fn decode_bitchat_dm_content(
         return Err("Embedded private payload is empty".to_string());
     };
     if payload_type != crate::payload_handling::NOISE_PAYLOAD_PRIVATE_MESSAGE {
-        return Err("Embedded private payload has unsupported type".to_string());
+        return Err(format!(
+            "{} 0x{:02x}",
+            EMBEDDED_PRIVATE_PAYLOAD_UNSUPPORTED_TYPE, payload_type
+        ));
     }
     let (_, private_content) =
         crate::payload_handling::parse_private_noise_payload(private_payload)
             .map_err(|e| e.to_string())?;
-    Ok((private_content, sender_pubkey, timestamp))
+    Ok((private_content, sender_pubkey, timestamp, sender_nickname))
 }
 
 fn create_embedded_bitchat_dm(content: &str, sender_peer_id: &str) -> Result<String, String> {
@@ -1049,16 +1114,60 @@ fn nip44_encrypt(
     recipient_pubkey: &str,
     sender_key: &SecretKey,
 ) -> Result<String, String> {
+    let mut nonce = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    nip44_encrypt_with_nonce(plaintext, recipient_pubkey, sender_key, &nonce)
+}
+
+fn nip44_encrypt_with_nonce(
+    plaintext: &str,
+    recipient_pubkey: &str,
+    sender_key: &SecretKey,
+    nonce: &[u8; 32],
+) -> Result<String, String> {
+    let public_key = public_key_from_xonly(recipient_pubkey, 0x02)?;
+    let conversation_key = derive_nip44_conversation_key(sender_key, &public_key)?;
+    nip44_encrypt_payload(plaintext, &conversation_key, nonce)
+}
+
+fn nip44_decrypt(
+    ciphertext: &str,
+    sender_pubkey: &str,
+    recipient_key: &SecretKey,
+) -> Result<String, String> {
+    if ciphertext.starts_with("v2:") {
+        return legacy_nip44_decrypt(ciphertext, sender_pubkey, recipient_key);
+    }
+
+    let mut last_error = "NIP-44 decryption failed".to_string();
+    for prefix in [0x02u8, 0x03u8] {
+        match public_key_from_xonly(sender_pubkey, prefix)
+            .and_then(|public_key| derive_nip44_conversation_key(recipient_key, &public_key))
+            .and_then(|conversation_key| nip44_decrypt_payload(ciphertext, &conversation_key))
+        {
+            Ok(plaintext) => return Ok(plaintext),
+            Err(e) => last_error = e,
+        }
+    }
+
+    Err(last_error)
+}
+
+fn legacy_nip44_encrypt(
+    plaintext: &str,
+    recipient_pubkey: &str,
+    sender_key: &SecretKey,
+) -> Result<String, String> {
     let public_key = public_key_from_xonly(recipient_pubkey, 0x02)?;
     let shared_secret = derive_shared_secret_compressed(sender_key, &public_key)?;
-    let key = derive_nip44_key(&shared_secret)?;
+    let key = legacy_derive_nip44_key(&shared_secret)?;
 
     let mut nonce = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut nonce);
     let cipher = XChaCha20Poly1305::new(XChaChaKey::from_slice(&key));
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce), plaintext.as_bytes())
-        .map_err(|_| "NIP-44 encryption failed".to_string())?;
+        .map_err(|_| "Legacy NIP-44 encryption failed".to_string())?;
 
     let mut combined = Vec::with_capacity(nonce.len() + ciphertext.len());
     combined.extend_from_slice(&nonce);
@@ -1066,7 +1175,58 @@ fn nip44_encrypt(
     Ok(format!("v2:{}", URL_SAFE_NO_PAD.encode(combined)))
 }
 
-fn nip44_decrypt(
+fn nip44_encrypt_payload(
+    plaintext: &str,
+    conversation_key: &[u8; 32],
+    nonce: &[u8; 32],
+) -> Result<String, String> {
+    let (chacha_key, chacha_nonce, hmac_key) = derive_nip44_message_keys(conversation_key, nonce)?;
+    let mut ciphertext = pad_nip44_plaintext(plaintext.as_bytes())?;
+    let mut cipher = ChaCha20::new_from_slices(&chacha_key, &chacha_nonce)
+        .map_err(|_| "NIP-44 ChaCha20 initialization failed".to_string())?;
+    cipher.apply_keystream(&mut ciphertext);
+    let mac = nip44_hmac(&hmac_key, &ciphertext, nonce)?;
+
+    let mut payload = Vec::with_capacity(1 + nonce.len() + ciphertext.len() + mac.len());
+    payload.push(0x02);
+    payload.extend_from_slice(nonce);
+    payload.extend_from_slice(&ciphertext);
+    payload.extend_from_slice(&mac);
+    Ok(STANDARD.encode(payload))
+}
+
+fn nip44_decrypt_payload(payload: &str, conversation_key: &[u8; 32]) -> Result<String, String> {
+    if payload.is_empty() || payload.starts_with('#') {
+        return Err("Unsupported NIP-44 ciphertext version".to_string());
+    }
+    if !(132..=87_472).contains(&payload.len()) {
+        return Err("Invalid NIP-44 payload size".to_string());
+    }
+
+    let data = STANDARD.decode(payload).map_err(|e| e.to_string())?;
+    if !(99..=65_603).contains(&data.len()) {
+        return Err("Invalid NIP-44 data size".to_string());
+    }
+    if data.first() != Some(&0x02) {
+        return Err("Unsupported NIP-44 ciphertext version".to_string());
+    }
+
+    let nonce: [u8; 32] = data[1..33]
+        .try_into()
+        .map_err(|_| "Invalid NIP-44 nonce length".to_string())?;
+    let ciphertext = &data[33..data.len() - 32];
+    let expected_mac = &data[data.len() - 32..];
+    let (chacha_key, chacha_nonce, hmac_key) = derive_nip44_message_keys(conversation_key, &nonce)?;
+    verify_nip44_hmac(&hmac_key, ciphertext, &nonce, expected_mac)?;
+
+    let mut plaintext = ciphertext.to_vec();
+    let mut cipher = ChaCha20::new_from_slices(&chacha_key, &chacha_nonce)
+        .map_err(|_| "NIP-44 ChaCha20 initialization failed".to_string())?;
+    cipher.apply_keystream(&mut plaintext);
+    unpad_nip44_plaintext(&plaintext)
+}
+
+fn legacy_nip44_decrypt(
     ciphertext: &str,
     sender_pubkey: &str,
     recipient_key: &SecretKey,
@@ -1085,7 +1245,7 @@ fn nip44_decrypt(
     for prefix in [0x02u8, 0x03u8] {
         if let Ok(public_key) = public_key_from_xonly(sender_pubkey, prefix) {
             if let Ok(shared_secret) = derive_shared_secret_compressed(recipient_key, &public_key) {
-                if let Ok(key) = derive_nip44_key(&shared_secret) {
+                if let Ok(key) = legacy_derive_nip44_key(&shared_secret) {
                     let cipher = XChaCha20Poly1305::new(XChaChaKey::from_slice(&key));
                     if let Ok(plaintext) = cipher.decrypt(XNonce::from_slice(nonce), encrypted) {
                         return String::from_utf8(plaintext).map_err(|e| e.to_string());
@@ -1096,6 +1256,34 @@ fn nip44_decrypt(
     }
 
     Err("NIP-44 decryption failed".to_string())
+}
+
+fn derive_nip44_conversation_key(
+    secret_key: &SecretKey,
+    public_key: &SecpPublicKey,
+) -> Result<[u8; 32], String> {
+    let shared_x = derive_shared_secret_xonly(secret_key, public_key)?;
+    let (prk, _) = Hkdf::<Sha256>::extract(Some(b"nip44-v2"), &shared_x);
+    let mut conversation_key = [0u8; 32];
+    conversation_key.copy_from_slice(&prk);
+    Ok(conversation_key)
+}
+
+fn derive_shared_secret_xonly(
+    secret_key: &SecretKey,
+    public_key: &SecpPublicKey,
+) -> Result<[u8; 32], String> {
+    let secp = Secp256k1::new();
+    let scalar = Scalar::from_be_bytes(secret_key.secret_bytes())
+        .map_err(|_| "Invalid secp256k1 scalar while deriving Nostr shared secret".to_string())?;
+    let shared_point = public_key
+        .clone()
+        .mul_tweak(&secp, &scalar)
+        .map_err(|e| e.to_string())?;
+    let serialized = shared_point.serialize();
+    let mut shared_x = [0u8; 32];
+    shared_x.copy_from_slice(&serialized[1..33]);
+    Ok(shared_x)
 }
 
 fn derive_shared_secret_compressed(
@@ -1112,12 +1300,102 @@ fn derive_shared_secret_compressed(
     Ok(shared_point.serialize().to_vec())
 }
 
-fn derive_nip44_key(shared_secret: &[u8]) -> Result<[u8; 32], String> {
+fn legacy_derive_nip44_key(shared_secret: &[u8]) -> Result<[u8; 32], String> {
     let hk = Hkdf::<Sha256>::new(None, shared_secret);
     let mut key = [0u8; 32];
     hk.expand(b"nip44-v2", &mut key)
         .map_err(|_| "NIP-44 HKDF expansion failed".to_string())?;
     Ok(key)
+}
+
+fn derive_nip44_message_keys(
+    conversation_key: &[u8; 32],
+    nonce: &[u8; 32],
+) -> Result<([u8; 32], [u8; 12], [u8; 32]), String> {
+    let hk =
+        Hkdf::<Sha256>::from_prk(conversation_key).map_err(|_| "Invalid NIP-44 PRK".to_string())?;
+    let mut output = [0u8; 76];
+    hk.expand(nonce, &mut output)
+        .map_err(|_| "NIP-44 message key expansion failed".to_string())?;
+
+    let mut chacha_key = [0u8; 32];
+    let mut chacha_nonce = [0u8; 12];
+    let mut hmac_key = [0u8; 32];
+    chacha_key.copy_from_slice(&output[0..32]);
+    chacha_nonce.copy_from_slice(&output[32..44]);
+    hmac_key.copy_from_slice(&output[44..76]);
+    Ok((chacha_key, chacha_nonce, hmac_key))
+}
+
+fn nip44_hmac(
+    hmac_key: &[u8; 32],
+    ciphertext: &[u8],
+    nonce: &[u8; 32],
+) -> Result<[u8; 32], String> {
+    let mut mac = <Hmac<Sha256> as HmacMac>::new_from_slice(hmac_key).map_err(|e| e.to_string())?;
+    HmacMac::update(&mut mac, nonce);
+    HmacMac::update(&mut mac, ciphertext);
+    let bytes = mac.finalize().into_bytes();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&bytes);
+    Ok(result)
+}
+
+fn verify_nip44_hmac(
+    hmac_key: &[u8; 32],
+    ciphertext: &[u8],
+    nonce: &[u8; 32],
+    expected_mac: &[u8],
+) -> Result<(), String> {
+    let mut mac = <Hmac<Sha256> as HmacMac>::new_from_slice(hmac_key).map_err(|e| e.to_string())?;
+    HmacMac::update(&mut mac, nonce);
+    HmacMac::update(&mut mac, ciphertext);
+    mac.verify_slice(expected_mac)
+        .map_err(|_| "Invalid NIP-44 MAC".to_string())
+}
+
+fn pad_nip44_plaintext(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let unpadded_len = plaintext.len();
+    if !(NIP44_MIN_PLAINTEXT_SIZE..=NIP44_MAX_PLAINTEXT_SIZE).contains(&unpadded_len) {
+        return Err("Invalid NIP-44 plaintext length".to_string());
+    }
+
+    let padded_len = calc_nip44_padded_len(unpadded_len);
+    let mut padded = Vec::with_capacity(2 + padded_len);
+    padded.extend_from_slice(&(unpadded_len as u16).to_be_bytes());
+    padded.extend_from_slice(plaintext);
+    padded.resize(2 + padded_len, 0);
+    Ok(padded)
+}
+
+fn unpad_nip44_plaintext(padded: &[u8]) -> Result<String, String> {
+    if padded.len() < 2 {
+        return Err("Invalid NIP-44 padding".to_string());
+    }
+    let unpadded_len = u16::from_be_bytes([padded[0], padded[1]]) as usize;
+    if unpadded_len == 0
+        || unpadded_len > NIP44_MAX_PLAINTEXT_SIZE
+        || padded.len() != 2 + calc_nip44_padded_len(unpadded_len)
+        || padded.len() < 2 + unpadded_len
+    {
+        return Err("Invalid NIP-44 padding".to_string());
+    }
+    String::from_utf8(padded[2..2 + unpadded_len].to_vec()).map_err(|e| e.to_string())
+}
+
+fn calc_nip44_padded_len(unpadded_len: usize) -> usize {
+    if unpadded_len <= 32 {
+        return 32;
+    }
+
+    let log2_next = usize::BITS as usize - (unpadded_len - 1).leading_zeros() as usize;
+    let next_power = 1usize << log2_next;
+    let chunk = if next_power <= 256 {
+        32
+    } else {
+        next_power / 8
+    };
+    chunk * (((unpadded_len - 1) / chunk) + 1)
 }
 
 fn public_key_from_xonly(pubkey: &str, prefix: u8) -> Result<SecpPublicKey, String> {
@@ -1147,8 +1425,8 @@ fn random_secret_key() -> SecretKey {
 }
 
 fn randomized_timestamp() -> i64 {
-    let offset = rand::thread_rng().gen_range(-900i64..=900i64);
-    Local::now().timestamp().saturating_add(offset)
+    let offset = rand::thread_rng().gen_range(0i64..=900i64);
+    Local::now().timestamp().saturating_sub(offset)
 }
 
 fn calculate_event_id(
@@ -1497,6 +1775,46 @@ mod tests {
     }
 
     #[test]
+    fn nip44_matches_v2_test_vector() {
+        let sender_secret = SecretKey::from_slice(
+            &hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap(),
+        )
+        .unwrap();
+        let recipient_secret = SecretKey::from_slice(
+            &hex::decode("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap(),
+        )
+        .unwrap();
+        let recipient_pubkey = xonly_pubkey_from_secret(&recipient_secret);
+        let recipient_public_key = public_key_from_xonly(&recipient_pubkey, 0x02).unwrap();
+        let conversation_key =
+            derive_nip44_conversation_key(&sender_secret, &recipient_public_key).unwrap();
+        assert_eq!(
+            hex::encode(conversation_key),
+            "c41c775356fd92eadc63ff5a0dc1da211b268cbea22316767095b2871ea1412d"
+        );
+
+        let mut nonce = [0u8; 32];
+        nonce[31] = 1;
+        let payload =
+            nip44_encrypt_with_nonce("a", &recipient_pubkey, &sender_secret, &nonce).unwrap();
+        assert_eq!(
+            payload,
+            "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABee0G5VSK0/9YypIObAtDKfYEAjD35uVkHyB0F4DwrcNaCXlCWZKaArsGrY6M9wnuTMxWfp1RTN9Xga8no+kF5Vsb"
+        );
+
+        let sender_pubkey = xonly_pubkey_from_secret(&sender_secret);
+        let plaintext = nip44_decrypt(&payload, &sender_pubkey, &recipient_secret).unwrap();
+        assert_eq!(plaintext, "a");
+
+        let random_payload = nip44_encrypt("hello", &recipient_pubkey, &sender_secret).unwrap();
+        let random_plaintext =
+            nip44_decrypt(&random_payload, &sender_pubkey, &recipient_secret).unwrap();
+        assert_eq!(random_plaintext, "hello");
+    }
+
+    #[test]
     fn creates_and_decrypts_geohash_dm_event() {
         let sender_seed = vec![7u8; 32];
         let recipient_seed = vec![9u8; 32];
@@ -1509,17 +1827,21 @@ mod tests {
             &recipient_pubkey,
             "private hello",
             "0102030405060708",
+            "c666",
         )
         .unwrap();
 
         assert_eq!(event.kind, 1059);
+        assert!(event.content.starts_with("v2:"));
         assert!(event_has_tag_value(&event, "p", &recipient_pubkey));
         assert_eq!(event.sig.len(), 128);
 
-        let (content, sender_pubkey, _) = decrypt_private_message(&event, &recipient_secret)
-            .and_then(decode_bitchat_dm_content)
-            .unwrap();
+        let (content, sender_pubkey, _, sender_nickname) =
+            decrypt_private_message(&event, &recipient_secret)
+                .and_then(decode_bitchat_dm_content)
+                .unwrap();
         assert_eq!(content, "private hello");
+        assert_eq!(sender_nickname.as_deref(), Some("c666"));
         assert_eq!(
             sender_pubkey,
             xonly_pubkey_from_secret(&derive_secret_key(&sender_seed, "ws").unwrap())

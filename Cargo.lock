@@ -152,6 +152,7 @@ dependencies = [
  "base64",
  "bloomfilter",
  "btleplug",
+ "chacha20",
  "chacha20poly1305",
  "chrono",
  "crossterm",

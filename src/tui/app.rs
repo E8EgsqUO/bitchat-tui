@@ -72,6 +72,7 @@ pub struct App {
     pub sidebar_flat_selected: usize,
     pub msg_scroll: usize,
     pub message_viewport_height: usize, // ADDED: To store the height of the message panel
+    pub message_rendered_line_count: usize,
 
     // Data state for rendering
     pub nickname: String,
@@ -136,6 +137,7 @@ impl App {
             sidebar_flat_selected: 0,
             msg_scroll: 0,
             message_viewport_height: 10, // ADDED: Default value
+            message_rendered_line_count: 0,
             nickname,
             network_name: "BitChat Mesh".to_string(),
             connected: false,

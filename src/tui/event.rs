@@ -27,8 +27,7 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sen
     }
     if key_event.code == KeyCode::Tab {
         app.focus_area = match app.focus_area {
-            FocusArea::Sidebar => FocusArea::MainPanel,
-            FocusArea::MainPanel => FocusArea::InputBox,
+            FocusArea::Sidebar | FocusArea::MainPanel => FocusArea::InputBox,
             FocusArea::InputBox => FocusArea::Sidebar,
         };
         return;
@@ -44,7 +43,7 @@ fn handle_sidebar_events(app: &mut App, key_event: KeyEvent) {
     let visible_items = sidebar_visible_items(app);
     let current_selection = app.sidebar_flat_selected;
     match key_event.code {
-        KeyCode::Tab => app.focus_area = FocusArea::MainPanel,
+        KeyCode::Tab => app.focus_area = FocusArea::InputBox,
         KeyCode::Down => {
             if !visible_items.is_empty() {
                 app.sidebar_flat_selected = (current_selection + 1) % visible_items.len();
@@ -102,11 +101,10 @@ fn handle_sidebar_events(app: &mut App, key_event: KeyEvent) {
 }
 
 fn handle_main_panel_events(app: &mut App, key_event: KeyEvent) {
-    let (messages, _, _) = app.get_current_messages();
-    let total_messages = messages.len();
+    let total_lines = app.message_rendered_line_count;
     let messages_height = app.message_viewport_height;
 
-    let max_scroll = total_messages.saturating_sub(messages_height);
+    let max_scroll = total_lines.saturating_sub(messages_height);
 
     match key_event.code {
         KeyCode::Tab => app.focus_area = FocusArea::InputBox,

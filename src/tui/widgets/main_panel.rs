@@ -8,8 +8,9 @@ use ratatui::{
         Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
     },
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::tui::app::{App, FocusArea};
+use crate::tui::app::{App, FocusArea, Message};
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
@@ -56,121 +57,15 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     // --- Message Panel Rendering ---
     let messages_height = app.message_viewport_height;
-    let total_messages = messages.len();
+    let all_msg_items = render_message_lines(messages, messages_area.width);
+    let total_lines = all_msg_items.len();
+    app.message_rendered_line_count = total_lines;
 
-    // Calculate visible message range
-    let end = total_messages.saturating_sub(app.msg_scroll);
+    let max_scroll = total_lines.saturating_sub(messages_height);
+    app.msg_scroll = app.msg_scroll.min(max_scroll);
+    let end = total_lines.saturating_sub(app.msg_scroll);
     let start = end.saturating_sub(messages_height);
-    let visible_messages = if start < end && !messages.is_empty() {
-        &messages[start..end]
-    } else {
-        &[]
-    };
-
-    let msg_items: Vec<ListItem> = visible_messages
-        .iter()
-        .flat_map(|msg| {
-            let color = if msg.sender == "system" {
-                Color::White
-            } else if msg.is_self {
-                Color::Cyan
-            } else {
-                Color::LightGreen
-            };
-
-            // Calculate available width for content (accounting for timestamp, sender, and spacing)
-            let timestamp_width = msg.timestamp.len() + 2; // [timestamp]
-            let sender_width = msg.sender.len() + 1; // sender:
-            let prefix_width = timestamp_width + 1 + sender_width + 1; // [time] sender:
-            let available_width = messages_area.width.saturating_sub(2) as usize; // Account for borders
-            let content_width = available_width.saturating_sub(prefix_width);
-
-            if content_width == 0 {
-                // Fallback if no space for content
-                let line = Line::from(vec![
-                    Span::styled(
-                        format!("[{}]", msg.timestamp),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{}:", msg.sender),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::raw(&msg.content),
-                ]);
-                vec![ListItem::new(line)]
-            } else {
-                // Split content into lines that fit the available width using character-based operations
-                let mut lines = Vec::new();
-                let content = &msg.content;
-
-                // Convert to character vector for safe operations
-                let chars: Vec<char> = content.chars().collect();
-                let mut current_pos = 0;
-                let mut first_line = true;
-
-                while current_pos < chars.len() {
-                    // Calculate how many characters can fit on this line
-                    let remaining_chars = chars.len() - current_pos;
-                    let max_chars_for_line = content_width.min(remaining_chars);
-
-                    // Find the best break point (prefer space, fallback to character limit)
-                    let break_point = if max_chars_for_line == remaining_chars {
-                        // Last line, take all remaining characters
-                        max_chars_for_line
-                    } else {
-                        // Look for the last space in the available range
-                        let search_range = &chars[current_pos..current_pos + max_chars_for_line];
-                        if let Some(last_space_idx) = search_range.iter().rposition(|&c| c == ' ') {
-                            last_space_idx + 1 // +1 to include the space
-                        } else {
-                            // No space found, break at character limit
-                            max_chars_for_line
-                        }
-                    };
-
-                    // Extract the line content
-                    let line_chars = &chars[current_pos..current_pos + break_point];
-                    let line_content: String = line_chars.iter().collect();
-
-                    // Create the line
-                    if first_line {
-                        let line = Line::from(vec![
-                            Span::styled(
-                                format!("[{}]", msg.timestamp),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                            Span::raw(" "),
-                            Span::styled(
-                                format!("{}:", msg.sender),
-                                Style::default().fg(color).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw(" "),
-                            Span::raw(line_content.clone()),
-                        ]);
-                        lines.push(ListItem::new(line));
-                        first_line = false;
-                    } else {
-                        let line = Line::from(vec![
-                            Span::raw(" ".repeat(prefix_width)),
-                            Span::raw(line_content.clone()),
-                        ]);
-                        lines.push(ListItem::new(line));
-                    }
-
-                    // Move to next position, skipping leading spaces on continuation lines
-                    current_pos += break_point;
-                    if !first_line && current_pos < chars.len() && chars[current_pos] == ' ' {
-                        current_pos += 1; // Skip the space at the beginning of continuation lines
-                    }
-                }
-
-                lines
-            }
-        })
-        .collect();
+    let msg_items = all_msg_items.into_iter().skip(start).take(end - start);
 
     let border_style = if app.focus_area == FocusArea::MainPanel {
         Style::default().fg(Color::Green)
@@ -190,11 +85,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(list, messages_area);
 
     // --- Scrollbar Rendering ---
-    let max_scroll = total_messages.saturating_sub(messages_height);
-
     // Fix: Use scroll positions as content length, and invert app.msg_scroll for correct direction
     let (scrollbar_content_length, scrollbar_viewport_length, scrollbar_position) =
-        if total_messages > messages_height {
+        if total_lines > messages_height {
             let content_length = max_scroll + 1;
             let position = max_scroll.saturating_sub(app.msg_scroll);
             // Set viewport length to a reasonable fraction of the content length for consistent thumb size
@@ -210,7 +103,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         .position(scrollbar_position);
 
     // Render the scrollbar only if scrolling is actually possible (prevents unnecessary rendering)
-    if total_messages > messages_height {
+    if total_lines > messages_height {
         f.render_stateful_widget(
             Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
@@ -219,5 +112,132 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
             messages_area, // Use full area to allow scrollbar to extend to bottom
             &mut scrollbar_state,
         );
+    }
+}
+
+fn render_message_lines(messages: &[Message], area_width: u16) -> Vec<ListItem<'static>> {
+    messages
+        .iter()
+        .flat_map(|msg| message_to_list_items(msg, area_width))
+        .collect()
+}
+
+fn message_to_list_items(msg: &Message, area_width: u16) -> Vec<ListItem<'static>> {
+    let color = if msg.sender == "system" {
+        Color::White
+    } else if msg.is_self {
+        Color::Cyan
+    } else {
+        Color::LightGreen
+    };
+
+    let timestamp = format!("[{}]", msg.timestamp);
+    let sender = format!("{}:", msg.sender);
+    let timestamp_width = UnicodeWidthStr::width(timestamp.as_str());
+    let sender_width = UnicodeWidthStr::width(sender.as_str());
+    let prefix_width = timestamp_width + 1 + sender_width + 1;
+    let available_width = area_width.saturating_sub(2) as usize;
+    let content_width = available_width.saturating_sub(prefix_width).max(1);
+    let continuation_indent = " ".repeat(prefix_width.min(available_width.saturating_sub(1)));
+
+    wrap_display_width(&msg.content, content_width)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, line_content)| {
+            if idx == 0 {
+                ListItem::new(Line::from(vec![
+                    Span::styled(timestamp.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::raw(" "),
+                    Span::styled(
+                        sender.clone(),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::raw(line_content),
+                ]))
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::raw(continuation_indent.clone()),
+                    Span::raw(line_content),
+                ]))
+            }
+        })
+        .collect()
+}
+
+fn wrap_display_width(text: &str, max_width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let max_width = max_width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0usize;
+    let mut last_break = None;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(line.trim_end().to_string());
+            line.clear();
+            line_width = 0;
+            last_break = None;
+            continue;
+        }
+
+        let ch_width = ch.width().unwrap_or(0);
+        if !line.is_empty() && line_width + ch_width > max_width {
+            if let Some(break_idx) = last_break {
+                let remainder = line[break_idx..].trim_start().to_string();
+                line.truncate(break_idx);
+                lines.push(line.trim_end().to_string());
+                line = remainder;
+                line_width = UnicodeWidthStr::width(line.as_str());
+                last_break = last_whitespace_boundary(&line);
+            } else {
+                lines.push(line);
+                line = String::new();
+                line_width = 0;
+                last_break = None;
+            }
+        }
+
+        line.push(ch);
+        line_width += ch_width;
+        if ch.is_whitespace() {
+            last_break = Some(line.len());
+        }
+    }
+
+    lines.push(line.trim_end().to_string());
+    lines
+}
+
+fn last_whitespace_boundary(value: &str) -> Option<usize> {
+    value
+        .char_indices()
+        .filter_map(|(idx, ch)| ch.is_whitespace().then_some(idx + ch.len_utf8()))
+        .last()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wraps_long_messages_into_visual_lines() {
+        let message = Message {
+            sender: "bot".to_string(),
+            timestamp: "12:00".to_string(),
+            content: "one two three four five six seven".to_string(),
+            is_self: false,
+        };
+
+        assert!(message_to_list_items(&message, 24).len() > 1);
+    }
+
+    #[test]
+    fn wraps_wide_characters_by_display_width() {
+        assert_eq!(wrap_display_width("你好世界", 4), vec!["你好", "世界"]);
     }
 }
