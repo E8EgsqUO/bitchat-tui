@@ -21,6 +21,7 @@ futures-util = "0.3.30"
 regex = "1"
 strip-ansi-escapes = "0.2"
 tokio = { version = "1", features = ["full", "process"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 btleplug = "0.11"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
@@ -43,6 +44,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 secp256k1 = { version = "0.29", features = ["rand", "hashes"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 unicode-width = "0.1"
+magic-wormhole = "0.8"
+url = "2"
 
 # For Cryptography
 x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }

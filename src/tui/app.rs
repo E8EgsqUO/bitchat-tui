@@ -14,6 +14,14 @@ pub struct Message {
     pub is_self: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingWormholeOffer {
+    pub sender: String,
+    pub code: String,
+    pub file_name: String,
+    pub file_size_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum SidebarSection {
@@ -107,6 +115,7 @@ pub struct App {
     pub pending_connection_retry: bool,
     // To signal when conversation should be cleared
     pub pending_clear_conversation: bool,
+    pub pending_wormhole_offers: HashMap<String, PendingWormholeOffer>,
 
     // Unread message tracking
     pub unread_counts: HashMap<String, usize>, // Channel/DM name -> unread count
@@ -157,6 +166,7 @@ impl App {
             pending_nickname_update: None,
             pending_connection_retry: false,
             pending_clear_conversation: false,
+            pending_wormhole_offers: HashMap::new(),
             unread_counts: HashMap::new(),
             last_read_messages: HashMap::new(),
             popup_active: false,
@@ -205,7 +215,7 @@ impl App {
         self.visible_people().get(idx).cloned()
     }
 
-    fn geohash_dm_key(channel: &str, target: &str) -> String {
+    pub fn geohash_dm_key(channel: &str, target: &str) -> String {
         format!("geo:{}:{}", channel, target)
     }
 
@@ -446,6 +456,41 @@ impl App {
                 };
 
                 let target_key = Self::geohash_dm_key(&channel, &sender);
+                if let Some((code, file_name, file_size_bytes)) =
+                    crate::command_handling::parse_geohash_file_offer_message(&content)
+                {
+                    self.pending_wormhole_offers.insert(
+                        target_key.clone(),
+                        PendingWormholeOffer {
+                            sender: sender.clone(),
+                            code,
+                            file_name: file_name.clone(),
+                            file_size_bytes,
+                        },
+                    );
+                    let content = format!(
+                        "[file] {} ({}) - type /receive to accept",
+                        file_name,
+                        crate::command_handling::format_file_size(file_size_bytes)
+                    );
+                    let msg = Message {
+                        sender,
+                        timestamp,
+                        content,
+                        is_self: false,
+                    };
+                    self.dm_messages
+                        .entry(target_key.clone())
+                        .or_default()
+                        .push(msg);
+                    if self.current_conv.as_ref().and_then(|(dm, _)| dm.as_ref()) != Some(&target_key)
+                    {
+                        self.add_unread_message(format!("dm:{}", target_key));
+                    }
+                    self.scroll_to_bottom_current_conversation();
+                    return;
+                }
+
                 let msg = Message {
                     sender,
                     timestamp,
@@ -650,6 +695,13 @@ impl App {
             .or_default()
             .push(msg);
         self.scroll_to_bottom_current_conversation();
+    }
+
+    pub fn take_pending_wormhole_offer(
+        &mut self,
+        conversation_key: &str,
+    ) -> Option<PendingWormholeOffer> {
+        self.pending_wormhole_offers.remove(conversation_key)
     }
 
     pub fn scroll_to_bottom_current_conversation(&mut self) {

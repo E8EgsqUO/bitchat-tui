@@ -171,7 +171,6 @@ pub fn get_help_text() -> String {
         "▶ Channels",
         "  /j #channel            Join/create a channel",
         "  /leave                   Leave current channel",
-        "  /transfer @user        Transfer ownership (owner only)\n",
         "▶ Discovery",
         "  /channels                List all discovered channels",
         "  /w, /online           Show who's online\n",

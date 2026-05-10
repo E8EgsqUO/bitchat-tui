@@ -7,14 +7,14 @@ use crate::packet_creation::{
     create_file_transfer_packet_for_signing_at, create_file_transfer_packet_with_recipient_at,
     current_timestamp_ms,
 };
-use crate::packet_delivery::send_channel_announce;
 use crate::payload_handling::create_bitchat_message_payload_full;
 use crate::persistence::{encrypt_password, save_state, AppState, EncryptedPassword};
 use crate::terminal_ux::{ChatContext, ChatMode};
 use btleplug::api::{Peripheral as _, WriteType};
 use btleplug::platform::Peripheral;
 use chrono;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -37,6 +37,11 @@ fn persistent_channels(chat_context: &ChatContext) -> Vec<String> {
 struct FileCommand<'a> {
     target_nickname: Option<&'a str>,
     path: &'a str,
+}
+
+pub(crate) struct GeohashFileOffer<'a> {
+    pub(crate) target_nickname: &'a str,
+    pub(crate) path: &'a str,
 }
 
 fn trim_path_quotes(path: &str) -> &str {
@@ -93,6 +98,75 @@ fn parse_file_command(line: &str) -> Result<Option<FileCommand<'_>>, &'static st
             path,
         }))
     }
+}
+
+pub(crate) fn parse_geohash_file_offer(
+    line: &str,
+) -> Result<Option<GeohashFileOffer<'_>>, &'static str> {
+    let Some(rest) = line.strip_prefix("/file") else {
+        return Ok(None);
+    };
+
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return Ok(None);
+    }
+
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err("Usage: /file @user <path>");
+    }
+
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("");
+    let Some(target) = first.strip_prefix('@') else {
+        return Err("Usage: /file @user <path>");
+    };
+    if target.is_empty() {
+        return Err("Usage: /file @user <path>");
+    }
+    let Some(path) = parts.next().map(str::trim_start) else {
+        return Err("Usage: /file @user <path>");
+    };
+    let path = trim_path_quotes(path);
+    if path.is_empty() {
+        return Err("Usage: /file @user <path>");
+    }
+    Ok(Some(GeohashFileOffer {
+        target_nickname: target,
+        path,
+    }))
+}
+
+pub(crate) fn parse_receive_command(line: &str) -> Option<&str> {
+    let Some(rest) = line.strip_prefix("/receive") else {
+        return None;
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim();
+    Some(rest)
+}
+
+pub(crate) fn extract_wormhole_code(text: &str) -> Option<String> {
+    let code_re = Regex::new(r"\b[a-z0-9]{2,4}(?:-[a-z0-9]{2,4})+\b").ok()?;
+    code_re.find(text).map(|m| m.as_str().to_string())
+}
+
+pub(crate) fn geohash_file_offer_message(code: &str, file_name: &str, file_size: u64) -> String {
+    format!("__GEO_FILE_OFFER__:{}:{}:{}", code, file_name, file_size)
+}
+
+pub(crate) fn parse_geohash_file_offer_message(content: &str) -> Option<(String, String, u64)> {
+    let parts: Vec<&str> = content.splitn(4, ':').collect();
+    if parts.len() != 4 || parts[0] != "__GEO_FILE_OFFER__" {
+        return None;
+    }
+    Some((
+        parts[1].to_string(),
+        parts[2].to_string(),
+        parts[3].parse().ok()?,
+    ))
 }
 
 fn push_tlv_u16(payload: &mut Vec<u8>, field_type: u8, value: &[u8]) -> Result<(), String> {
@@ -161,7 +235,7 @@ fn create_file_transfer_payload(
     Ok(payload)
 }
 
-fn format_file_size(bytes: u64) -> String {
+pub(crate) fn format_file_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     } else if bytes >= 1024 {
@@ -1226,86 +1300,6 @@ pub async fn handle_fingerprint_command(
                 fingerprint
             ))
             .await;
-        return true;
-    }
-    false
-}
-
-pub async fn handle_transfer_command(
-    line: &str,
-    chat_context: &ChatContext,
-    channel_creators: &mut HashMap<String, String>,
-    password_protected_channels: &HashSet<String>,
-    channel_keys: &HashMap<String, [u8; 32]>,
-    my_peer_id: &str,
-    peers: &Arc<Mutex<HashMap<String, Peer>>>,
-    peripheral: &Peripheral,
-    cmd_char: &btleplug::api::Characteristic,
-    ui_tx: mpsc::Sender<String>,
-) -> bool {
-    if line.starts_with("/transfer ") {
-        if let ChatMode::Channel(channel) = &chat_context.current_mode {
-            if channel_creators
-                .get(channel)
-                .map_or(false, |owner| owner == my_peer_id)
-            {
-                let target_name = line
-                    .trim_start_matches("/transfer ")
-                    .trim()
-                    .trim_start_matches('@');
-                let target_peer_id = peers
-                    .lock()
-                    .await
-                    .iter()
-                    .find(|(_, peer)| peer.nickname.as_deref() == Some(target_name))
-                    .map(|(id, _)| id.clone());
-
-                if let Some(new_owner_id) = target_peer_id {
-                    channel_creators.insert(channel.clone(), new_owner_id.clone());
-                    let is_protected = password_protected_channels.contains(channel);
-                    let commitment = if is_protected {
-                        channel_keys
-                            .get(channel)
-                            .map(|k| hex::encode(Sha256::digest(k)))
-                    } else {
-                        None
-                    };
-                    if send_channel_announce(
-                        peripheral,
-                        cmd_char,
-                        &new_owner_id,
-                        channel,
-                        is_protected,
-                        commitment.as_deref(),
-                    )
-                    .await
-                    .is_ok()
-                    {
-                        let _ = ui_tx
-                            .send(format!(
-                                "» Transferred ownership of {} to {}\n",
-                                channel, target_name
-                            ))
-                            .await;
-                    }
-                } else {
-                    let _ = ui_tx
-                        .send(format!(
-                            "\x1b[93m⚠ User '{}' not found\x1b[0m\n",
-                            target_name
-                        ))
-                        .await;
-                }
-            } else {
-                let _ = ui_tx
-                    .send("» Only the channel owner can transfer ownership.\n".to_string())
-                    .await;
-            }
-        } else {
-            let _ = ui_tx
-                .send("» You must be in a channel to use /transfer.\n".to_string())
-                .await;
-        }
         return true;
     }
     false

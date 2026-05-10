@@ -135,6 +135,10 @@ fn get_help_text(app: &App) -> Vec<Span> {
                     Span::raw(": Join • "),
                     Span::styled("/dm user", Style::default().fg(Color::Green)),
                     Span::raw(": Direct message • "),
+                    Span::styled("/file", Style::default().fg(Color::Green)),
+                    Span::raw(": Mesh file • "),
+                    Span::styled("/receive", Style::default().fg(Color::Green)),
+                    Span::raw(": Accept offer • "),
                     Span::styled(
                         format!("Nick: {}", app.nickname),
                         Style::default().fg(Color::Blue),

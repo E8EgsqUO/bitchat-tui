@@ -10,6 +10,7 @@
 - Unread counters in the sidebar for channels and people
 - Message fragmentation and reassembly for larger payloads
 - TUI-to-TUI Bluetooth mesh file transfer up to 1 MiB
+- Geohash DM file pairing via Magic Wormhole
 - Windows, Linux, and macOS builds with the same Rust codebase
 - Graceful fallback when Bluetooth mesh discovery fails, with geohash chat still available
 
@@ -79,7 +80,7 @@ If the Bluetooth mesh connection stalls or drops, press `r` on the error screen 
 - Direct messages work from the `People` list in the geohash view.
 - Use `/leave` to leave the geohash channel and return to public chat.
 - `/w`, `/online`, `/channels`, `/name`, and `/public` work in geohash mode.
-- `/reply`, `/file`, `/transfer`, `/block`, and `/unblock` are mesh-only commands.
+- `/reply`, `/block`, and `/unblock` are mesh-only commands.
 
 ### Direct Messages
 
@@ -92,11 +93,12 @@ If the Bluetooth mesh connection stalls or drops, press `r` on the error screen 
 
 ### File Transfer
 
-- Use `/file <path>` to send a file to other `bitchat-tui` clients in the current public mesh room or mesh channel.
-- Use `/file @user <path>` to send a file directly to a visible `bitchat-tui` mesh peer.
-- Files are limited to 1 MiB and are saved under `received_files/` on the receiving side.
+- Mesh transfer stays the same: use `/file <path>` in the current room, or `/file @user <path>` for a visible mesh peer.
+- In a geohash DM, use `/file @user <path>` to send a Wormhole offer to that DM.
+- The receiver opens the same geohash DM and types `/receive` to accept the transfer.
+- The sender does not enter the Wormhole code manually.
+- Files are limited to 1 MiB on mesh transfer and are saved under `received_files/` on the receiving side.
 - This is a TUI-only extension. iOS mesh clients still use their native image and voice-note transfers.
-- TUI file transfer is mesh-only and is not available in Nostr geohash channels or password-protected channels.
 - `/pass` has been removed from this fork.
 
 ## Proxy Support
@@ -131,11 +133,11 @@ Supported proxy formats:
 - `/exit` quit
 - `/public` switch to public chat
 - `/dm <name> [msg]` open a DM or send an initial message
-- `/file [@user] <path>` send a file to other TUI clients over Bluetooth mesh
+- `/file [@user] <path>` send a file over Bluetooth mesh, or create a Wormhole offer in a geohash DM
+- `/receive` accept the pending geohash DM file offer
 - `/reply` reply to the last private sender
 - `/j #channel` join a channel
 - `/leave` leave the current channel
-- `/transfer @user` transfer channel ownership
 - `/channels` list discovered channels
 - `/w` or `/online` show visible users
 - `/block @user` block a user
@@ -171,4 +173,4 @@ BITCHAT_TUI_FILE_LOG=0
 - If Bluetooth mesh is unavailable, geohash channels remain usable.
 - `r` is still useful as a recovery action when the Bluetooth scan needs to be restarted.
 - Proxy settings apply to Nostr relay traffic, not Bluetooth mesh traffic.
-- `/reply`, `/file`, `/transfer`, `/block`, and `/unblock` are Bluetooth mesh commands. In geohash channels, use the `People` list or `/dm <name>` for direct messages.
+- `/reply`, `/block`, and `/unblock` are Bluetooth mesh commands. In geohash channels, use the `People` list or `/dm <name>` for direct messages.
