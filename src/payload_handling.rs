@@ -123,6 +123,10 @@ pub fn parse_private_noise_payload(data: &[u8]) -> Result<(String, String), &'st
     ))
 }
 
+pub fn parse_private_noise_ack_payload(data: &[u8]) -> Result<String, &'static str> {
+    String::from_utf8(data.to_vec()).map_err(|_| "Invalid UTF-8 in private ack message ID")
+}
+
 pub fn parse_bitchat_message_payload(data: &[u8]) -> Result<BitchatMessage, &'static str> {
     debug_full_println!(
         "[PARSE] Parsing message payload, size: {} bytes",
@@ -500,6 +504,26 @@ mod tests {
     fn private_noise_payload_round_trips() {
         let payload = create_private_noise_payload("msg-1", "hello").unwrap();
 
+        assert_eq!(
+            payload,
+            vec![
+                NOISE_PAYLOAD_PRIVATE_MESSAGE,
+                0x00,
+                5,
+                b'm',
+                b's',
+                b'g',
+                b'-',
+                b'1',
+                0x01,
+                5,
+                b'h',
+                b'e',
+                b'l',
+                b'l',
+                b'o',
+            ]
+        );
         assert_eq!(payload[0], NOISE_PAYLOAD_PRIVATE_MESSAGE);
         let (message_id, content) = parse_private_noise_payload(&payload[1..]).unwrap();
         assert_eq!(message_id, "msg-1");

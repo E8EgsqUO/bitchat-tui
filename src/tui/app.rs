@@ -15,6 +15,17 @@ pub struct Message {
     pub timestamp: String,
     pub content: String,
     pub is_self: bool,
+    pub status: MessageStatus,
+    pub local_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageStatus {
+    None,
+    Sending,
+    Delivered,
+    Read,
+    Failed,
 }
 
 #[derive(Debug, Clone)]
@@ -592,6 +603,8 @@ impl App {
                     timestamp,
                     content,
                     is_self: false,
+                    status: MessageStatus::None,
+                    local_id: None,
                 };
 
                 self.dm_messages
@@ -640,14 +653,40 @@ impl App {
             }
         }
 
+        if trimmed.starts_with("__GEO_DM_STATUS__:") {
+            let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
+            if parts.len() >= 3 {
+                let local_id = parts[1];
+                let status = match parts[2] {
+                    "sent" => Some(MessageStatus::None),
+                    "delivered" => Some(MessageStatus::Delivered),
+                    "read" => Some(MessageStatus::Read),
+                    "failed" => Some(MessageStatus::Failed),
+                    _ => None,
+                };
+                if let Some(status) = status {
+                    self.update_dm_message_status(local_id, status);
+                }
+                if status == Some(MessageStatus::Failed) && parts.len() >= 4 && !parts[3].is_empty()
+                {
+                    self.add_log_message(format!(
+                        "system: Failed to send geohash DM: {}",
+                        parts[3]
+                    ));
+                }
+                return;
+            }
+        }
+
         if trimmed.starts_with("__GEO_DM__:") {
-            let parts: Vec<&str> = trimmed.splitn(6, ':').collect();
-            if parts.len() >= 6 {
+            let parts: Vec<&str> = trimmed.splitn(7, ':').collect();
+            if parts.len() >= 7 {
                 let channel = parts[1].to_string();
                 let sender = parts[2].to_string();
                 let pubkey = parts[3].to_string();
                 let timestamp_raw = parts[4].to_string();
-                let content = parts[5].to_string();
+                let message_id = parts[5].to_string();
+                let content = parts[6].to_string();
 
                 if !self.channels.contains(&channel) {
                     self.channels.push(channel.clone());
@@ -685,6 +724,8 @@ impl App {
                         timestamp,
                         content,
                         is_self: false,
+                        status: MessageStatus::None,
+                        local_id: Some(message_id),
                     };
                     self.dm_messages
                         .entry(target_key.clone())
@@ -705,6 +746,52 @@ impl App {
                     timestamp,
                     content,
                     is_self: false,
+                    status: MessageStatus::None,
+                    local_id: Some(message_id),
+                };
+
+                self.dm_messages
+                    .entry(target_key.clone())
+                    .or_default()
+                    .push(msg);
+
+                if self.current_conv.as_ref().and_then(|(dm, _)| dm.as_ref()) != Some(&target_key) {
+                    self.add_unread_message(format!("dm:{}", target_key));
+                }
+
+                self.scroll_to_bottom_current_conversation();
+                return;
+            }
+
+            let parts: Vec<&str> = trimmed.splitn(6, ':').collect();
+            if parts.len() >= 6 {
+                let channel = parts[1].to_string();
+                let sender = parts[2].to_string();
+                let pubkey = parts[3].to_string();
+                let timestamp_raw = parts[4].to_string();
+                let content = parts[5].to_string();
+
+                if !self.channels.contains(&channel) {
+                    self.channels.push(channel.clone());
+                }
+                self.note_geohash_presence(&channel, &pubkey, chrono::Local::now().timestamp());
+                self.add_geohash_person(&channel, &sender, Some(&pubkey));
+
+                let timestamp = if timestamp_raw.len() == 4 {
+                    format!("{}:{}", &timestamp_raw[0..2], &timestamp_raw[2..4])
+                } else {
+                    timestamp_raw
+                };
+
+                let target_key = Self::geohash_dm_pubkey_key(&channel, &pubkey);
+                let msg = Message {
+                    sender,
+                    sender_pubkey: Some(pubkey),
+                    timestamp,
+                    content,
+                    is_self: false,
+                    status: MessageStatus::None,
+                    local_id: None,
                 };
 
                 self.dm_messages
@@ -757,6 +844,8 @@ impl App {
                     timestamp,
                     content,
                     is_self: false,
+                    status: MessageStatus::None,
+                    local_id: None,
                 };
 
                 self.channel_messages
@@ -806,6 +895,8 @@ impl App {
                 timestamp,
                 content,
                 is_self: false,
+                status: MessageStatus::None,
+                local_id: None,
             };
             let current_channel = self.get_selected_channel_name();
             self.channel_messages
@@ -835,6 +926,8 @@ impl App {
                             timestamp: chrono::Local::now().format("%H:%M").to_string(),
                             content: trimmed_line.to_string(),
                             is_self: false,
+                            status: MessageStatus::None,
+                            local_id: None,
                         };
 
                         // Check if we're in a DM conversation or channel conversation
@@ -877,6 +970,8 @@ impl App {
                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                     content: trimmed_line.to_string(),
                     is_self: false,
+                    status: MessageStatus::None,
+                    local_id: None,
                 };
                 self.channel_messages
                     .entry(current_channel.clone())
@@ -895,6 +990,8 @@ impl App {
             timestamp,
             content: text,
             is_self: true,
+            status: MessageStatus::None,
+            local_id: None,
         };
 
         let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
@@ -906,6 +1003,43 @@ impl App {
         self.scroll_to_bottom_current_conversation();
     }
 
+    pub fn add_pending_geohash_dm_message(&mut self, text: String, local_id: String) {
+        let timestamp = chrono::Local::now().format("%H:%M").to_string();
+        let msg = Message {
+            sender: self.nickname.clone(),
+            sender_pubkey: None,
+            timestamp,
+            content: text,
+            is_self: true,
+            status: MessageStatus::Sending,
+            local_id: Some(local_id),
+        };
+
+        let (dm_target, _) = self.current_conv.clone().unwrap_or((None, None));
+        if let Some(target) = dm_target {
+            self.dm_messages.entry(target).or_default().push(msg);
+        }
+        self.scroll_to_bottom_current_conversation();
+    }
+
+    pub fn update_dm_message_status(&mut self, local_id: &str, status: MessageStatus) -> bool {
+        for messages in self.dm_messages.values_mut() {
+            if let Some(message) = messages
+                .iter_mut()
+                .find(|message| message.local_id.as_deref() == Some(local_id))
+            {
+                if matches!(message.status, MessageStatus::Read)
+                    && matches!(status, MessageStatus::Delivered)
+                {
+                    return true;
+                }
+                message.status = status;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn add_dm_message(&mut self, target_nickname: String, content: String) {
         let timestamp = chrono::Local::now().format("%H:%M").to_string();
         let msg = Message {
@@ -914,6 +1048,8 @@ impl App {
             timestamp,
             content,
             is_self: true,
+            status: MessageStatus::None,
+            local_id: None,
         };
         self.dm_messages
             .entry(target_nickname)
@@ -946,6 +1082,8 @@ impl App {
                 timestamp: chrono::Local::now().format("%H:%M").to_string(),
                 content,
                 is_self: false,
+                status: MessageStatus::None,
+                local_id: None,
             })
             .collect();
         self.channel_messages
@@ -1291,7 +1429,7 @@ mod tests {
     #[test]
     fn geohash_dm_prefers_canonical_pubkey_thread_keys() {
         let mut app = App::new_with_nickname("me".to_string());
-        let pubkey = "4d4b6cd13610392258017bfb6c6d0ca3bce4a592f22ce86c02aa1da97a9a1d3d";
+        let pubkey = "4ccaa3888b3b303d28bd9ae6aa2278530232b404abccffa83d9aa815ed2ca4e2";
 
         app.join_channel("#ws".to_string());
         app.add_log_message(format!("__GEO_PERSON__:#ws:alice:{}", pubkey));
@@ -1366,6 +1504,60 @@ mod tests {
         assert_eq!(app.display_visible_person("g8.bot"), "g8.bot");
         let msg = app.channel_messages.get("#ws").unwrap().first().unwrap();
         assert_eq!(app.display_geohash_sender("#ws", msg), "g8.bot");
+    }
+
+    #[test]
+    fn pending_geohash_dm_status_updates_in_current_thread() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let pubkey = "4ccaa3888b3b303d28bd9ae6aa2278530232b404abccffa83d9aa815ed2ca4e2";
+
+        app.join_channel("#ws".to_string());
+        app.add_log_message(format!("__GEO_PERSON__:#ws:alice:{}", pubkey));
+        app.switch_to_geohash_dm("alice".to_string());
+        app.add_pending_geohash_dm_message("hello".to_string(), "local-1".to_string());
+
+        let key = App::geohash_dm_pubkey_key("#ws", pubkey);
+        let msg = app.dm_messages.get(&key).unwrap().first().unwrap();
+        assert_eq!(msg.status, MessageStatus::Sending);
+
+        app.add_log_message("__GEO_DM_STATUS__:local-1:sent".to_string());
+        let msg = app.dm_messages.get(&key).unwrap().first().unwrap();
+        assert_eq!(msg.status, MessageStatus::None);
+
+        app.add_log_message("__GEO_DM_STATUS__:local-1:delivered".to_string());
+        let msg = app.dm_messages.get(&key).unwrap().first().unwrap();
+        assert_eq!(msg.status, MessageStatus::Delivered);
+
+        app.add_log_message("__GEO_DM_STATUS__:local-1:read".to_string());
+        let msg = app.dm_messages.get(&key).unwrap().first().unwrap();
+        assert_eq!(msg.status, MessageStatus::Read);
+
+        app.add_log_message("__GEO_DM_STATUS__:local-1:delivered".to_string());
+        let msg = app.dm_messages.get(&key).unwrap().first().unwrap();
+        assert_eq!(msg.status, MessageStatus::Read);
+    }
+
+    #[test]
+    fn geohash_profile_name_keeps_pubkey_dm_thread_stable() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let pubkey = "4ccaa3888b3b303d28bd9ae6aa2278530232b404abccffa83d9aa815ed2ca4e2";
+
+        app.join_channel("#ws".to_string());
+        app.add_log_message(format!("__GEO_PERSON__:#ws:{}:{}", pubkey, pubkey));
+        app.switch_to_geohash_dm(pubkey.to_string());
+        app.add_pending_geohash_dm_message("before".to_string(), "local-1".to_string());
+        app.add_log_message(format!("__GEO_PERSON__:#ws:g8.bot:{}", pubkey));
+        app.switch_to_geohash_dm("g8.bot".to_string());
+        app.add_pending_geohash_dm_message("after".to_string(), "local-2".to_string());
+
+        let key = App::geohash_dm_pubkey_key("#ws", pubkey);
+        let messages = app.dm_messages.get(&key).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            app.current_geohash_dm(),
+            Some(("#ws".to_string(), pubkey.to_string(), pubkey.to_string()))
+        );
+        assert_eq!(app.display_dm_target(&key), "g8.bot in #ws");
     }
 
     #[test]

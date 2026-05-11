@@ -10,7 +10,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::tui::app::{App, FocusArea, Message};
+use crate::tui::app::{App, FocusArea, Message, MessageStatus};
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
@@ -166,15 +166,25 @@ fn message_to_list_items(app: &App, msg: &Message, area_width: u16) -> Vec<ListI
     let sender_width = UnicodeWidthStr::width(sender.as_str());
     let prefix_width = timestamp_width + 1 + sender_width + 1;
     let available_width = area_width.saturating_sub(2) as usize;
-    let content_width = available_width.saturating_sub(prefix_width).max(1);
+    let status_marker = message_status_marker(msg.status);
+    let status_reserve = status_marker
+        .as_ref()
+        .map(|(text, _)| UnicodeWidthStr::width(*text) + 1)
+        .unwrap_or_default();
+    let content_width = available_width
+        .saturating_sub(prefix_width + status_reserve)
+        .max(1);
     let continuation_indent = " ".repeat(prefix_width.min(available_width.saturating_sub(1)));
 
-    wrap_display_width(&msg.content, content_width)
+    let wrapped_lines = wrap_display_width(&msg.content, content_width);
+    let last_idx = wrapped_lines.len().saturating_sub(1);
+    wrapped_lines
         .into_iter()
         .enumerate()
         .map(|(idx, line_content)| {
+            let is_last_line = idx == last_idx;
             if idx == 0 {
-                ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(timestamp.clone(), Style::default().fg(Color::DarkGray)),
                     Span::raw(" "),
                     Span::styled(
@@ -183,15 +193,71 @@ fn message_to_list_items(app: &App, msg: &Message, area_width: u16) -> Vec<ListI
                     ),
                     Span::raw(" "),
                     Span::raw(line_content),
-                ]))
+                ];
+                append_status_marker(
+                    &mut spans,
+                    status_marker,
+                    is_last_line,
+                    available_width,
+                    prefix_width,
+                );
+                ListItem::new(Line::from(spans))
             } else {
-                ListItem::new(Line::from(vec![
+                let indent_width = UnicodeWidthStr::width(continuation_indent.as_str());
+                let mut spans = vec![
                     Span::raw(continuation_indent.clone()),
                     Span::raw(line_content),
-                ]))
+                ];
+                append_status_marker(
+                    &mut spans,
+                    status_marker,
+                    is_last_line,
+                    available_width,
+                    indent_width,
+                );
+                ListItem::new(Line::from(spans))
             }
         })
         .collect()
+}
+
+fn message_status_marker(status: MessageStatus) -> Option<(&'static str, Style)> {
+    match status {
+        MessageStatus::None | MessageStatus::Sending => None,
+        MessageStatus::Delivered => Some(("✓", Style::default().fg(Color::Green))),
+        MessageStatus::Read => Some(("✓", Style::default().fg(Color::LightBlue))),
+        MessageStatus::Failed => Some((
+            "!",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+    }
+}
+
+fn append_status_marker(
+    spans: &mut Vec<Span<'static>>,
+    marker: Option<(&'static str, Style)>,
+    is_last_line: bool,
+    available_width: usize,
+    prefix_width: usize,
+) {
+    let Some((text, style)) = marker else {
+        return;
+    };
+    if !is_last_line {
+        return;
+    }
+
+    let marker_width = UnicodeWidthStr::width(text);
+    let content_width = spans
+        .last()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .unwrap_or_default();
+    let current_width = prefix_width + content_width;
+    let padding_width = available_width.saturating_sub(current_width + marker_width);
+    if padding_width > 0 {
+        spans.push(Span::raw(" ".repeat(padding_width)));
+    }
+    spans.push(Span::styled(text, style));
 }
 
 fn wrap_display_width(text: &str, max_width: usize) -> Vec<String> {
@@ -262,6 +328,8 @@ mod tests {
             timestamp: "12:00".to_string(),
             content: "one two three four five six seven".to_string(),
             is_self: false,
+            status: MessageStatus::None,
+            local_id: None,
         };
 
         assert!(message_to_list_items(&app, &message, 24).len() > 1);

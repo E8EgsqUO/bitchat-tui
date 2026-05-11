@@ -200,7 +200,7 @@ fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Send
             let input_str = app.input.value().to_string();
             if !input_str.is_empty() {
                 if input_tx.try_send(input_str.clone()).is_ok() {
-                    if !input_str.starts_with('/') {
+                    if !input_str.starts_with('/') && app.current_geohash_dm().is_none() {
                         app.add_sent_message(input_str);
                     }
                     app.input.reset();
@@ -260,6 +260,29 @@ mod tests {
         assert_eq!(app.input.value(), "");
         let public_messages = app.channel_messages.get("#public").unwrap();
         assert_eq!(public_messages.last().unwrap().content, "🙂");
+    }
+
+    #[test]
+    fn geohash_dm_input_is_not_echoed_by_event_layer() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        let pubkey = "4ccaa3888b3b303d28bd9ae6aa2278530232b404abccffa83d9aa815ed2ca4e2";
+        let dm_key = App::geohash_dm_pubkey_key("#ws", pubkey);
+        app.focus_area = FocusArea::InputBox;
+        app.join_channel("#ws".to_string());
+        app.add_log_message(format!("__GEO_PERSON__:#ws:alice:{}", pubkey));
+        app.switch_to_geohash_dm("alice".to_string());
+
+        handle_paste_event(&mut app, "hello");
+        handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(input_rx.try_recv().unwrap(), "hello");
+        assert_eq!(app.input.value(), "");
+        assert!(app
+            .dm_messages
+            .get(&dm_key)
+            .map(Vec::is_empty)
+            .unwrap_or(true));
     }
 
     #[test]

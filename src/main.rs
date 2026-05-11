@@ -90,6 +90,7 @@ use packet_creation::{
 use packet_parser::parse_bitchat_packet;
 use persistence::{load_state, save_state, AppState, EncryptedPassword};
 use terminal_ux::{ChatContext, ChatMode};
+use uuid::Uuid;
 use x25519_dalek::StaticSecret;
 
 type AppStateFactory = Box<
@@ -266,6 +267,54 @@ fn resolve_geohash_dm_target(
     }
 
     Err(GeohashDmTargetError::UnknownName)
+}
+
+fn queue_geohash_dm_send(
+    app: &mut App,
+    nostr_geo_client: nostr_geo::NostrGeoClient,
+    ui_tx: mpsc::Sender<String>,
+    channel: String,
+    target_label: String,
+    recipient_pubkey: String,
+    message: String,
+    my_peer_id: String,
+    sender_nickname: String,
+) {
+    let message_id = Uuid::new_v4().to_string();
+    app.add_pending_geohash_dm_message(message.clone(), message_id.clone());
+    write_debug_log(&format!(
+        "Queued geohash DM: channel={}, target={}, recipient={}, message={}",
+        channel,
+        sanitize_status_field(&target_label),
+        App::short_pubkey(&recipient_pubkey),
+        App::short_pubkey(&message_id)
+    ));
+
+    tokio::spawn(async move {
+        let status = match nostr_geo_client
+            .send_private_message(
+                &channel,
+                &recipient_pubkey,
+                &message,
+                &my_peer_id,
+                &sender_nickname,
+                &message_id,
+            )
+            .await
+        {
+            Ok(()) => format!("__GEO_DM_STATUS__:{}:sent", message_id),
+            Err(e) => format!(
+                "__GEO_DM_STATUS__:{}:failed:{}",
+                message_id,
+                sanitize_status_field(&format!("{}: {}", target_label, e))
+            ),
+        };
+        let _ = ui_tx.send(status).await;
+    });
+}
+
+fn sanitize_status_field(value: &str) -> String {
+    value.replace(['\r', '\n'], " ")
 }
 
 fn is_pass_command(line: &str) -> bool {
@@ -1450,32 +1499,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.switch_to_geohash_dm(target_label.clone());
 
                     if let Some(message) = maybe_message {
-                        app.add_sent_message(message.clone());
-                        let nostr_geo_client = nostr_geo_client.clone();
-                        let ui_tx = ui_tx.clone();
-                        let channel = geohash_channel.clone();
-                        let target_for_error = target_nickname.clone();
-                        let my_peer_id = my_peer_id.clone();
-                        let sender_nickname = nickname.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = nostr_geo_client
-                                .send_private_message(
-                                    &channel,
-                                    &recipient_pubkey,
-                                    &message,
-                                    &my_peer_id,
-                                    &sender_nickname,
-                                )
-                                .await
-                            {
-                                let _ = ui_tx
-                                    .send(format!(
-                                        "system: Failed to send geohash DM to {}: {}",
-                                        target_for_error, e
-                                    ))
-                                    .await;
-                            }
-                        });
+                        queue_geohash_dm_send(
+                            &mut app,
+                            nostr_geo_client.clone(),
+                            ui_tx.clone(),
+                            geohash_channel.clone(),
+                            target_label,
+                            recipient_pubkey,
+                            message,
+                            my_peer_id.clone(),
+                            nickname.clone(),
+                        );
                     }
                     continue;
                 }
@@ -1576,6 +1610,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let sender_nickname = nickname.clone();
                         let code_for_log = transfer.code.clone();
                         tokio::spawn(async move {
+                            let message_id = Uuid::new_v4().to_string();
                             if let Err(e) = nostr_geo_client
                                 .send_private_message(
                                     &channel,
@@ -1583,6 +1618,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &offer_msg,
                                     &my_peer_id,
                                     &sender_nickname,
+                                    &message_id,
                                 )
                                 .await
                             {
@@ -1630,10 +1666,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if parse_receive_command(&line).is_some() {
-                if let Some((channel, target_nickname, _recipient_pubkey)) =
+                if let Some((channel, _target_nickname, recipient_pubkey)) =
                     app.current_geohash_dm()
                 {
-                    let conversation_key = App::geohash_dm_key(&channel, &target_nickname);
+                    let conversation_key = App::geohash_dm_pubkey_key(&channel, &recipient_pubkey);
                     let Some(offer) = app.take_pending_wormhole_offer(&conversation_key) else {
                         app.add_log_message(
                             "system: No pending file offer in this conversation.".to_string(),
@@ -1680,30 +1716,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !app.connected && !line.trim_start().starts_with('/') {
                 if let Some((channel, target_nickname, recipient_pubkey)) = app.current_geohash_dm()
                 {
-                    let nostr_geo_client = nostr_geo_client.clone();
-                    let ui_tx = ui_tx.clone();
-                    let message = line.clone();
-                    let my_peer_id = my_peer_id.clone();
-                    let sender_nickname = nickname.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = nostr_geo_client
-                            .send_private_message(
-                                &channel,
-                                &recipient_pubkey,
-                                &message,
-                                &my_peer_id,
-                                &sender_nickname,
-                            )
-                            .await
-                        {
-                            let _ = ui_tx
-                                .send(format!(
-                                    "system: Failed to send geohash DM to {}: {}",
-                                    target_nickname, e
-                                ))
-                                .await;
-                        }
-                    });
+                    queue_geohash_dm_send(
+                        &mut app,
+                        nostr_geo_client.clone(),
+                        ui_tx.clone(),
+                        channel,
+                        target_nickname,
+                        recipient_pubkey,
+                        line.clone(),
+                        my_peer_id.clone(),
+                        nickname.clone(),
+                    );
                     continue;
                 }
 
@@ -1943,30 +1966,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if let Some((channel, target_nickname, recipient_pubkey)) = app.current_geohash_dm() {
-                let nostr_geo_client = nostr_geo_client.clone();
-                let ui_tx = ui_tx.clone();
-                let message = line.clone();
-                let my_peer_id = my_peer_id.clone();
-                let sender_nickname = nickname.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = nostr_geo_client
-                        .send_private_message(
-                            &channel,
-                            &recipient_pubkey,
-                            &message,
-                            &my_peer_id,
-                            &sender_nickname,
-                        )
-                        .await
-                    {
-                        let _ = ui_tx
-                            .send(format!(
-                                "system: Failed to send geohash DM to {}: {}",
-                                target_nickname, e
-                            ))
-                            .await;
-                    }
-                });
+                queue_geohash_dm_send(
+                    &mut app,
+                    nostr_geo_client.clone(),
+                    ui_tx.clone(),
+                    channel,
+                    target_nickname,
+                    recipient_pubkey,
+                    line.clone(),
+                    my_peer_id.clone(),
+                    nickname.clone(),
+                );
                 continue;
             }
 

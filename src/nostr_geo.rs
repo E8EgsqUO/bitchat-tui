@@ -38,7 +38,7 @@ const GEO_RELAY_CSV_URL: &str =
     "https://raw.githubusercontent.com/permissionlesstech/georelays/main/nostr_relays.csv";
 const GEOHASH_ALPHABET: &str = "0123456789bcdefghjkmnpqrstuvwxyz";
 const SUBSCRIBE_SINCE_SECONDS: i64 = 300;
-const DM_SUBSCRIBE_SINCE_SECONDS: i64 = 3_600;
+const DM_SUBSCRIBE_SINCE_SECONDS: i64 = 86_400;
 const RECONNECT_DELAY_SECONDS: u64 = 10;
 const CONNECT_TIMEOUT_SECONDS: u64 = 8;
 const PUBLISH_TIMEOUT_SECONDS: u64 = 8;
@@ -52,6 +52,8 @@ const NIP44_MIN_PLAINTEXT_SIZE: usize = 1;
 const NIP44_MAX_PLAINTEXT_SIZE: usize = 65_535;
 const EMBEDDED_PRIVATE_PAYLOAD_UNSUPPORTED_TYPE: &str =
     "Embedded private payload has unsupported type";
+const GEOHASH_DM_STATUS_DELIVERED: &str = "delivered";
+const GEOHASH_DM_STATUS_READ: &str = "read";
 
 const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -301,9 +303,13 @@ impl NostrGeoClient {
 
         let mut sent_count = 0usize;
         let total_count = publish_results.len();
+        let mut accepted_relays = Vec::new();
         for (relay, result) in publish_results {
             match result {
-                Ok(()) => sent_count += 1,
+                Ok(()) => {
+                    sent_count += 1;
+                    accepted_relays.push(relay);
+                }
                 Err(e) => write_nostr_debug_log(&format!(
                     "publish failed: relay={}, event={}, error={}",
                     relay, event_id, e
@@ -311,8 +317,12 @@ impl NostrGeoClient {
             }
         }
         write_nostr_debug_log(&format!(
-            "publish result: geohash=#{}, event={}, sent={}, total={}",
-            geohash, event_id, sent_count, total_count
+            "publish result: geohash=#{}, event={}, sent={}, total={}, accepted={}",
+            geohash,
+            event_id,
+            sent_count,
+            total_count,
+            accepted_relays.join(",")
         ));
 
         if sent_count == 0 {
@@ -336,6 +346,7 @@ impl NostrGeoClient {
         content: &str,
         sender_peer_id: &str,
         sender_nickname: &str,
+        message_id: &str,
     ) -> Result<(), String> {
         let geohash =
             normalize_geohash(channel).ok_or_else(|| "Invalid geohash channel".to_string())?;
@@ -350,25 +361,41 @@ impl NostrGeoClient {
             content,
             sender_peer_id,
             sender_nickname,
+            message_id,
         )?;
+        self.publish_private_event(&geohash, recipient_pubkey, event)
+            .await
+    }
+
+    async fn publish_private_event(
+        &self,
+        geohash: &str,
+        recipient_pubkey: &str,
+        event: NostrEvent,
+    ) -> Result<(), String> {
         let event_id = event.id.clone();
+        let sender_pubkey = derive_secret_key(&self.inner.identity_seed, geohash)
+            .map(|secret| xonly_pubkey_from_secret(&secret))
+            .unwrap_or_else(|_| event.pubkey.clone());
 
         let public_relays = self
             .inner
             .relays_by_geohash
             .lock()
             .await
-            .get(&geohash)
+            .get(geohash)
             .cloned()
             .unwrap_or_else(default_relays);
         let dm_relays = dm_relays();
+        let dm_relay_set: HashSet<String> = dm_relays.iter().cloned().collect();
         let relays = merge_relays(&public_relays, &dm_relays);
 
         let _publish_guard = self.inner.publish_lock.lock().await;
         write_nostr_debug_log(&format!(
-            "dm publish start: geohash=#{}, recipient={}, event={}, public_relays={}, dm_relays={}, relays={}",
+            "dm publish start: geohash=#{}, sender={}, recipient={}, event={}, public_relays={}, dm_relays={}, relays={}",
             geohash,
-            &recipient_pubkey[..recipient_pubkey.len().min(8)],
+            short_log_pubkey(&sender_pubkey),
+            short_log_pubkey(recipient_pubkey),
             event_id,
             public_relays.len(),
             dm_relays.len(),
@@ -385,10 +412,18 @@ impl NostrGeoClient {
         .await;
 
         let mut sent_count = 0usize;
+        let mut dm_sent_count = 0usize;
         let total_count = publish_results.len();
+        let mut accepted_relays = Vec::new();
         for (relay, result) in publish_results {
             match result {
-                Ok(()) => sent_count += 1,
+                Ok(()) => {
+                    sent_count += 1;
+                    if dm_relay_set.contains(&relay) {
+                        dm_sent_count += 1;
+                    }
+                    accepted_relays.push(relay);
+                }
                 Err(e) => write_nostr_debug_log(&format!(
                     "dm publish failed: relay={}, event={}, error={}",
                     relay, event_id, e
@@ -396,11 +431,21 @@ impl NostrGeoClient {
             }
         }
         write_nostr_debug_log(&format!(
-            "dm publish result: geohash=#{}, event={}, sent={}, total={}",
-            geohash, event_id, sent_count, total_count
+            "dm publish result: geohash=#{}, event={}, sent={}, dm_sent={}, total={}, accepted={}",
+            geohash,
+            event_id,
+            sent_count,
+            dm_sent_count,
+            total_count,
+            accepted_relays.join(",")
         ));
 
-        if sent_count == 0 {
+        if dm_sent_count == 0 {
+            Err(
+                "Failed to publish geohash DM to any default DM relay; iOS only listens on those relays"
+                    .to_string(),
+            )
+        } else if sent_count == 0 {
             Err("Failed to publish geohash DM to any Nostr relay".to_string())
         } else {
             Ok(())
@@ -503,9 +548,13 @@ async fn broadcast_geohash_presence(
 
     let mut sent_count = 0usize;
     let total_count = publish_results.len();
+    let mut accepted_relays = Vec::new();
     for (relay, result) in publish_results {
         match result {
-            Ok(()) => sent_count += 1,
+            Ok(()) => {
+                sent_count += 1;
+                accepted_relays.push(relay);
+            }
             Err(e) => write_nostr_debug_log(&format!(
                 "presence publish failed: relay={}, event={}, error={}",
                 relay, event_id, e
@@ -513,8 +562,12 @@ async fn broadcast_geohash_presence(
         }
     }
     write_nostr_debug_log(&format!(
-        "presence publish result: geohash=#{}, event={}, sent={}, total={}",
-        geohash, event_id, sent_count, total_count
+        "presence publish result: geohash=#{}, event={}, sent={}, total={}, accepted={}",
+        geohash,
+        event_id,
+        sent_count,
+        total_count,
+        accepted_relays.join(",")
     ));
 
     if sent_count == 0 {
@@ -565,7 +618,8 @@ async fn subscribe_once(
         {
             "kinds": [GEOHASH_DM_KIND],
             "#p": [local_pubkey],
-            "since": dm_since
+            "since": dm_since,
+            "limit": 100
         }
     ]);
 
@@ -574,8 +628,12 @@ async fn subscribe_once(
         .await
         .map_err(|e| e.to_string())?;
     write_nostr_debug_log(&format!(
-        "subscribe connected: relay={}, geohash=#{}, public_since={}, dm_since={}",
-        relay, geohash, public_since, dm_since
+        "subscribe connected: relay={}, geohash=#{}, local_pubkey={}, public_since={}, dm_since={}",
+        relay,
+        geohash,
+        short_log_pubkey(local_pubkey),
+        public_since,
+        dm_since
     ));
 
     loop {
@@ -686,8 +744,11 @@ async fn handle_relay_text(
         event.content
     );
     write_nostr_debug_log(&format!(
-        "received event: geohash=#{}, sender={}, event={}",
-        geohash, sender, event.id
+        "received event: geohash=#{}, sender={}, pubkey={}, event={}",
+        geohash,
+        sender,
+        short_log_pubkey(&event.pubkey),
+        event.id
     ));
     send_presence_update(inner, channel, &event.pubkey, event.created_at).await;
     let _ = inner.ui_tx.send(structured).await;
@@ -807,7 +868,27 @@ async fn handle_private_relay_event(
     local_secret: &SecretKey,
     event: &NostrEvent,
 ) {
+    write_nostr_debug_log(&format!(
+        "received geohash dm candidate: channel={}, event={}, gift_pubkey={}, local={}, p_tags={}",
+        channel,
+        event.id,
+        short_log_pubkey(&event.pubkey),
+        short_log_pubkey(local_pubkey),
+        event
+            .tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("p"))
+            .filter_map(|tag| tag.get(1))
+            .map(|value| short_log_pubkey(value))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+
     if event.pubkey == local_pubkey || !event_has_tag_value(event, "p", local_pubkey) {
+        write_nostr_debug_log(&format!(
+            "ignored geohash dm candidate: event={}, reason=not addressed to local key",
+            event.id
+        ));
         return;
     }
 
@@ -817,25 +898,75 @@ async fn handle_private_relay_event(
     }
     drop(seen);
 
-    let (content, sender_pubkey, timestamp, sender_nickname) =
+    let decoded =
         match decrypt_private_message(event, local_secret).and_then(decode_bitchat_dm_content) {
             Ok(decoded) => decoded,
             Err(e) => {
-                if e.starts_with(EMBEDDED_PRIVATE_PAYLOAD_UNSUPPORTED_TYPE) {
-                    write_nostr_debug_log(&format!(
-                        "ignored geohash dm control payload: event={}, error={}",
-                        event.id, e
-                    ));
-                } else {
-                    write_nostr_debug_log(&format!(
-                        "failed to decrypt geohash dm: event={}, error={}",
-                        event.id, e
-                    ));
-                }
+                write_nostr_debug_log(&format!(
+                    "failed to decrypt geohash dm: event={}, error={}",
+                    event.id, e
+                ));
                 return;
             }
         };
 
+    let sender_pubkey = decoded.sender_pubkey.clone();
+    write_nostr_debug_log(&format!(
+        "decrypted geohash dm: channel={}, sender={}, event={}",
+        channel,
+        short_log_pubkey(&sender_pubkey),
+        event.id
+    ));
+    match decoded.kind {
+        DecodedPrivateMessageKind::Text {
+            content,
+            message_id,
+        } => {
+            handle_private_text_event(
+                inner,
+                channel,
+                event,
+                sender_pubkey,
+                decoded.timestamp,
+                decoded.sender_nickname,
+                message_id,
+                content,
+            )
+            .await;
+        }
+        DecodedPrivateMessageKind::Delivered { message_id } => {
+            emit_private_status_update(
+                inner,
+                channel,
+                &sender_pubkey,
+                &message_id,
+                GEOHASH_DM_STATUS_DELIVERED,
+            )
+            .await;
+        }
+        DecodedPrivateMessageKind::Read { message_id } => {
+            emit_private_status_update(
+                inner,
+                channel,
+                &sender_pubkey,
+                &message_id,
+                GEOHASH_DM_STATUS_READ,
+            )
+            .await;
+        }
+    }
+}
+
+async fn handle_private_text_event(
+    inner: &Arc<NostrGeoInner>,
+    channel: &str,
+    event: &NostrEvent,
+    sender_pubkey: String,
+    timestamp: i64,
+    sender_nickname: Option<String>,
+    message_id: String,
+    content: String,
+) {
     let sender = if let Some(nickname) = sender_nickname {
         update_known_person(inner, channel, &sender_pubkey, &nickname).await;
         nickname
@@ -853,18 +984,46 @@ async fn handle_private_relay_event(
         .single()
         .unwrap_or_else(Local::now);
     let structured = format!(
-        "__GEO_DM__:{}:{}:{}:{}:{}",
+        "__GEO_DM__:{}:{}:{}:{}:{}:{}",
         channel,
         sender,
         sender_pubkey,
         timestamp.format("%H%M"),
+        sanitize_display_field(&message_id),
         content
     );
     write_nostr_debug_log(&format!(
-        "received geohash dm: channel={}, sender={}, event={}",
-        channel, sender, event.id
+        "received geohash dm: channel={}, sender={}, message={}, event={}",
+        channel,
+        sender,
+        short_log_pubkey(&message_id),
+        event.id
     ));
     let _ = inner.ui_tx.send(structured).await;
+}
+
+async fn emit_private_status_update(
+    inner: &Arc<NostrGeoInner>,
+    channel: &str,
+    sender_pubkey: &str,
+    message_id: &str,
+    status: &str,
+) {
+    write_nostr_debug_log(&format!(
+        "received geohash dm {}: channel={}, sender={}, message={}",
+        status,
+        channel,
+        short_log_pubkey(sender_pubkey),
+        short_log_pubkey(message_id)
+    ));
+    let _ = inner
+        .ui_tx
+        .send(format!(
+            "__GEO_DM_STATUS__:{}:{}",
+            sanitize_display_field(message_id),
+            status
+        ))
+        .await;
 }
 
 fn event_has_geohash(event: &NostrEvent, geohash: &str) -> bool {
@@ -1044,6 +1203,8 @@ async fn connect_relay(
 fn nostr_proxy() -> Option<String> {
     [
         "BITCHAT_TUI_NOSTR_PROXY",
+        "HTTP_PROXY",
+        "http_proxy",
         "HTTPS_PROXY",
         "https_proxy",
         "ALL_PROXY",
@@ -1343,11 +1504,21 @@ fn create_private_message_event(
     content: &str,
     sender_peer_id: &str,
     sender_nickname: &str,
+    message_id: &str,
 ) -> Result<NostrEvent, String> {
     let local_secret = derive_secret_key(identity_seed, geohash)?;
     let local_pubkey = xonly_pubkey_from_secret(&local_secret);
-    let embedded = create_embedded_bitchat_dm(content, sender_peer_id)?;
+    let embedded = create_embedded_bitchat_dm(content, sender_peer_id, message_id)?;
 
+    create_private_event_from_embedded(local_pubkey, recipient_pubkey, embedded, sender_nickname)
+}
+
+fn create_private_event_from_embedded(
+    local_pubkey: String,
+    recipient_pubkey: &str,
+    embedded: String,
+    sender_nickname: &str,
+) -> Result<NostrEvent, String> {
     let rumor = Nip17Event {
         id: String::new(),
         pubkey: local_pubkey.clone(),
@@ -1361,24 +1532,28 @@ fn create_private_message_event(
         sig: None,
     };
 
+    // Match iOS NostrProtocol.createPrivateMessage: the rumor carries the
+    // geohash identity, while seal and gift-wrap use fresh ephemeral keys.
+    let seal_key = random_secret_key();
+    let seal_pubkey = xonly_pubkey_from_secret(&seal_key);
     let seal_json = serde_json::to_string(&rumor).map_err(|e| e.to_string())?;
-    let encrypted_seal = nip44_encrypt(&seal_json, recipient_pubkey, &local_secret)?;
+    let encrypted_seal = legacy_nip44_encrypt(&seal_json, recipient_pubkey, &seal_key)?;
     let seal = sign_nip17_event(
         Nip17Event {
             id: String::new(),
-            pubkey: local_pubkey,
+            pubkey: seal_pubkey,
             created_at: randomized_timestamp(),
             kind: 13,
             tags: Vec::new(),
             content: encrypted_seal,
             sig: None,
         },
-        &local_secret,
+        &seal_key,
     )?;
 
     let wrap_key = random_secret_key();
     let seal_json = serde_json::to_string(&seal).map_err(|e| e.to_string())?;
-    let encrypted_wrap = nip44_encrypt(&seal_json, recipient_pubkey, &wrap_key)?;
+    let encrypted_wrap = legacy_nip44_encrypt(&seal_json, recipient_pubkey, &wrap_key)?;
     let gift_wrap = sign_nip17_event(
         Nip17Event {
             id: String::new(),
@@ -1414,12 +1589,35 @@ fn decrypt_private_message(
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedPrivateMessage {
+    kind: DecodedPrivateMessageKind,
+    sender_pubkey: String,
+    timestamp: i64,
+    sender_nickname: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecodedPrivateMessageKind {
+    Text { message_id: String, content: String },
+    Delivered { message_id: String },
+    Read { message_id: String },
+}
+
 fn decode_bitchat_dm_content(
     decoded: (String, String, i64, Option<String>),
-) -> Result<(String, String, i64, Option<String>), String> {
+) -> Result<DecodedPrivateMessage, String> {
     let (content, sender_pubkey, timestamp, sender_nickname) = decoded;
     let Some(encoded) = content.strip_prefix("bitchat1:") else {
-        return Ok((content, sender_pubkey, timestamp, sender_nickname));
+        return Ok(DecodedPrivateMessage {
+            kind: DecodedPrivateMessageKind::Text {
+                message_id: Uuid::new_v4().to_string(),
+                content,
+            },
+            sender_pubkey,
+            timestamp,
+            sender_nickname,
+        });
     };
 
     let packet_bytes = URL_SAFE_NO_PAD
@@ -1427,28 +1625,79 @@ fn decode_bitchat_dm_content(
         .map_err(|e| e.to_string())?;
     let packet =
         crate::packet_parser::parse_bitchat_packet(&packet_bytes).map_err(|e| e.to_string())?;
+    write_nostr_debug_log(&format!(
+        "decoded embedded geohash dm packet: version={}, type={:?}, payload_type={}",
+        packet.version,
+        packet.msg_type,
+        packet
+            .payload
+            .first()
+            .map(|payload_type| format!("0x{:02x}", payload_type))
+            .unwrap_or_else(|| "none".to_string())
+    ));
     if packet.msg_type != crate::data_structures::MessageType::NoiseEncrypted {
         return Err("Embedded BitChat packet is not a private message".to_string());
     }
     let Some((&payload_type, private_payload)) = packet.payload.split_first() else {
         return Err("Embedded private payload is empty".to_string());
     };
-    if payload_type != crate::payload_handling::NOISE_PAYLOAD_PRIVATE_MESSAGE {
-        return Err(format!(
+    let kind_result = match payload_type {
+        crate::payload_handling::NOISE_PAYLOAD_PRIVATE_MESSAGE => {
+            crate::payload_handling::parse_private_noise_payload(private_payload)
+                .map(
+                    |(message_id, private_content)| DecodedPrivateMessageKind::Text {
+                        message_id,
+                        content: private_content,
+                    },
+                )
+                .map_err(|e| e.to_string())
+        }
+        crate::payload_handling::NOISE_PAYLOAD_DELIVERED => {
+            crate::payload_handling::parse_private_noise_ack_payload(private_payload)
+                .map(|message_id| DecodedPrivateMessageKind::Delivered { message_id })
+                .map_err(|e| e.to_string())
+        }
+        crate::payload_handling::NOISE_PAYLOAD_READ_RECEIPT => {
+            crate::payload_handling::parse_private_noise_ack_payload(private_payload)
+                .map(|message_id| DecodedPrivateMessageKind::Read { message_id })
+                .map_err(|e| e.to_string())
+        }
+        _ => Err(format!(
             "{} 0x{:02x}",
             EMBEDDED_PRIVATE_PAYLOAD_UNSUPPORTED_TYPE, payload_type
+        )),
+    };
+    let kind = kind_result.map_err(|e| {
+        write_nostr_debug_log(&format!(
+            "failed to decode embedded geohash dm payload: payload_type=0x{:02x}, payload_len={}, error={}",
+            payload_type,
+            private_payload.len(),
+            e
         ));
-    }
-    let (_, private_content) =
-        crate::payload_handling::parse_private_noise_payload(private_payload)
-            .map_err(|e| e.to_string())?;
-    Ok((private_content, sender_pubkey, timestamp, sender_nickname))
+        e
+    })?;
+    Ok(DecodedPrivateMessage {
+        kind,
+        sender_pubkey,
+        timestamp,
+        sender_nickname,
+    })
 }
 
-fn create_embedded_bitchat_dm(content: &str, sender_peer_id: &str) -> Result<String, String> {
-    let message_id = Uuid::new_v4().to_string();
+fn create_embedded_bitchat_dm(
+    content: &str,
+    sender_peer_id: &str,
+    message_id: &str,
+) -> Result<String, String> {
     let payload = crate::payload_handling::create_private_noise_payload(&message_id, content)
         .map_err(|e| e.to_string())?;
+    create_embedded_bitchat_noise_packet(sender_peer_id, payload)
+}
+
+fn create_embedded_bitchat_noise_packet(
+    sender_peer_id: &str,
+    payload: Vec<u8>,
+) -> Result<String, String> {
     let packet = crate::packet_creation::create_bitchat_packet_with_recipient_at(
         sender_peer_id,
         None,
@@ -1503,6 +1752,36 @@ fn nip44_encrypt(
     let mut nonce = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
     nip44_encrypt_with_nonce(plaintext, recipient_pubkey, sender_key, &nonce)
+}
+
+fn legacy_nip44_encrypt(
+    plaintext: &str,
+    recipient_pubkey: &str,
+    sender_key: &SecretKey,
+) -> Result<String, String> {
+    let mut nonce = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    legacy_nip44_encrypt_with_nonce(plaintext, recipient_pubkey, sender_key, &nonce)
+}
+
+fn legacy_nip44_encrypt_with_nonce(
+    plaintext: &str,
+    recipient_pubkey: &str,
+    sender_key: &SecretKey,
+    nonce: &[u8; 24],
+) -> Result<String, String> {
+    let public_key = public_key_from_xonly(recipient_pubkey, 0x02)?;
+    let shared_secret = derive_shared_secret_compressed(sender_key, &public_key)?;
+    let key = legacy_derive_nip44_key(&shared_secret)?;
+    let cipher = XChaCha20Poly1305::new(XChaChaKey::from_slice(&key));
+    let encrypted = cipher
+        .encrypt(XNonce::from_slice(nonce), plaintext.as_bytes())
+        .map_err(|_| "NIP-44 legacy encryption failed".to_string())?;
+
+    let mut combined = Vec::with_capacity(nonce.len() + encrypted.len());
+    combined.extend_from_slice(nonce);
+    combined.extend_from_slice(&encrypted);
+    Ok(format!("v2:{}", URL_SAFE_NO_PAD.encode(combined)))
 }
 
 fn nip44_encrypt_with_nonce(
@@ -2077,7 +2356,13 @@ fn dm_relays() -> Vec<String> {
             return relays;
         }
     }
-    default_relays()
+
+    let relays = default_relays();
+    write_nostr_debug_log(&format!(
+        "using default dm relays: relays={}",
+        relays.join(",")
+    ));
+    relays
 }
 
 fn metadata_relays() -> Vec<String> {
@@ -2133,6 +2418,22 @@ fn sanitize_display_field(value: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn short_log_pubkey(pubkey: &str) -> String {
+    let char_count = pubkey.chars().count();
+    if char_count <= 18 {
+        return pubkey.to_string();
+    }
+
+    let prefix: String = pubkey.chars().take(10).collect();
+    let mut suffix_chars: Vec<char> = pubkey.chars().rev().take(6).collect();
+    suffix_chars.reverse();
+    format!(
+        "{}...{}",
+        prefix,
+        suffix_chars.into_iter().collect::<String>()
+    )
 }
 
 fn write_nostr_debug_log(message: &str) {
@@ -2348,6 +2649,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_nip44_encrypts_and_decrypts_v2_payload() {
+        let sender_secret = SecretKey::from_slice(
+            &hex::decode("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap(),
+        )
+        .unwrap();
+        let recipient_secret = SecretKey::from_slice(
+            &hex::decode("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap(),
+        )
+        .unwrap();
+        let recipient_pubkey = xonly_pubkey_from_secret(&recipient_secret);
+        let sender_pubkey = xonly_pubkey_from_secret(&sender_secret);
+        let nonce = [3u8; 24];
+
+        let payload =
+            legacy_nip44_encrypt_with_nonce("hello", &recipient_pubkey, &sender_secret, &nonce)
+                .unwrap();
+
+        assert!(payload.starts_with("v2:"));
+        assert_eq!(
+            nip44_decrypt(&payload, &sender_pubkey, &recipient_secret).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
     fn creates_and_decrypts_geohash_dm_event() {
         let sender_seed = vec![7u8; 32];
         let recipient_seed = vec![9u8; 32];
@@ -2361,24 +2689,35 @@ mod tests {
             "private hello",
             "0102030405060708",
             "c666",
+            "msg-1",
         )
         .unwrap();
 
         assert_eq!(event.kind, GEOHASH_DM_KIND);
-        assert!(!event.content.starts_with("v2:"));
-        assert_eq!(event.content.as_bytes().first(), Some(&b'A'));
+        assert!(event.content.starts_with("v2:"));
         assert!(event_has_tag_value(&event, "p", &recipient_pubkey));
         assert_eq!(event.sig.len(), 128);
 
-        let (content, sender_pubkey, _, sender_nickname) =
-            decrypt_private_message(&event, &recipient_secret)
-                .and_then(decode_bitchat_dm_content)
-                .unwrap();
-        assert_eq!(content, "private hello");
-        assert_eq!(sender_nickname.as_deref(), Some("c666"));
+        let sender_pubkey =
+            xonly_pubkey_from_secret(&derive_secret_key(&sender_seed, "ws").unwrap());
+        let seal_json = nip44_decrypt(&event.content, &event.pubkey, &recipient_secret).unwrap();
+        let seal: Nip17Event = serde_json::from_str(&seal_json).unwrap();
+        assert_ne!(seal.pubkey, sender_pubkey);
+        let rumor_json = nip44_decrypt(&seal.content, &seal.pubkey, &recipient_secret).unwrap();
+        let rumor: Nip17Event = serde_json::from_str(&rumor_json).unwrap();
+        assert_eq!(rumor.pubkey, sender_pubkey);
+
+        let decoded = decrypt_private_message(&event, &recipient_secret)
+            .and_then(decode_bitchat_dm_content)
+            .unwrap();
         assert_eq!(
-            sender_pubkey,
-            xonly_pubkey_from_secret(&derive_secret_key(&sender_seed, "ws").unwrap())
+            decoded.kind,
+            DecodedPrivateMessageKind::Text {
+                message_id: "msg-1".to_string(),
+                content: "private hello".to_string()
+            }
         );
+        assert_eq!(decoded.sender_nickname.as_deref(), Some("c666"));
+        assert_eq!(decoded.sender_pubkey, sender_pubkey);
     }
 }
