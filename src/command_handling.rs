@@ -40,7 +40,7 @@ struct FileCommand<'a> {
 }
 
 pub(crate) struct GeohashFileOffer<'a> {
-    pub(crate) target_nickname: &'a str,
+    pub(crate) target_nickname: Option<&'a str>,
     pub(crate) path: &'a str,
 }
 
@@ -113,26 +113,35 @@ pub(crate) fn parse_geohash_file_offer(
 
     let rest = rest.trim();
     if rest.is_empty() {
-        return Err("Usage: /file @user <path>");
+        return Err("Usage: /file [@user] <path>");
     }
 
     let mut parts = rest.splitn(2, char::is_whitespace);
     let first = parts.next().unwrap_or("");
-    let Some(target) = first.strip_prefix('@') else {
-        return Err("Usage: /file @user <path>");
-    };
-    if target.is_empty() {
-        return Err("Usage: /file @user <path>");
+    if let Some(target) = first.strip_prefix('@') {
+        if target.is_empty() {
+            return Err("Usage: /file [@user] <path>");
+        }
+        let Some(path) = parts.next().map(str::trim_start) else {
+            return Err("Usage: /file [@user] <path>");
+        };
+        let path = trim_path_quotes(path);
+        if path.is_empty() {
+            return Err("Usage: /file [@user] <path>");
+        }
+        return Ok(Some(GeohashFileOffer {
+            target_nickname: Some(target),
+            path,
+        }));
     }
-    let Some(path) = parts.next().map(str::trim_start) else {
-        return Err("Usage: /file @user <path>");
-    };
-    let path = trim_path_quotes(path);
+
+    let path = trim_path_quotes(rest);
     if path.is_empty() {
-        return Err("Usage: /file @user <path>");
+        return Err("Usage: /file [@user] <path>");
     }
+
     Ok(Some(GeohashFileOffer {
-        target_nickname: target,
+        target_nickname: None,
         path,
     }))
 }
@@ -1303,4 +1312,29 @@ pub async fn handle_fingerprint_command(
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_geohash_file_offer_with_explicit_target() {
+        let offer = parse_geohash_file_offer("/file @alice ./photo.png")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(offer.target_nickname, Some("alice"));
+        assert_eq!(offer.path, "./photo.png");
+    }
+
+    #[test]
+    fn parses_geohash_file_offer_without_target_for_current_dm() {
+        let offer = parse_geohash_file_offer("/file ./photo.png")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(offer.target_nickname, None);
+        assert_eq!(offer.path, "./photo.png");
+    }
 }

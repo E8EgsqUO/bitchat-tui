@@ -96,7 +96,7 @@ If the Bluetooth mesh connection stalls or drops, press `r` on the error screen 
 ### File Transfer
 
 - Mesh transfer stays the same: use `/file <path>` in the current room, or `/file @user <path>` for a visible mesh peer.
-- In a geohash DM, use `/file @user <path>` to send a Wormhole offer to that DM.
+- In a geohash DM, use `/file <path>` to send a Wormhole offer to the current DM. From a geohash channel, use `/file @user <path>`.
 - The receiver opens the same geohash DM and types `/receive` to accept the transfer.
 - The sender does not enter the Wormhole code manually.
 - Files are limited to 1 MiB on mesh transfer and are saved under `received_files/` on the receiving side.

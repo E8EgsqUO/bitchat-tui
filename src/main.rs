@@ -1488,124 +1488,144 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                if let Ok(Some(offer)) = parse_geohash_file_offer(&line) {
-                    let (target_label, recipient_pubkey) = match resolve_geohash_dm_target(
-                        &app,
-                        &geohash_channel,
-                        offer.target_nickname,
-                    ) {
-                        Ok(target) => target,
-                        Err(GeohashDmTargetError::UnknownPubkey) => {
+                match parse_geohash_file_offer(&line) {
+                    Ok(Some(offer)) => {
+                        let (target_label, recipient_pubkey) = if let Some(target_nickname) =
+                            offer.target_nickname
+                        {
+                            match resolve_geohash_dm_target(&app, &geohash_channel, target_nickname)
+                            {
+                                Ok(target) => target,
+                                Err(GeohashDmTargetError::UnknownPubkey) => {
+                                    app.add_log_message(format!(
+                                                "system: Pubkey '{}' has not been seen in {}. Geohash file offers must target a name from /w, or a full key that is already in People.",
+                                                target_nickname, geohash_channel
+                                            ));
+                                    continue;
+                                }
+                                Err(GeohashDmTargetError::UnknownName) => {
+                                    app.add_log_message(format!(
+                                            "system: User '{}' has not been seen in {} with a Nostr key yet.",
+                                            target_nickname, geohash_channel
+                                        ));
+                                    continue;
+                                }
+                            }
+                        } else if let Some((_, target_nickname, recipient_pubkey)) =
+                            app.current_geohash_dm()
+                        {
+                            (target_nickname, recipient_pubkey)
+                        } else {
                             app.add_log_message(format!(
-                                    "system: Pubkey '{}' has not been seen in {}. Geohash file offers must target a name from /w, or a full key that is already in People.",
-                                    offer.target_nickname, geohash_channel
+                                    "system: Usage in {}: /file @user <path>. In a geohash DM, use /file <path>.",
+                                    geohash_channel
                                 ));
                             continue;
-                        }
-                        Err(GeohashDmTargetError::UnknownName) => {
+                        };
+
+                        let file_path = std::path::Path::new(offer.path);
+                        let metadata = match tokio::fs::metadata(file_path).await {
+                            Ok(metadata) => metadata,
+                            Err(e) => {
+                                app.add_log_message(format!(
+                                    "system: Cannot read file '{}': {}",
+                                    offer.path, e
+                                ));
+                                continue;
+                            }
+                        };
+
+                        if !metadata.is_file() {
                             app.add_log_message(format!(
-                                "system: User '{}' has not been seen in {} with a Nostr key yet.",
-                                offer.target_nickname, geohash_channel
+                                "system: '{}' is not a regular file",
+                                offer.path
                             ));
                             continue;
                         }
-                    };
 
-                    let file_path = std::path::Path::new(offer.path);
-                    let metadata = match tokio::fs::metadata(file_path).await {
-                        Ok(metadata) => metadata,
-                        Err(e) => {
-                            app.add_log_message(format!(
-                                "system: Cannot read file '{}': {}",
-                                offer.path, e
-                            ));
-                            continue;
-                        }
-                    };
+                        let file_size = metadata.len();
+                        let file_name = file_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or(offer.path)
+                            .to_string();
+                        let transfer = match wormhole_transfer::prepare_send(
+                            file_path,
+                            file_name.clone(),
+                            file_size,
+                        )
+                        .await
+                        {
+                            Ok(transfer) => transfer,
+                            Err(e) => {
+                                app.add_log_message(format!("system: {}", e));
+                                continue;
+                            }
+                        };
 
-                    if !metadata.is_file() {
+                        let offer_msg = geohash_file_offer_message(
+                            &transfer.code,
+                            &transfer.file_name,
+                            transfer.file_size,
+                        );
+                        let nostr_geo_client = nostr_geo_client.clone();
+                        let offer_ui_tx = ui_tx.clone();
+                        let channel = geohash_channel.clone();
+                        let target_nickname = target_label.clone();
+                        let my_peer_id = my_peer_id.clone();
+                        let sender_nickname = nickname.clone();
+                        let code_for_log = transfer.code.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = nostr_geo_client
+                                .send_private_message(
+                                    &channel,
+                                    &recipient_pubkey,
+                                    &offer_msg,
+                                    &my_peer_id,
+                                    &sender_nickname,
+                                )
+                                .await
+                            {
+                                let _ = offer_ui_tx
+                                    .send(format!(
+                                        "system: Failed to send file offer to {}: {}",
+                                        target_nickname, e
+                                    ))
+                                    .await;
+                            }
+                        });
+
                         app.add_log_message(format!(
-                            "system: '{}' is not a regular file",
-                            offer.path
+                            "system: Wormhole offer {} sent to {}. Type /receive in the same geohash DM to accept.",
+                            code_for_log, target_label
                         ));
+                        let transfer_ui_tx = ui_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = wormhole_transfer::send_file(transfer).await {
+                                let _ = transfer_ui_tx
+                                    .send(format!(
+                                        "system: Wormhole transfer {} failed: {}",
+                                        code_for_log, e
+                                    ))
+                                    .await;
+                            } else {
+                                let _ = ui_tx
+                                    .send(format!(
+                                        "system: Wormhole transfer {} completed.",
+                                        code_for_log
+                                    ))
+                                    .await;
+                            }
+                        });
                         continue;
                     }
-
-                    let file_size = metadata.len();
-                    let file_name = file_path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or(offer.path)
-                        .to_string();
-                    let transfer = match wormhole_transfer::prepare_send(
-                        file_path,
-                        file_name.clone(),
-                        file_size,
-                    )
-                    .await
-                    {
-                        Ok(transfer) => transfer,
-                        Err(e) => {
-                            app.add_log_message(format!("system: {}", e));
+                    Ok(None) => {}
+                    Err(usage) => {
+                        if line.starts_with("/file") {
+                            app.add_log_message(format!("system: {}", usage));
                             continue;
                         }
-                    };
-
-                    let offer_msg = geohash_file_offer_message(
-                        &transfer.code,
-                        &transfer.file_name,
-                        transfer.file_size,
-                    );
-                    let nostr_geo_client = nostr_geo_client.clone();
-                    let offer_ui_tx = ui_tx.clone();
-                    let channel = geohash_channel.clone();
-                    let target_nickname = target_label.clone();
-                    let my_peer_id = my_peer_id.clone();
-                    let sender_nickname = nickname.clone();
-                    let code_for_log = transfer.code.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = nostr_geo_client
-                            .send_private_message(
-                                &channel,
-                                &recipient_pubkey,
-                                &offer_msg,
-                                &my_peer_id,
-                                &sender_nickname,
-                            )
-                            .await
-                        {
-                            let _ = offer_ui_tx
-                                .send(format!(
-                                    "system: Failed to send file offer to {}: {}",
-                                    target_nickname, e
-                                ))
-                                .await;
-                        }
-                    });
-
-                    app.add_log_message(format!(
-                        "system: Wormhole offer {} sent to {}. Type /receive in the same geohash DM to accept.",
-                        code_for_log, offer.target_nickname
-                    ));
-                    let transfer_ui_tx = ui_tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = wormhole_transfer::send_file(transfer).await {
-                            let _ = transfer_ui_tx
-                                .send(format!(
-                                    "system: Wormhole transfer {} failed: {}",
-                                    code_for_log, e
-                                ))
-                                .await;
-                        } else {
-                            let _ = ui_tx
-                                .send(format!(
-                                    "system: Wormhole transfer {} completed.",
-                                    code_for_log
-                                ))
-                                .await;
-                        }
-                    });
-                    continue;
+                    }
                 }
             }
 
@@ -1620,6 +1640,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         continue;
                     };
+                    app.add_log_message(format!(
+                        "system: Accepted file offer for {} ({}). Receiving with Wormhole code {}...",
+                        offer.file_name,
+                        command_handling::format_file_size(offer.file_size_bytes),
+                        offer.code
+                    ));
                     let receive_ui_tx = ui_tx.clone();
                     let code_for_log = offer.code.clone();
                     tokio::spawn(async move {
