@@ -76,17 +76,19 @@ If the Bluetooth mesh connection stalls or drops, press `r` on the error screen 
 ### Nostr Geohash Chat
 
 - Join a geohash channel with `/j #ws`.
-- Once inside a geohash channel, the sidebar shows the local people list for that region.
+- Once inside a geohash channel, the header and People section show the recent active count for that region when presence events are visible.
 - Direct messages work from the `People` list in the geohash view.
 - Use `/leave` to leave the geohash channel and return to public chat.
 - `/w`, `/online`, `/channels`, `/name`, and `/public` work in geohash mode.
+- The active count follows the BitChat geohash presence heartbeat (`kind 20001`) and counts unique pubkeys seen in the last five minutes. Presence-only users are not added to the DM People list until they send a chat message or DM.
 - `/reply`, `/block`, and `/unblock` are mesh-only commands.
 
 ### Direct Messages
 
 - Use `/dm <name>` to open a direct message.
 - Use `/dm <name> <message>` to send a direct message immediately.
-- In a geohash channel, `/dm` uses the people seen in that region.
+- In a geohash channel, `/dm` uses the people seen in that region. Geohash identities are per-channel Nostr keys, so arbitrary global npub values are not valid targets unless that exact key has already appeared in the current `People` list.
+- Use `/w` or `/online` in a geohash channel to show seen names and their short geohash DM keys.
 - In mesh mode, `/dm` uses visible Bluetooth mesh peers.
 - In the sidebar, select a person to open or continue a DM.
 - Unread DM counts appear next to names in `People`.
@@ -139,7 +141,7 @@ Supported proxy formats:
 - `/j #channel` join a channel
 - `/leave` leave the current channel
 - `/channels` list discovered channels
-- `/w` or `/online` show visible users
+- `/w` or `/online` show active geohash count and visible users
 - `/block @user` block a user
 - `/block` list blocked users
 - `/unblock @user` unblock a user
@@ -148,7 +150,7 @@ Supported proxy formats:
 
 - `Public` is the shared room.
 - `Channels` contains joined or discovered channels.
-- `People` shows nearby mesh peers or the people seen in the current geohash channel.
+- `People` shows nearby mesh peers or the people seen in the current geohash channel. In geohash mode, its heading can also show the recent active count from Nostr presence events.
 - Unread counts are shown in parentheses when there are pending messages.
 
 ## Logging

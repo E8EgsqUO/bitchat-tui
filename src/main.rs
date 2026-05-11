@@ -71,8 +71,8 @@ use command_handling::{
     geohash_file_offer_message, handle_block_command, handle_channels_command,
     handle_clear_command, handle_dm_command, handle_exit_command, handle_file_command,
     handle_fingerprint_command, handle_join_command, handle_leave_command, handle_name_command,
-    handle_online_command, handle_public_command, handle_reply_command,
-    handle_unblock_command, parse_geohash_file_offer, parse_receive_command,
+    handle_online_command, handle_public_command, handle_reply_command, handle_unblock_command,
+    parse_geohash_file_offer, parse_receive_command,
 };
 use encryption::EncryptionService;
 use message_handlers::{handle_private_dm_message, handle_regular_message};
@@ -223,23 +223,49 @@ async fn setup_bluetooth_connection(
 }
 
 fn parse_dm_command(line: &str) -> Option<(String, Option<String>)> {
-    let mut parts = line.splitn(3, ' ');
-    if parts.next()? != "/dm" {
+    let rest = line.strip_prefix("/dm")?;
+    if !rest.is_empty() && !rest.chars().next()?.is_whitespace() {
         return None;
     }
 
-    let target = parts.next()?.trim().trim_start_matches('@');
+    let rest = rest.trim_start();
+    let target_end = rest
+        .char_indices()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
+        .unwrap_or(rest.len());
+    let target = rest[..target_end].trim().trim_start_matches('@');
     if target.is_empty() {
         return None;
     }
 
-    let message = parts
-        .next()
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .map(ToOwned::to_owned);
+    let message = rest[target_end..].trim();
+    let message = (!message.is_empty()).then(|| message.to_owned());
 
     Some((target.to_string(), message))
+}
+
+enum GeohashDmTargetError {
+    UnknownName,
+    UnknownPubkey,
+}
+
+fn resolve_geohash_dm_target(
+    app: &App,
+    channel: &str,
+    target: &str,
+) -> Result<(String, String), GeohashDmTargetError> {
+    if let Some(pubkey) = app.geohash_person_pubkey(channel, target) {
+        return Ok((target.to_string(), pubkey));
+    }
+
+    if let Some(pubkey) = nostr_geo::normalize_dm_pubkey(target) {
+        let Some(label) = app.geohash_person_for_pubkey(channel, &pubkey) else {
+            return Err(GeohashDmTargetError::UnknownPubkey);
+        };
+        return Ok((label, pubkey));
+    }
+
+    Err(GeohashDmTargetError::UnknownName)
 }
 
 fn is_pass_command(line: &str) -> bool {
@@ -1332,16 +1358,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Some(geohash_channel) = app.current_geohash_context_channel() {
                 if line == "/online" || line == "/w" {
-                    let mut people = app.geohash_people_for_channel(&geohash_channel);
+                    let active_count = app.geohash_active_count(&geohash_channel);
+                    let mut people: Vec<String> = app
+                        .geohash_people_with_pubkeys(&geohash_channel)
+                        .into_iter()
+                        .map(|(name, pubkey)| {
+                            if let Some(pubkey) = pubkey {
+                                format!("{} ({})", name, App::short_pubkey(&pubkey))
+                            } else {
+                                name
+                            }
+                        })
+                        .collect();
                     people.sort();
                     if people.is_empty() {
                         app.add_log_message(format!(
-                            "system: No people seen in {} yet.",
-                            geohash_channel
+                            "system: {} active in {}; no named people seen yet.",
+                            active_count, geohash_channel
                         ));
                     } else {
                         app.add_log_message(format!(
-                            "system: People seen in {}: {}",
+                            "system: {} active in {}; people seen: {}",
+                            active_count,
                             geohash_channel,
                             people.join(", ")
                         ));
@@ -1387,17 +1425,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     };
 
-                    let Some(recipient_pubkey) =
-                        app.geohash_person_pubkey(&geohash_channel, &target_nickname)
-                    else {
-                        app.add_log_message(format!(
-                            "system: User '{}' has not been seen in {} with a Nostr key yet.",
-                            target_nickname, geohash_channel
-                        ));
-                        continue;
+                    let (target_label, recipient_pubkey) = match resolve_geohash_dm_target(
+                        &app,
+                        &geohash_channel,
+                        &target_nickname,
+                    ) {
+                        Ok(target) => target,
+                        Err(GeohashDmTargetError::UnknownPubkey) => {
+                            app.add_log_message(format!(
+                                    "system: Pubkey '{}' has not been seen in {}. Geohash DMs use per-channel Nostr keys; send to a name from /w, or to a full key that is already in People.",
+                                    target_nickname, geohash_channel
+                                ));
+                            continue;
+                        }
+                        Err(GeohashDmTargetError::UnknownName) => {
+                            app.add_log_message(format!(
+                                "system: User '{}' has not been seen in {} with a Nostr key yet.",
+                                target_nickname, geohash_channel
+                            ));
+                            continue;
+                        }
                     };
 
-                    app.switch_to_geohash_dm(target_nickname.clone());
+                    app.switch_to_geohash_dm(target_label.clone());
 
                     if let Some(message) = maybe_message {
                         app.add_sent_message(message.clone());
@@ -1439,14 +1489,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if let Ok(Some(offer)) = parse_geohash_file_offer(&line) {
-                    let Some(recipient_pubkey) =
-                        app.geohash_person_pubkey(&geohash_channel, offer.target_nickname)
-                    else {
-                        app.add_log_message(format!(
-                            "system: User '{}' has not been seen in {} with a Nostr key yet.",
-                            offer.target_nickname, geohash_channel
-                        ));
-                        continue;
+                    let (target_label, recipient_pubkey) = match resolve_geohash_dm_target(
+                        &app,
+                        &geohash_channel,
+                        offer.target_nickname,
+                    ) {
+                        Ok(target) => target,
+                        Err(GeohashDmTargetError::UnknownPubkey) => {
+                            app.add_log_message(format!(
+                                    "system: Pubkey '{}' has not been seen in {}. Geohash file offers must target a name from /w, or a full key that is already in People.",
+                                    offer.target_nickname, geohash_channel
+                                ));
+                            continue;
+                        }
+                        Err(GeohashDmTargetError::UnknownName) => {
+                            app.add_log_message(format!(
+                                "system: User '{}' has not been seen in {} with a Nostr key yet.",
+                                offer.target_nickname, geohash_channel
+                            ));
+                            continue;
+                        }
                     };
 
                     let file_path = std::path::Path::new(offer.path);
@@ -1497,7 +1559,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let nostr_geo_client = nostr_geo_client.clone();
                     let offer_ui_tx = ui_tx.clone();
                     let channel = geohash_channel.clone();
-                    let target_nickname = offer.target_nickname.to_string();
+                    let target_nickname = target_label.clone();
                     let my_peer_id = my_peer_id.clone();
                     let sender_nickname = nickname.clone();
                     let code_for_log = transfer.code.clone();
@@ -1548,7 +1610,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if parse_receive_command(&line).is_some() {
-                if let Some((channel, target_nickname, _recipient_pubkey)) = app.current_geohash_dm()
+                if let Some((channel, target_nickname, _recipient_pubkey)) =
+                    app.current_geohash_dm()
                 {
                     let conversation_key = App::geohash_dm_key(&channel, &target_nickname);
                     let Some(offer) = app.take_pending_wormhole_offer(&conversation_key) else {
@@ -2049,6 +2112,10 @@ mod tests {
             parse_dm_command("/dm @anon7301"),
             Some(("anon7301".to_string(), None))
         );
+        assert_eq!(
+            parse_dm_command("/dm   npub1abc\twith tabs"),
+            Some(("npub1abc".to_string(), Some("with tabs".to_string())))
+        );
         assert_eq!(parse_dm_command("/dm"), None);
     }
 
@@ -2056,7 +2123,7 @@ mod tests {
     fn detects_mesh_only_commands_inside_geohash() {
         assert_eq!(
             mesh_only_command_in_geohash("/file @alice ./photo.png"),
-            Some("/file")
+            None
         );
         assert_eq!(
             mesh_only_command_in_geohash("/block @alice"),
@@ -2066,9 +2133,35 @@ mod tests {
     }
 
     #[test]
+    fn geohash_dm_pubkey_targets_must_be_seen_in_channel() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let known_pubkey = "4ccaa3888b3b303d28bd9ae6aa2278530232b404abccffa83d9aa815ed2ca4e2";
+        let unknown_pubkey = "f5688e82b33eae5112cd6ec58eca77da3091974f84579129e0d13141e4403c9e";
+
+        app.join_channel("#ws".to_string());
+        app.add_log_message(format!("__GEO_PERSON__:#ws:alice:{}", known_pubkey));
+
+        assert_eq!(
+            resolve_geohash_dm_target(&app, "#ws", "alice").ok(),
+            Some(("alice".to_string(), known_pubkey.to_string()))
+        );
+        assert_eq!(
+            resolve_geohash_dm_target(&app, "#ws", known_pubkey).ok(),
+            Some(("alice".to_string(), known_pubkey.to_string()))
+        );
+        assert!(matches!(
+            resolve_geohash_dm_target(&app, "#ws", unknown_pubkey),
+            Err(GeohashDmTargetError::UnknownPubkey)
+        ));
+    }
+
+    #[test]
     fn parses_receive_command_without_arguments() {
         assert_eq!(parse_receive_command("/receive"), Some(""));
         assert_eq!(parse_receive_command("/receive   "), Some(""));
-        assert_eq!(parse_receive_command("/receive wormhole-code"), Some("wormhole-code"));
+        assert_eq!(
+            parse_receive_command("/receive wormhole-code"),
+            Some("wormhole-code")
+        );
     }
 }

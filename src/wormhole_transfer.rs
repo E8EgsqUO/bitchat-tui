@@ -1,4 +1,4 @@
-use magic_wormhole::{AppID, Code, MailboxConnection, Wormhole, transfer, transit};
+use magic_wormhole::{transfer, transit, AppID, Code, MailboxConnection, Wormhole};
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, OpenOptions};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -131,10 +131,7 @@ async fn allocate_destination_path(preferred_name: &str) -> Result<PathBuf, Stri
 }
 
 fn sanitize_file_name(preferred_name: &str) -> String {
-    let fallback = format!(
-        "file_{}",
-        chrono::Local::now().format("%Y%m%d_%H%M%S")
-    );
+    let fallback = format!("file_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
     let base_name = Path::new(preferred_name)
         .file_name()
         .and_then(|name| name.to_str())

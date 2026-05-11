@@ -42,9 +42,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     for (i, section_title) in section_titles.iter().enumerate() {
         let section_label = if i == 2 && app.current_people_are_geohash() {
-            "People (seen)"
+            let channel = app.get_selected_channel_name();
+            let active_count = app.geohash_active_count(&channel);
+            if active_count > 0 {
+                format!("People ({} active)", active_count)
+            } else {
+                "People (seen)".to_string()
+            }
         } else {
-            *section_title
+            (*section_title).to_string()
         };
         let is_selected = app.sidebar_flat_selected == flat_idx;
         let mut style = if is_selected && app.focus_area == FocusArea::Sidebar {
@@ -79,9 +85,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         flat_idx += 1;
 
         if app.sidebar_state.expanded[i] {
-            let list: Vec<(String, Color, bool)> = match i {
+            let list: Vec<(String, String, Color, bool)> = match i {
                 0 => vec![(
                     "Public Chat".to_string(),
+                    "#public".to_string(),
                     Color::Yellow,
                     app.sidebar_state.public_selected.unwrap_or(false),
                 )], // Public section
@@ -91,6 +98,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     .enumerate()
                     .map(|(idx, s)| {
                         (
+                            s.clone(),
                             s.clone(),
                             Color::Cyan,
                             app.sidebar_state.channel_selected == Some(idx),
@@ -103,6 +111,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     .enumerate()
                     .map(|(idx, s)| {
                         (
+                            app.display_visible_person(s),
                             s.clone(),
                             Color::Green,
                             app.sidebar_state.people_selected == Some(idx),
@@ -112,19 +121,19 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 3 => app
                     .blocked
                     .iter()
-                    .map(|s| (s.clone(), Color::Red, false))
+                    .map(|s| (s.clone(), s.clone(), Color::Red, false))
                     .collect(),
                 _ => vec![],
             };
 
-            for (item_str, color, is_active_conv) in list {
+            for (item_str, item_key, color, is_active_conv) in list {
                 let is_selected = app.sidebar_flat_selected == flat_idx;
 
                 // Add unread count for individual items
                 let unread_count = match i {
-                    0 => app.get_unread_count("#public"), // Public
-                    1 => app.get_unread_count(&item_str), // Channels
-                    2 => app.get_visible_person_unread_count(&item_str),
+                    0 => app.get_unread_count(&item_key), // Public
+                    1 => app.get_unread_count(&item_key), // Channels
+                    2 => app.get_visible_person_unread_count(&item_key),
                     _ => 0,
                 };
 

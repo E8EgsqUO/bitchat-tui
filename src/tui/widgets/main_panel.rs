@@ -36,12 +36,27 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     } else if let Some(channel) = channel_name {
         if channel == "#public" {
             "Public Chat".to_string()
+        } else if crate::nostr_geo::is_geohash_channel(&channel) {
+            let active_count = app.geohash_active_count(&channel);
+            if active_count > 0 {
+                format!("Channel: {} ({} active)", channel, active_count)
+            } else {
+                format!("Channel: {}", channel)
+            }
         } else {
             format!("Channel: {}", channel)
         }
     } else {
         if app.get_selected_channel_name() == "#public" {
             "Public Chat".to_string()
+        } else if crate::nostr_geo::is_geohash_channel(&app.get_selected_channel_name()) {
+            let channel = app.get_selected_channel_name();
+            let active_count = app.geohash_active_count(&channel);
+            if active_count > 0 {
+                format!("Channel: {} ({} active)", channel, active_count)
+            } else {
+                format!("Channel: {}", channel)
+            }
         } else {
             format!("Channel: {}", app.get_selected_channel_name())
         }
@@ -57,7 +72,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     // --- Message Panel Rendering ---
     let messages_height = app.message_viewport_height;
-    let all_msg_items = render_message_lines(messages, messages_area.width);
+    let all_msg_items = render_message_lines(app, messages, messages_area.width);
     let total_lines = all_msg_items.len();
     app.message_rendered_line_count = total_lines;
 
@@ -115,14 +130,18 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn render_message_lines(messages: &[Message], area_width: u16) -> Vec<ListItem<'static>> {
+fn render_message_lines(
+    app: &App,
+    messages: &[Message],
+    area_width: u16,
+) -> Vec<ListItem<'static>> {
     messages
         .iter()
-        .flat_map(|msg| message_to_list_items(msg, area_width))
+        .flat_map(|msg| message_to_list_items(app, msg, area_width))
         .collect()
 }
 
-fn message_to_list_items(msg: &Message, area_width: u16) -> Vec<ListItem<'static>> {
+fn message_to_list_items(app: &App, msg: &Message, area_width: u16) -> Vec<ListItem<'static>> {
     let color = if msg.sender == "system" {
         Color::White
     } else if msg.is_self {
@@ -132,7 +151,17 @@ fn message_to_list_items(msg: &Message, area_width: u16) -> Vec<ListItem<'static
     };
 
     let timestamp = format!("[{}]", msg.timestamp);
-    let sender = format!("{}:", msg.sender);
+    let sender_text = if let Some(pubkey) = &msg.sender_pubkey {
+        if let Some(channel) = app.current_geohash_context_channel() {
+            app.geohash_person_name_by_pubkey(&channel, pubkey)
+                .unwrap_or_else(|| App::short_pubkey(pubkey))
+        } else {
+            App::short_pubkey(pubkey)
+        }
+    } else {
+        msg.sender.clone()
+    };
+    let sender = format!("{}:", sender_text);
     let timestamp_width = UnicodeWidthStr::width(timestamp.as_str());
     let sender_width = UnicodeWidthStr::width(sender.as_str());
     let prefix_width = timestamp_width + 1 + sender_width + 1;
@@ -226,14 +255,16 @@ mod tests {
 
     #[test]
     fn wraps_long_messages_into_visual_lines() {
+        let app = App::new_with_nickname("me".to_string());
         let message = Message {
             sender: "bot".to_string(),
+            sender_pubkey: None,
             timestamp: "12:00".to_string(),
             content: "one two three four five six seven".to_string(),
             is_self: false,
         };
 
-        assert!(message_to_list_items(&message, 24).len() > 1);
+        assert!(message_to_list_items(&app, &message, 24).len() > 1);
     }
 
     #[test]

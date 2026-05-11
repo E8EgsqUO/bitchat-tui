@@ -6,9 +6,12 @@ use std::collections::HashMap;
 use tui_input::Input;
 use unicode_width::UnicodeWidthChar;
 
+const GEOHASH_ACTIVE_WINDOW_SECONDS: i64 = crate::nostr_geo::PRESENCE_ACTIVE_WINDOW_SECONDS;
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub sender: String,
+    pub sender_pubkey: Option<String>,
     pub timestamp: String,
     pub content: String,
     pub is_self: bool,
@@ -92,6 +95,7 @@ pub struct App {
     pub people: Vec<String>,
     pub geohash_people: HashMap<String, Vec<String>>,
     pub geohash_people_pubkeys: HashMap<String, HashMap<String, String>>,
+    pub geohash_presence: HashMap<String, HashMap<String, i64>>,
     pub blocked: Vec<String>,
 
     // Message storage
@@ -155,6 +159,7 @@ impl App {
             people: Vec::new(),
             geohash_people: HashMap::new(),
             geohash_people_pubkeys: HashMap::new(),
+            geohash_presence: HashMap::new(),
             blocked: Vec::new(),
             channel_messages,
             dm_messages: HashMap::new(),
@@ -211,6 +216,24 @@ impl App {
         self.visible_people().len()
     }
 
+    pub fn geohash_active_count(&self, channel: &str) -> usize {
+        self.geohash_active_count_at(channel, chrono::Local::now().timestamp())
+    }
+
+    fn geohash_active_count_at(&self, channel: &str, now: i64) -> usize {
+        self.geohash_presence
+            .get(channel)
+            .map(|presence| {
+                presence
+                    .values()
+                    .filter(|last_seen| {
+                        now.saturating_sub(**last_seen) <= GEOHASH_ACTIVE_WINDOW_SECONDS
+                    })
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn visible_person_at(&self, idx: usize) -> Option<String> {
         self.visible_people().get(idx).cloned()
     }
@@ -219,17 +242,101 @@ impl App {
         format!("geo:{}:{}", channel, target)
     }
 
-    fn parse_geohash_dm_key(key: &str) -> Option<(String, String)> {
+    pub fn geohash_dm_pubkey_key(channel: &str, pubkey: &str) -> String {
+        Self::geohash_dm_key(channel, pubkey)
+    }
+
+    pub fn parse_geohash_dm_key(key: &str) -> Option<(String, String)> {
         let rest = key.strip_prefix("geo:")?;
         let (channel, target) = rest.split_once(':')?;
         Some((channel.to_string(), target.to_string()))
     }
 
+    fn resolve_geohash_target_pubkey(&self, channel: &str, target: &str) -> Option<String> {
+        self.geohash_person_pubkey(channel, target)
+            .or_else(|| crate::nostr_geo::normalize_dm_pubkey(target))
+    }
+
+    pub fn geohash_person_name_by_pubkey(&self, channel: &str, pubkey: &str) -> Option<String> {
+        let mut pubkey_name = None;
+        for (name, known_pubkey) in self.geohash_people_pubkeys.get(channel)? {
+            if known_pubkey != pubkey {
+                continue;
+            }
+            if !crate::nostr_geo::looks_like_dm_pubkey(name) {
+                return Some(name.clone());
+            }
+            pubkey_name.get_or_insert_with(|| name.clone());
+        }
+        pubkey_name
+    }
+
+    fn geohash_pubkey_display_name(&self, channel: &str, pubkey: &str) -> String {
+        self.geohash_person_name_by_pubkey(channel, pubkey)
+            .filter(|name| !crate::nostr_geo::looks_like_dm_pubkey(name))
+            .unwrap_or_else(|| Self::short_pubkey(pubkey))
+    }
+
+    fn geohash_display_name(&self, channel: &str, target: &str) -> String {
+        let Some(pubkey) = self.resolve_geohash_target_pubkey(channel, target) else {
+            return if crate::nostr_geo::looks_like_dm_pubkey(target) {
+                Self::short_pubkey(target)
+            } else {
+                target.to_string()
+            };
+        };
+        self.geohash_pubkey_display_name(channel, &pubkey)
+    }
+
+    pub fn display_geohash_sender(&self, channel: &str, message: &Message) -> String {
+        if let Some(pubkey) = &message.sender_pubkey {
+            return self.geohash_pubkey_display_name(channel, pubkey);
+        }
+
+        self.geohash_display_name(channel, &message.sender)
+    }
+
     pub fn display_dm_target(&self, target: &str) -> String {
         if let Some((channel, nickname)) = Self::parse_geohash_dm_key(target) {
-            format!("{} in {}", nickname, channel)
+            return format!(
+                "{} in {}",
+                self.geohash_display_name(&channel, &nickname),
+                channel
+            );
+        }
+
+        if crate::nostr_geo::looks_like_dm_pubkey(target) {
+            Self::short_pubkey(target)
         } else {
             target.to_string()
+        }
+    }
+
+    pub fn short_pubkey(pubkey: &str) -> String {
+        let short = pubkey.trim();
+        let char_count = short.chars().count();
+        if char_count <= 18 {
+            short.to_string()
+        } else {
+            let prefix: String = short.chars().take(10).collect();
+            let mut suffix_chars: Vec<char> = short.chars().rev().take(6).collect();
+            suffix_chars.reverse();
+            let suffix: String = suffix_chars.into_iter().collect();
+            format!("{}...{}", prefix, suffix)
+        }
+    }
+
+    pub fn display_visible_person(&self, person: &str) -> String {
+        if self.current_people_are_geohash() {
+            let channel = self.get_selected_channel_name();
+            if let Some(pubkey) = self.resolve_geohash_target_pubkey(&channel, person) {
+                return self.geohash_pubkey_display_name(&channel, &pubkey);
+            }
+        }
+        if crate::nostr_geo::looks_like_dm_pubkey(person) {
+            Self::short_pubkey(person)
+        } else {
+            person.to_string()
         }
     }
 
@@ -237,11 +344,7 @@ impl App {
         let (dm_target, _) = self.current_conv.clone().unwrap_or((None, None));
         let target_key = dm_target?;
         let (channel, nickname) = Self::parse_geohash_dm_key(&target_key)?;
-        let pubkey = self
-            .geohash_people_pubkeys
-            .get(&channel)?
-            .get(&nickname)?
-            .clone();
+        let pubkey = self.resolve_geohash_target_pubkey(&channel, &nickname)?;
         Some((channel, nickname, pubkey))
     }
 
@@ -272,24 +375,105 @@ impl App {
             .cloned()
     }
 
-    fn add_geohash_person(&mut self, channel: &str, sender: &str, pubkey: Option<&str>) {
+    pub fn geohash_person_for_pubkey(&self, channel: &str, pubkey: &str) -> Option<String> {
+        self.geohash_people_pubkeys
+            .get(channel)?
+            .iter()
+            .find_map(|(name, known_pubkey)| (known_pubkey == pubkey).then(|| name.clone()))
+    }
+
+    pub fn geohash_people_with_pubkeys(&self, channel: &str) -> Vec<(String, Option<String>)> {
+        let pubkeys = self.geohash_people_pubkeys.get(channel);
+        self.geohash_people_for_channel(channel)
+            .into_iter()
+            .map(|person| {
+                let pubkey = pubkeys.and_then(|items| items.get(&person)).cloned();
+                (person, pubkey)
+            })
+            .collect()
+    }
+
+    fn geohash_dm_thread_key(&self, channel: &str, target: &str) -> String {
+        self.resolve_geohash_target_pubkey(channel, target)
+            .map(|pubkey| Self::geohash_dm_pubkey_key(channel, &pubkey))
+            .unwrap_or_else(|| Self::geohash_dm_key(channel, target))
+    }
+
+    fn geohash_person_index_by_pubkey(&self, channel: &str, pubkey: &str) -> Option<usize> {
+        self.geohash_people.get(channel)?.iter().position(|person| {
+            self.resolve_geohash_target_pubkey(channel, person)
+                .as_deref()
+                == Some(pubkey)
+        })
+    }
+
+    pub(crate) fn add_geohash_person(&mut self, channel: &str, sender: &str, pubkey: Option<&str>) {
         if sender == self.nickname || sender == "system" || sender.trim().is_empty() {
             return;
         }
 
-        if let Some(pubkey) = pubkey {
-            if !pubkey.trim().is_empty() {
-                self.geohash_people_pubkeys
-                    .entry(channel.to_string())
-                    .or_default()
-                    .insert(sender.to_string(), pubkey.to_string());
+        let Some(pubkey) = pubkey.filter(|value| !value.trim().is_empty()) else {
+            return;
+        };
+
+        let people_pubkeys = self
+            .geohash_people_pubkeys
+            .entry(channel.to_string())
+            .or_default();
+        let people = self.geohash_people.entry(channel.to_string()).or_default();
+
+        if let Some(existing_name) = people_pubkeys
+            .iter()
+            .find_map(|(name, known_pubkey)| (known_pubkey == pubkey).then(|| name.clone()))
+        {
+            let existing_is_pubkey = crate::nostr_geo::looks_like_dm_pubkey(&existing_name);
+            let sender_is_pubkey = crate::nostr_geo::looks_like_dm_pubkey(sender);
+            let preferred_name = if existing_is_pubkey && !sender_is_pubkey {
+                sender.to_string()
+            } else {
+                existing_name.clone()
+            };
+
+            if preferred_name != existing_name {
+                people_pubkeys.remove(&existing_name);
+                if let Some(idx) = people.iter().position(|person| person == &existing_name) {
+                    people[idx] = preferred_name.clone();
+                }
             }
+
+            if !people.iter().any(|person| person == &preferred_name) {
+                people.push(preferred_name.clone());
+            }
+            people_pubkeys.insert(preferred_name, pubkey.to_string());
+            people.sort();
+            return;
         }
 
-        let people = self.geohash_people.entry(channel.to_string()).or_default();
-        if !people.iter().any(|person| person == sender) {
-            people.push(sender.to_string());
+        let target = if crate::nostr_geo::looks_like_dm_pubkey(sender) {
+            pubkey.to_string()
+        } else {
+            sender.to_string()
+        };
+
+        people_pubkeys.insert(target.clone(), pubkey.to_string());
+        if !people.iter().any(|person| person == &target) {
+            people.push(target);
             people.sort();
+        }
+    }
+
+    fn note_geohash_presence(&mut self, channel: &str, pubkey: &str, timestamp: i64) {
+        if pubkey.trim().is_empty() {
+            return;
+        }
+
+        let presence = self
+            .geohash_presence
+            .entry(channel.to_string())
+            .or_default();
+        let entry = presence.entry(pubkey.to_string()).or_insert(timestamp);
+        if timestamp > *entry {
+            *entry = timestamp;
         }
     }
 
@@ -321,7 +505,7 @@ impl App {
             } else if self.visible_person_at(user_idx).is_some() {
                 let channel = self.get_selected_channel_name();
                 if let Some(user) = self.visible_person_at(user_idx) {
-                    let target_key = Self::geohash_dm_key(&channel, &user);
+                    let target_key = self.geohash_dm_thread_key(&channel, &user);
                     self.current_conv = Some((Some(target_key), Some(channel)));
                     return;
                 }
@@ -356,7 +540,7 @@ impl App {
                 }
             } else if let Some(user) = self.visible_person_at(user_idx) {
                 let channel = self.get_selected_channel_name();
-                let target_key = Self::geohash_dm_key(&channel, &user);
+                let target_key = self.geohash_dm_thread_key(&channel, &user);
                 let messages = self
                     .dm_messages
                     .get(&target_key)
@@ -400,6 +584,7 @@ impl App {
                 let sender_clone = sender.clone();
                 let msg = Message {
                     sender,
+                    sender_pubkey: None,
                     timestamp,
                     content,
                     is_self: false,
@@ -430,7 +615,23 @@ impl App {
                 if !self.channels.contains(&channel) {
                     self.channels.push(channel.clone());
                 }
+                self.note_geohash_presence(&channel, &pubkey, chrono::Local::now().timestamp());
                 self.add_geohash_person(&channel, &sender, Some(&pubkey));
+                return;
+            }
+        }
+
+        if trimmed.starts_with("__GEO_PRESENCE__:") {
+            let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
+            if parts.len() >= 4 {
+                let channel = parts[1].to_string();
+                let pubkey = parts[2].to_string();
+                if let Ok(timestamp) = parts[3].parse::<i64>() {
+                    if !self.channels.contains(&channel) {
+                        self.channels.push(channel.clone());
+                    }
+                    self.note_geohash_presence(&channel, &pubkey, timestamp);
+                }
                 return;
             }
         }
@@ -447,6 +648,7 @@ impl App {
                 if !self.channels.contains(&channel) {
                     self.channels.push(channel.clone());
                 }
+                self.note_geohash_presence(&channel, &pubkey, chrono::Local::now().timestamp());
                 self.add_geohash_person(&channel, &sender, Some(&pubkey));
 
                 let timestamp = if timestamp_raw.len() == 4 {
@@ -455,7 +657,7 @@ impl App {
                     timestamp_raw
                 };
 
-                let target_key = Self::geohash_dm_key(&channel, &sender);
+                let target_key = Self::geohash_dm_pubkey_key(&channel, &pubkey);
                 if let Some((code, file_name, file_size_bytes)) =
                     crate::command_handling::parse_geohash_file_offer_message(&content)
                 {
@@ -475,6 +677,7 @@ impl App {
                     );
                     let msg = Message {
                         sender,
+                        sender_pubkey: Some(pubkey.clone()),
                         timestamp,
                         content,
                         is_self: false,
@@ -483,7 +686,8 @@ impl App {
                         .entry(target_key.clone())
                         .or_default()
                         .push(msg);
-                    if self.current_conv.as_ref().and_then(|(dm, _)| dm.as_ref()) != Some(&target_key)
+                    if self.current_conv.as_ref().and_then(|(dm, _)| dm.as_ref())
+                        != Some(&target_key)
                     {
                         self.add_unread_message(format!("dm:{}", target_key));
                     }
@@ -493,6 +697,7 @@ impl App {
 
                 let msg = Message {
                     sender,
+                    sender_pubkey: Some(pubkey),
                     timestamp,
                     content,
                     is_self: false,
@@ -534,6 +739,7 @@ impl App {
 
                 let msg = Message {
                     sender,
+                    sender_pubkey: None,
                     timestamp,
                     content,
                     is_self: false,
@@ -582,6 +788,7 @@ impl App {
 
             let msg = Message {
                 sender,
+                sender_pubkey: None,
                 timestamp,
                 content,
                 is_self: false,
@@ -610,6 +817,7 @@ impl App {
                     if !trimmed_line.is_empty() {
                         let msg = Message {
                             sender: "system".to_string(),
+                            sender_pubkey: None,
                             timestamp: chrono::Local::now().format("%H:%M").to_string(),
                             content: trimmed_line.to_string(),
                             is_self: false,
@@ -651,6 +859,7 @@ impl App {
             if !trimmed_line.is_empty() {
                 let msg = Message {
                     sender: "system".to_string(),
+                    sender_pubkey: None,
                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
                     content: trimmed_line.to_string(),
                     is_self: false,
@@ -668,6 +877,7 @@ impl App {
         let timestamp = chrono::Local::now().format("%H:%M").to_string();
         let msg = Message {
             sender: self.nickname.clone(),
+            sender_pubkey: None,
             timestamp,
             content: text,
             is_self: true,
@@ -686,6 +896,7 @@ impl App {
         let timestamp = chrono::Local::now().format("%H:%M").to_string();
         let msg = Message {
             sender: self.nickname.clone(),
+            sender_pubkey: None,
             timestamp,
             content,
             is_self: true,
@@ -717,6 +928,7 @@ impl App {
             .drain(..)
             .map(|content| Message {
                 sender: "system".to_string(),
+                sender_pubkey: None,
                 timestamp: chrono::Local::now().format("%H:%M").to_string(),
                 content,
                 is_self: false,
@@ -807,10 +1019,12 @@ impl App {
         let Some(channel_idx) = self.channels.iter().position(|c| c == &channel) else {
             return;
         };
-        let Some(person_idx) = self
-            .geohash_people
-            .get(&channel)
-            .and_then(|people| people.iter().position(|p| p == &target_nickname))
+        let Some(canonical_target) = self.resolve_geohash_target_pubkey(&channel, &target_nickname)
+        else {
+            return;
+        };
+        self.add_geohash_person(&channel, &target_nickname, Some(&canonical_target));
+        let Some(person_idx) = self.geohash_person_index_by_pubkey(&channel, &canonical_target)
         else {
             return;
         };
@@ -819,7 +1033,7 @@ impl App {
         self.sidebar_state.channel_selected = Some(channel_idx);
         self.sidebar_state.people_selected = Some(person_idx);
         self.current_conv = Some((
-            Some(Self::geohash_dm_key(&channel, &target_nickname)),
+            Some(Self::geohash_dm_key(&channel, &canonical_target)),
             Some(channel),
         ));
         self.update_sidebar_flat_selection();
@@ -830,6 +1044,7 @@ impl App {
         self.channels.retain(|c| c != channel);
         self.geohash_people.remove(channel);
         self.geohash_people_pubkeys.remove(channel);
+        self.geohash_presence.remove(channel);
         self.channel_messages.remove(channel);
         self.dm_messages.retain(|key, _| {
             Self::parse_geohash_dm_key(key)
@@ -878,7 +1093,7 @@ impl App {
 
     pub fn get_visible_person_unread_count(&self, person: &str) -> usize {
         if self.current_people_are_geohash() {
-            let key = Self::geohash_dm_key(&self.get_selected_channel_name(), person);
+            let key = self.geohash_dm_thread_key(&self.get_selected_channel_name(), person);
             self.get_unread_count(&format!("dm:{}", key))
         } else {
             self.get_unread_count(&format!("dm:{}", person))
@@ -1057,6 +1272,85 @@ mod tests {
 
         assert_eq!(app.get_visible_person_unread_count("anon7301"), 0);
         assert_eq!(app.get_section_unread_count(2), 0);
+    }
+
+    #[test]
+    fn geohash_dm_prefers_canonical_pubkey_thread_keys() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let pubkey = "4d4b6cd13610392258017bfb6c6d0ca3bce4a592f22ce86c02aa1da97a9a1d3d";
+
+        app.join_channel("#ws".to_string());
+        app.add_log_message(format!("__GEO_PERSON__:#ws:alice:{}", pubkey));
+        app.switch_to_geohash_dm("alice".to_string());
+        app.add_sent_message("hello".to_string());
+
+        let key = App::geohash_dm_pubkey_key("#ws", pubkey);
+        assert!(app.dm_messages.contains_key(&key));
+        assert_eq!(app.dm_messages.get(&key).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn geohash_dm_npub_uses_pubkey_thread_and_short_display() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let npub = "npub1n7wu4ycqsglag2kmfjdzuvyumktaf79ra5t8km3a9t25rpjgud3qj4plrk";
+        let pubkey = crate::nostr_geo::normalize_dm_pubkey(npub).unwrap();
+
+        app.join_channel("#ws".to_string());
+        app.add_log_message(format!("__GEO_PERSON__:#ws:bob:{}", pubkey));
+        app.switch_to_geohash_dm(npub.to_string());
+        app.add_sent_message("hello".to_string());
+
+        let key = App::geohash_dm_pubkey_key("#ws", &pubkey);
+        assert!(app.dm_messages.contains_key(&key));
+        assert_eq!(
+            app.current_geohash_dm(),
+            Some(("#ws".to_string(), pubkey.clone(), pubkey))
+        );
+        assert_eq!(app.sidebar_state.people_selected, Some(0));
+    }
+
+    #[test]
+    fn geohash_dm_unknown_pubkey_is_shortened_until_name_seen() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let npub = "npub1n7wu4ycqsglag2kmfjdzuvyumktaf79ra5t8km3a9t25rpjgud3qj4plrk";
+        let pubkey = crate::nostr_geo::normalize_dm_pubkey(npub).unwrap();
+
+        app.join_channel("#ws".to_string());
+        app.switch_to_geohash_dm(npub.to_string());
+
+        let key = App::geohash_dm_pubkey_key("#ws", &pubkey);
+        assert_eq!(
+            app.display_dm_target(&key),
+            format!("{} in #ws", App::short_pubkey(&pubkey))
+        );
+        assert_eq!(
+            app.display_visible_person(&pubkey),
+            App::short_pubkey(&pubkey)
+        );
+
+        app.add_log_message(format!("__GEO_PERSON__:#ws:bob:{}", pubkey));
+
+        assert_eq!(app.display_dm_target(&key), "bob in #ws");
+        assert_eq!(app.display_visible_person("bob"), "bob");
+    }
+
+    #[test]
+    fn geohash_presence_counts_active_pubkeys_without_adding_people() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let now = chrono::Local::now().timestamp();
+
+        app.join_channel("#ws".to_string());
+        app.add_log_message(format!(
+            "__GEO_PRESENCE__:#ws:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:{}",
+            now
+        ));
+        app.add_log_message(format!(
+            "__GEO_PRESENCE__:#ws:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:{}",
+            now - crate::nostr_geo::PRESENCE_ACTIVE_WINDOW_SECONDS - 1
+        ));
+
+        assert_eq!(app.geohash_active_count_at("#ws", now), 1);
+        assert!(app.geohash_people_for_channel("#ws").is_empty());
     }
 
     #[test]

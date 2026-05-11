@@ -1,5 +1,6 @@
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use bech32::{FromBase32, Variant};
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -41,6 +42,12 @@ const DM_SUBSCRIBE_SINCE_SECONDS: i64 = 3_600;
 const RECONNECT_DELAY_SECONDS: u64 = 10;
 const CONNECT_TIMEOUT_SECONDS: u64 = 8;
 const PUBLISH_TIMEOUT_SECONDS: u64 = 8;
+pub const PRESENCE_ACTIVE_WINDOW_SECONDS: i64 = 300;
+const GEOHASH_CHAT_KIND: i64 = 20000;
+const GEOHASH_PRESENCE_KIND: i64 = 20001;
+const GEOHASH_DM_KIND: i64 = 1059;
+const PRESENCE_HEARTBEAT_MIN_SECONDS: u64 = 40;
+const PRESENCE_HEARTBEAT_MAX_SECONDS: u64 = 80;
 const NIP44_MIN_PLAINTEXT_SIZE: usize = 1;
 const NIP44_MAX_PLAINTEXT_SIZE: usize = 65_535;
 const EMBEDDED_PRIVATE_PAYLOAD_UNSUPPORTED_TYPE: &str =
@@ -139,6 +146,12 @@ pub fn is_geohash_channel(channel: &str) -> bool {
     normalize_geohash(channel).is_some()
 }
 
+pub fn geohash_broadcasts_presence(channel: &str) -> bool {
+    normalize_geohash(channel)
+        .map(|geohash| matches!(geohash.len(), 2 | 4 | 5))
+        .unwrap_or(false)
+}
+
 pub fn normalize_geohash(channel: &str) -> Option<String> {
     let geohash = channel.trim().trim_start_matches('#').to_ascii_lowercase();
     if !matches!(geohash.len(), 2 | 4 | 5 | 6 | 7 | 8) {
@@ -210,6 +223,14 @@ impl NostrGeoClient {
             });
         }
 
+        if geohash_broadcasts_presence(&geohash) {
+            let inner = self.inner.clone();
+            let geohash = geohash.clone();
+            tokio::spawn(async move {
+                presence_heartbeat_loop(inner, geohash).await;
+            });
+        }
+
         let _ = self
             .inner
             .ui_tx
@@ -235,6 +256,8 @@ impl NostrGeoClient {
 
         let event = create_geohash_event(&self.inner.identity_seed, &geohash, content, nickname)?;
         let event_id = event.id.clone();
+        let event_pubkey = event.pubkey.clone();
+        let event_created_at = event.created_at;
         self.inner
             .seen_event_ids
             .lock()
@@ -279,6 +302,13 @@ impl NostrGeoClient {
         if sent_count == 0 {
             Err("Failed to publish geohash message to any Nostr relay".to_string())
         } else {
+            send_presence_update(
+                &self.inner,
+                &format!("#{}", geohash),
+                &event_pubkey,
+                event_created_at,
+            )
+            .await;
             Ok(())
         }
     }
@@ -409,6 +439,86 @@ async fn is_joined(inner: &Arc<NostrGeoInner>, geohash: &str) -> bool {
     inner.joined_geohashes.lock().await.contains(geohash)
 }
 
+async fn presence_heartbeat_loop(inner: Arc<NostrGeoInner>, geohash: String) {
+    loop {
+        if !is_joined(&inner, &geohash).await {
+            break;
+        }
+
+        if let Err(e) = broadcast_geohash_presence(&inner, &geohash).await {
+            write_nostr_debug_log(&format!(
+                "presence publish failed: geohash=#{}, error={}",
+                geohash, e
+            ));
+        }
+
+        let delay = random_presence_heartbeat_delay();
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+    }
+}
+
+async fn broadcast_geohash_presence(
+    inner: &Arc<NostrGeoInner>,
+    geohash: &str,
+) -> Result<(), String> {
+    let event = create_geohash_presence_event(&inner.identity_seed, geohash)?;
+    let event_id = event.id.clone();
+    let event_pubkey = event.pubkey.clone();
+    let event_created_at = event.created_at;
+    inner.seen_event_ids.lock().await.insert(event_id.clone());
+
+    let relays = inner
+        .relays_by_geohash
+        .lock()
+        .await
+        .get(geohash)
+        .cloned()
+        .unwrap_or_else(default_relays);
+
+    let _publish_guard = inner.publish_lock.lock().await;
+    let publish_results = join_all(relays.into_iter().map(|relay| {
+        let event = event.clone();
+        async move {
+            let result = publish_event(&relay, &event).await;
+            (relay, result)
+        }
+    }))
+    .await;
+
+    let mut sent_count = 0usize;
+    let total_count = publish_results.len();
+    for (relay, result) in publish_results {
+        match result {
+            Ok(()) => sent_count += 1,
+            Err(e) => write_nostr_debug_log(&format!(
+                "presence publish failed: relay={}, event={}, error={}",
+                relay, event_id, e
+            )),
+        }
+    }
+    write_nostr_debug_log(&format!(
+        "presence publish result: geohash=#{}, event={}, sent={}, total={}",
+        geohash, event_id, sent_count, total_count
+    ));
+
+    if sent_count == 0 {
+        Err("Failed to publish geohash presence to any Nostr relay".to_string())
+    } else {
+        send_presence_update(
+            inner,
+            &format!("#{}", geohash),
+            &event_pubkey,
+            event_created_at,
+        )
+        .await;
+        Ok(())
+    }
+}
+
+fn random_presence_heartbeat_delay() -> u64 {
+    rand::thread_rng().gen_range(PRESENCE_HEARTBEAT_MIN_SECONDS..=PRESENCE_HEARTBEAT_MAX_SECONDS)
+}
+
 async fn subscribe_once(
     inner: Arc<NostrGeoInner>,
     relay: &str,
@@ -432,12 +542,12 @@ async fn subscribe_once(
         "REQ",
         sub_id,
         {
-            "kinds": [20000],
+            "kinds": [GEOHASH_CHAT_KIND, GEOHASH_PRESENCE_KIND],
             "#g": [geohash],
             "since": public_since
         },
         {
-            "kinds": [1059],
+            "kinds": [GEOHASH_DM_KIND],
             "#p": [local_pubkey],
             "since": dm_since
         }
@@ -493,12 +603,15 @@ async fn handle_relay_text(
         Ok(event) => event,
         Err(_) => return,
     };
-    if event.kind == 1059 {
+    if event.kind == GEOHASH_DM_KIND {
         handle_private_relay_event(inner, channel, local_pubkey, local_secret, &event).await;
         return;
     }
 
-    if event.kind != 20000 || event.pubkey == local_pubkey || !event_has_geohash(&event, geohash) {
+    if !matches!(event.kind, GEOHASH_CHAT_KIND | GEOHASH_PRESENCE_KIND)
+        || event.pubkey == local_pubkey
+        || !event_has_geohash(&event, geohash)
+    {
         return;
     }
 
@@ -507,6 +620,19 @@ async fn handle_relay_text(
         return;
     }
     drop(seen);
+
+    if event.kind == GEOHASH_PRESENCE_KIND {
+        if event.content.is_empty() {
+            send_presence_update(inner, channel, &event.pubkey, event.created_at).await;
+            write_nostr_debug_log(&format!(
+                "received presence: geohash=#{}, sender={}, event={}",
+                geohash,
+                &event.pubkey[..event.pubkey.len().min(8)],
+                event.id
+            ));
+        }
+        return;
+    }
 
     let sender = event
         .tags
@@ -537,6 +663,7 @@ async fn handle_relay_text(
         "received event: geohash=#{}, sender={}, event={}",
         geohash, sender, event.id
     ));
+    send_presence_update(inner, channel, &event.pubkey, event.created_at).await;
     let _ = inner
         .ui_tx
         .send(format!(
@@ -545,6 +672,21 @@ async fn handle_relay_text(
         ))
         .await;
     let _ = inner.ui_tx.send(structured).await;
+}
+
+async fn send_presence_update(
+    inner: &Arc<NostrGeoInner>,
+    channel: &str,
+    pubkey: &str,
+    timestamp: i64,
+) {
+    let _ = inner
+        .ui_tx
+        .send(format!(
+            "__GEO_PRESENCE__:{}:{}:{}",
+            channel, pubkey, timestamp
+        ))
+        .await;
 }
 
 async fn handle_private_relay_event(
@@ -667,7 +809,7 @@ async fn publish_event_once(relay: &str, event: &NostrEvent) -> Result<(), Strin
         }
     }
     let _ = ws_stream.close(None).await;
-    Ok(())
+    Err("publish ack timeout after 2s".to_string())
 }
 
 async fn connect_relay(
@@ -932,7 +1074,36 @@ fn create_geohash_event(
         vec!["g".to_string(), geohash.to_string()],
         vec!["n".to_string(), sanitize_display_field(nickname)],
     ];
-    let kind = 20000;
+    let kind = GEOHASH_CHAT_KIND;
+    let event_id = calculate_event_id(&pubkey, created_at, kind, &tags, content)?;
+    let digest = hex::decode(&event_id).map_err(|e| e.to_string())?;
+    let message = SecpMessage::from_digest_slice(&digest).map_err(|e| e.to_string())?;
+    let sig = secp.sign_schnorr_no_aux_rand(&message, &keypair);
+
+    Ok(NostrEvent {
+        id: event_id,
+        pubkey,
+        created_at,
+        kind,
+        tags,
+        content: content.to_string(),
+        sig: sig.to_string(),
+    })
+}
+
+fn create_geohash_presence_event(
+    identity_seed: &[u8],
+    geohash: &str,
+) -> Result<NostrEvent, String> {
+    let secp = Secp256k1::new();
+    let secret_key = derive_secret_key(identity_seed, geohash)?;
+    let keypair = Keypair::from_secret_key(&secp, &secret_key);
+    let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
+    let pubkey = hex::encode(xonly.serialize());
+    let created_at = Local::now().timestamp();
+    let tags = vec![vec!["g".to_string(), geohash.to_string()]];
+    let content = "";
+    let kind = GEOHASH_PRESENCE_KIND;
     let event_id = calculate_event_id(&pubkey, created_at, kind, &tags, content)?;
     let digest = hex::decode(&event_id).map_err(|e| e.to_string())?;
     let message = SecpMessage::from_digest_slice(&digest).map_err(|e| e.to_string())?;
@@ -963,7 +1134,7 @@ fn create_private_message_event(
 
     let rumor = Nip17Event {
         id: String::new(),
-        pubkey: local_pubkey,
+        pubkey: local_pubkey.clone(),
         created_at: Local::now().timestamp(),
         kind: 14,
         tags: vec![vec![
@@ -974,31 +1145,30 @@ fn create_private_message_event(
         sig: None,
     };
 
-    let seal_key = random_secret_key();
     let seal_json = serde_json::to_string(&rumor).map_err(|e| e.to_string())?;
-    let encrypted_seal = legacy_nip44_encrypt(&seal_json, recipient_pubkey, &seal_key)?;
+    let encrypted_seal = nip44_encrypt(&seal_json, recipient_pubkey, &local_secret)?;
     let seal = sign_nip17_event(
         Nip17Event {
             id: String::new(),
-            pubkey: xonly_pubkey_from_secret(&seal_key),
+            pubkey: local_pubkey,
             created_at: randomized_timestamp(),
             kind: 13,
             tags: Vec::new(),
             content: encrypted_seal,
             sig: None,
         },
-        &seal_key,
+        &local_secret,
     )?;
 
     let wrap_key = random_secret_key();
     let seal_json = serde_json::to_string(&seal).map_err(|e| e.to_string())?;
-    let encrypted_wrap = legacy_nip44_encrypt(&seal_json, recipient_pubkey, &wrap_key)?;
+    let encrypted_wrap = nip44_encrypt(&seal_json, recipient_pubkey, &wrap_key)?;
     let gift_wrap = sign_nip17_event(
         Nip17Event {
             id: String::new(),
             pubkey: xonly_pubkey_from_secret(&wrap_key),
             created_at: randomized_timestamp(),
-            kind: 1059,
+            kind: GEOHASH_DM_KIND,
             tags: vec![vec!["p".to_string(), recipient_pubkey.to_string()]],
             content: encrypted_wrap,
             sig: None,
@@ -1151,28 +1321,6 @@ fn nip44_decrypt(
     }
 
     Err(last_error)
-}
-
-fn legacy_nip44_encrypt(
-    plaintext: &str,
-    recipient_pubkey: &str,
-    sender_key: &SecretKey,
-) -> Result<String, String> {
-    let public_key = public_key_from_xonly(recipient_pubkey, 0x02)?;
-    let shared_secret = derive_shared_secret_compressed(sender_key, &public_key)?;
-    let key = legacy_derive_nip44_key(&shared_secret)?;
-
-    let mut nonce = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let cipher = XChaCha20Poly1305::new(XChaChaKey::from_slice(&key));
-    let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), plaintext.as_bytes())
-        .map_err(|_| "Legacy NIP-44 encryption failed".to_string())?;
-
-    let mut combined = Vec::with_capacity(nonce.len() + ciphertext.len());
-    combined.extend_from_slice(&nonce);
-    combined.extend_from_slice(&ciphertext);
-    Ok(format!("v2:{}", URL_SAFE_NO_PAD.encode(combined)))
 }
 
 fn nip44_encrypt_payload(
@@ -1411,6 +1559,73 @@ fn public_key_from_xonly(pubkey: &str, prefix: u8) -> Result<SecpPublicKey, Stri
 
 fn is_valid_xonly_pubkey(pubkey: &str) -> bool {
     public_key_from_xonly(pubkey, 0x02).is_ok() || public_key_from_xonly(pubkey, 0x03).is_ok()
+}
+
+fn clean_dm_pubkey_input(input: &str) -> &str {
+    let mut input = input.trim().trim_matches(|c| {
+        matches!(
+            c,
+            '<' | '>'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '"'
+                | '\''
+                | '`'
+                | '.'
+                | ','
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | '。'
+                | '，'
+                | '；'
+                | '：'
+                | '！'
+                | '？'
+        )
+    });
+    input = input.trim_start_matches('@');
+    if input
+        .get(..6)
+        .map(|prefix| prefix.eq_ignore_ascii_case("nostr:"))
+        .unwrap_or(false)
+    {
+        input = &input[6..];
+    }
+    input.trim()
+}
+
+pub fn looks_like_dm_pubkey(input: &str) -> bool {
+    let input = clean_dm_pubkey_input(input);
+    (input.len() == 64 && input.chars().all(|c| c.is_ascii_hexdigit()))
+        || input
+            .get(..5)
+            .map(|prefix| prefix.eq_ignore_ascii_case("npub1"))
+            .unwrap_or(false)
+}
+
+pub fn normalize_dm_pubkey(input: &str) -> Option<String> {
+    let input = clean_dm_pubkey_input(input);
+    if input.len() == 64 && input.chars().all(|c| c.is_ascii_hexdigit()) {
+        let pubkey = input.to_ascii_lowercase();
+        return is_valid_xonly_pubkey(&pubkey).then_some(pubkey);
+    }
+
+    let (hrp, data, variant) = bech32::decode(input).ok()?;
+    if variant != Variant::Bech32 || !hrp.eq_ignore_ascii_case("npub") {
+        return None;
+    }
+    let bytes = Vec::<u8>::from_base32(&data).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let pubkey = hex::encode(bytes);
+    is_valid_xonly_pubkey(&pubkey).then_some(pubkey)
 }
 
 fn xonly_pubkey_from_secret(secret_key: &SecretKey) -> String {
@@ -1744,10 +1959,30 @@ mod tests {
     fn creates_signed_geohash_event() {
         let seed = vec![7u8; 32];
         let event = create_geohash_event(&seed, "ws", "hello", "alice").unwrap();
-        assert_eq!(event.kind, 20000);
+        assert_eq!(event.kind, GEOHASH_CHAT_KIND);
         assert!(event_has_geohash(&event, "ws"));
         assert_eq!(event.pubkey.len(), 64);
         assert_eq!(event.sig.len(), 128);
+    }
+
+    #[test]
+    fn creates_signed_geohash_presence_event() {
+        let seed = vec![7u8; 32];
+        let event = create_geohash_presence_event(&seed, "ws").unwrap();
+        assert_eq!(event.kind, GEOHASH_PRESENCE_KIND);
+        assert!(event_has_geohash(&event, "ws"));
+        assert!(event.content.is_empty());
+        assert_eq!(event.pubkey.len(), 64);
+        assert_eq!(event.sig.len(), 128);
+    }
+
+    #[test]
+    fn only_broadcasts_presence_for_coarse_geohashes() {
+        assert!(geohash_broadcasts_presence("#ws"));
+        assert!(geohash_broadcasts_presence("#dr5r"));
+        assert!(geohash_broadcasts_presence("#dr5ru"));
+        assert!(!geohash_broadcasts_presence("#dr5ru6"));
+        assert!(!geohash_broadcasts_presence("#dr5ru62"));
     }
 
     #[test]
@@ -1772,6 +2007,55 @@ mod tests {
         let target = parse_ws_target("ws://localhost:8080/path").unwrap();
         assert_eq!(target.host, "localhost");
         assert_eq!(target.port, 8080);
+    }
+
+    #[test]
+    fn normalizes_hex_dm_pubkeys() {
+        let secret_key = SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let hex_pubkey = xonly_pubkey_from_secret(&secret_key);
+        assert_eq!(normalize_dm_pubkey(&hex_pubkey), Some(hex_pubkey));
+    }
+
+    #[test]
+    fn normalizes_npub_dm_pubkeys() {
+        use bech32::ToBase32;
+
+        let secret_key = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let hex_pubkey = xonly_pubkey_from_secret(&secret_key);
+        let bytes = hex::decode(&hex_pubkey).unwrap();
+        let npub = bech32::encode("npub", bytes.to_base32(), Variant::Bech32).unwrap();
+
+        assert_eq!(normalize_dm_pubkey(&npub), Some(hex_pubkey.clone()));
+        assert_eq!(
+            normalize_dm_pubkey(&format!("nostr:{}", npub)),
+            Some(hex_pubkey)
+        );
+    }
+
+    #[test]
+    fn normalizes_real_dm_pubkeys_from_reports() {
+        assert_eq!(
+            normalize_dm_pubkey("npub1745gaq4n86h9zykddmzcajnhmgcfr960s3tez20q6yc5rezq8j0qrpctyq")
+                .as_deref(),
+            Some("f5688e82b33eae5112cd6ec58eca77da3091974f84579129e0d13141e4403c9e")
+        );
+        assert_eq!(
+            normalize_dm_pubkey("npub1fn928zyt8vcr629antn25gnc2vpr9dqy40x0l2pan25ptmfv5n3qdvtshx")
+                .as_deref(),
+            Some("4ccaa3888b3b303d28bd9ae6aa2278530232b404abccffa83d9aa815ed2ca4e2")
+        );
+        assert_eq!(
+            normalize_dm_pubkey(
+                "npub1fn928zyt8vcr629antn25gnc2vpr9dqy40x0l2pan25ptmfv5n3qdvtshx。"
+            )
+            .as_deref(),
+            Some("4ccaa3888b3b303d28bd9ae6aa2278530232b404abccffa83d9aa815ed2ca4e2")
+        );
+    }
+
+    #[test]
+    fn normalize_dm_pubkey_rejects_invalid_npub() {
+        assert!(normalize_dm_pubkey("npub1invalid").is_none());
     }
 
     #[test]
@@ -1831,8 +2115,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(event.kind, 1059);
-        assert!(event.content.starts_with("v2:"));
+        assert_eq!(event.kind, GEOHASH_DM_KIND);
+        assert!(!event.content.starts_with("v2:"));
+        assert_eq!(event.content.as_bytes().first(), Some(&b'A'));
         assert!(event_has_tag_value(&event, "p", &recipient_pubkey));
         assert_eq!(event.sig.len(), 128);
 
