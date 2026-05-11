@@ -61,6 +61,12 @@ const DEFAULT_RELAYS: &[&str] = &[
     "wss://nostr21.com",
 ];
 
+const PROFILE_METADATA_RELAYS: &[&str] = &[
+    "wss://purplepag.es",
+    "wss://relay.nostr.band",
+    "wss://relay.primal.net",
+];
+
 const EMBEDDED_WS_RELAYS: &[&str] = &[
     "wss://nostr-relay.zeabur.app",
     "wss://relay.henryxplace.eu.org:9988",
@@ -109,6 +115,7 @@ struct NostrGeoInner {
     joined_geohashes: Mutex<HashSet<String>>,
     relays_by_geohash: Mutex<HashMap<String, Vec<String>>>,
     people_by_pubkey: Mutex<HashMap<String, String>>,
+    metadata_lookup_pubkeys: Mutex<HashSet<String>>,
     publish_lock: Mutex<()>,
 }
 
@@ -133,6 +140,14 @@ struct Nip17Event {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     sig: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NostrProfileMetadata {
+    display_name: Option<String>,
+    name: Option<String>,
+    username: Option<String>,
+    nip05: Option<String>,
 }
 
 #[derive(Clone)]
@@ -174,6 +189,7 @@ impl NostrGeoClient {
                 joined_geohashes: Mutex::new(HashSet::new()),
                 relays_by_geohash: Mutex::new(HashMap::new()),
                 people_by_pubkey: Mutex::new(HashMap::new()),
+                metadata_lookup_pubkeys: Mutex::new(HashSet::new()),
                 publish_lock: Mutex::new(()),
             }),
         }
@@ -634,28 +650,38 @@ async fn handle_relay_text(
         return;
     }
 
-    let sender = event
+    let tagged_sender = event
         .tags
         .iter()
         .find(|tag| tag.first().map(String::as_str) == Some("n") && tag.len() >= 2)
         .and_then(|tag| tag.get(1))
-        .map(|nick| sanitize_display_field(nick))
-        .unwrap_or_else(|| format!("npub{}", event.pubkey.chars().take(8).collect::<String>()));
+        .map(|nick| sanitize_display_field(nick));
+    let sender = if let Some(name) = tagged_sender
+        .as_ref()
+        .filter(|name| !is_pubkey_placeholder_name(name))
+    {
+        name.clone()
+    } else if let Some(name) = known_person_name(inner, &event.pubkey).await {
+        name
+    } else {
+        tagged_sender
+            .unwrap_or_else(|| format!("npub{}", event.pubkey.chars().take(8).collect::<String>()))
+    };
 
-    inner
-        .people_by_pubkey
-        .lock()
-        .await
-        .insert(event.pubkey.clone(), sender.clone());
+    update_known_person(inner, channel, &event.pubkey, &sender).await;
+    if is_pubkey_placeholder_name(&sender) {
+        schedule_metadata_lookup(inner.clone(), channel.to_string(), event.pubkey.clone()).await;
+    }
 
     let timestamp = Local
         .timestamp_opt(event.created_at, 0)
         .single()
         .unwrap_or_else(Local::now);
     let structured = format!(
-        "__CHANNEL__:{}:{}:{}:{}",
+        "__CHANNEL__:{}:{}:{}:{}:{}",
         channel,
         sender,
+        event.pubkey,
         timestamp.format("%H%M"),
         event.content
     );
@@ -664,13 +690,6 @@ async fn handle_relay_text(
         geohash, sender, event.id
     ));
     send_presence_update(inner, channel, &event.pubkey, event.created_at).await;
-    let _ = inner
-        .ui_tx
-        .send(format!(
-            "__GEO_PERSON__:{}:{}:{}",
-            channel, sender, event.pubkey
-        ))
-        .await;
     let _ = inner.ui_tx.send(structured).await;
 }
 
@@ -687,6 +706,98 @@ async fn send_presence_update(
             channel, pubkey, timestamp
         ))
         .await;
+}
+
+async fn known_person_name(inner: &Arc<NostrGeoInner>, pubkey: &str) -> Option<String> {
+    inner.people_by_pubkey.lock().await.get(pubkey).cloned()
+}
+
+fn is_pubkey_placeholder_name(name: &str) -> bool {
+    name.starts_with("npub") || looks_like_dm_pubkey(name)
+}
+
+async fn update_known_person(inner: &Arc<NostrGeoInner>, channel: &str, pubkey: &str, name: &str) {
+    let name = sanitize_display_field(name);
+    if !is_pubkey_placeholder_name(&name) {
+        inner
+            .people_by_pubkey
+            .lock()
+            .await
+            .insert(pubkey.to_string(), name.clone());
+    }
+
+    let _ = inner
+        .ui_tx
+        .send(format!("__GEO_PERSON__:{}:{}:{}", channel, name, pubkey))
+        .await;
+}
+
+async fn schedule_metadata_lookup(inner: Arc<NostrGeoInner>, channel: String, pubkey: String) {
+    let lookup_key = format!("{}:{}", channel, pubkey);
+    let mut lookups = inner.metadata_lookup_pubkeys.lock().await;
+    if !lookups.insert(lookup_key.clone()) {
+        return;
+    }
+    drop(lookups);
+
+    let relays = profile_lookup_relays(&inner, &channel).await;
+    tokio::spawn(async move {
+        write_nostr_debug_log(&format!(
+            "profile metadata lookup start: pubkey={}, relays={}",
+            &pubkey[..pubkey.len().min(8)],
+            relays.join(",")
+        ));
+        match lookup_profile_name(&pubkey, relays).await {
+            Ok(Some(name)) => {
+                write_nostr_debug_log(&format!(
+                    "resolved profile metadata: pubkey={}, name={}",
+                    &pubkey[..pubkey.len().min(8)],
+                    name
+                ));
+                update_known_person(&inner, &channel, &pubkey, &name).await;
+            }
+            Ok(None) => {
+                inner
+                    .metadata_lookup_pubkeys
+                    .lock()
+                    .await
+                    .remove(&lookup_key);
+                write_nostr_debug_log(&format!(
+                    "profile metadata not found: pubkey={}",
+                    &pubkey[..pubkey.len().min(8)]
+                ));
+            }
+            Err(e) => {
+                inner
+                    .metadata_lookup_pubkeys
+                    .lock()
+                    .await
+                    .remove(&lookup_key);
+                write_nostr_debug_log(&format!(
+                    "profile metadata lookup failed: pubkey={}, error={}",
+                    &pubkey[..pubkey.len().min(8)],
+                    e
+                ));
+            }
+        }
+    });
+}
+
+async fn profile_lookup_relays(inner: &Arc<NostrGeoInner>, channel: &str) -> Vec<String> {
+    let geohash_relays = if let Some(geohash) = normalize_geohash(channel) {
+        inner
+            .relays_by_geohash
+            .lock()
+            .await
+            .get(&geohash)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let profile_relays = metadata_relays();
+    let dm_relays = dm_relays();
+    merge_relays(&geohash_relays, &merge_relays(&profile_relays, &dm_relays))
 }
 
 async fn handle_private_relay_event(
@@ -725,14 +836,17 @@ async fn handle_private_relay_event(
             }
         };
 
-    let mut people_by_pubkey = inner.people_by_pubkey.lock().await;
-    let sender = sender_nickname
-        .or_else(|| people_by_pubkey.get(&sender_pubkey).cloned())
-        .unwrap_or_else(|| format!("npub{}", sender_pubkey.chars().take(8).collect::<String>()));
-    if !sender.starts_with("npub") {
-        people_by_pubkey.insert(sender_pubkey.clone(), sender.clone());
-    }
-    drop(people_by_pubkey);
+    let sender = if let Some(nickname) = sender_nickname {
+        update_known_person(inner, channel, &sender_pubkey, &nickname).await;
+        nickname
+    } else if let Some(name) = known_person_name(inner, &sender_pubkey).await {
+        name
+    } else {
+        let fallback = format!("npub{}", sender_pubkey.chars().take(8).collect::<String>());
+        update_known_person(inner, channel, &sender_pubkey, &fallback).await;
+        schedule_metadata_lookup(inner.clone(), channel.to_string(), sender_pubkey.clone()).await;
+        fallback
+    };
 
     let timestamp = Local
         .timestamp_opt(timestamp, 0)
@@ -772,6 +886,108 @@ fn event_tag_value(event: &Nip17Event, tag_name: &str) -> Option<String> {
             None
         }
     })
+}
+
+async fn lookup_profile_name(pubkey: &str, relays: Vec<String>) -> Result<Option<String>, String> {
+    let results = join_all(relays.into_iter().map(|relay| {
+        let pubkey = pubkey.to_string();
+        async move { lookup_profile_name_once(&relay, &pubkey).await }
+    }))
+    .await;
+
+    let mut last_error = None;
+    for result in results {
+        match result {
+            Ok(Some(name)) => return Ok(Some(name)),
+            Ok(None) => {}
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    if let Some(error) = last_error {
+        Err(error)
+    } else {
+        Ok(None)
+    }
+}
+
+async fn lookup_profile_name_once(relay: &str, pubkey: &str) -> Result<Option<String>, String> {
+    let (mut ws_stream, _) = connect_relay(relay).await?;
+    let sub_id = format!("bitchat-tui-profile-{}", Uuid::new_v4());
+    let req = json!([
+        "REQ",
+        sub_id,
+        {
+            "kinds": [0],
+            "authors": [pubkey],
+            "limit": 1
+        }
+    ]);
+    ws_stream
+        .send(WsMessage::Text(req.to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let message = match tokio::time::timeout(remaining, ws_stream.next()).await {
+            Ok(Some(Ok(message))) => message,
+            Ok(Some(Err(e))) => return Err(e.to_string()),
+            Ok(None) | Err(_) => break,
+        };
+
+        let WsMessage::Text(text) = message else {
+            continue;
+        };
+        let parsed: Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some(arr) = parsed.as_array() else {
+            continue;
+        };
+        match arr.first().and_then(Value::as_str) {
+            Some("EVENT") if arr.len() >= 3 => {
+                let event: NostrEvent = match serde_json::from_value(arr[2].clone()) {
+                    Ok(event) => event,
+                    Err(_) => continue,
+                };
+                if event.kind == 0 && event.pubkey == pubkey {
+                    let _ = ws_stream
+                        .send(WsMessage::Text(json!(["CLOSE", sub_id]).to_string()))
+                        .await;
+                    let _ = ws_stream.close(None).await;
+                    return Ok(profile_name_from_metadata(&event.content));
+                }
+            }
+            Some("EOSE") => break,
+            _ => {}
+        }
+    }
+
+    let _ = ws_stream
+        .send(WsMessage::Text(json!(["CLOSE", sub_id]).to_string()))
+        .await;
+    let _ = ws_stream.close(None).await;
+    Ok(None)
+}
+
+fn profile_name_from_metadata(content: &str) -> Option<String> {
+    let metadata: NostrProfileMetadata = serde_json::from_str(content).ok()?;
+    [
+        metadata.display_name,
+        metadata.name,
+        metadata.username,
+        metadata.nip05,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|name| sanitize_display_field(&name))
+    .find(|name| !name.trim().is_empty() && !is_pubkey_placeholder_name(name))
 }
 
 async fn publish_event(relay: &str, event: &NostrEvent) -> Result<(), String> {
@@ -1864,6 +2080,26 @@ fn dm_relays() -> Vec<String> {
     default_relays()
 }
 
+fn metadata_relays() -> Vec<String> {
+    let default_metadata_relays: Vec<String> = PROFILE_METADATA_RELAYS
+        .iter()
+        .filter_map(|relay| normalize_relay_url(relay))
+        .collect();
+    let base_relays = merge_relays(&default_metadata_relays, &default_relays());
+
+    if let Ok(value) = std::env::var("BITCHAT_TUI_NOSTR_METADATA_RELAYS") {
+        let relays: Vec<String> = value
+            .split(',')
+            .filter_map(|relay| normalize_relay_url(relay.trim()))
+            .collect();
+        if !relays.is_empty() {
+            return merge_relays(&relays, &base_relays);
+        }
+    }
+
+    base_relays
+}
+
 fn merge_relays(primary: &[String], secondary: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     primary
@@ -1974,6 +2210,19 @@ mod tests {
         assert!(event.content.is_empty());
         assert_eq!(event.pubkey.len(), 64);
         assert_eq!(event.sig.len(), 128);
+    }
+
+    #[test]
+    fn parses_profile_metadata_display_name() {
+        assert_eq!(
+            profile_name_from_metadata(r#"{"display_name":"g8.bot","name":"fallback"}"#).as_deref(),
+            Some("g8.bot")
+        );
+        assert_eq!(
+            profile_name_from_metadata(r#"{"name":"bot_name"}"#).as_deref(),
+            Some("bot_name")
+        );
+        assert_eq!(profile_name_from_metadata(r#"{"name":"npub1234"}"#), None);
     }
 
     #[test]
