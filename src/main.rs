@@ -2058,7 +2058,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 peer_id: target_peer_id,
             } = &chat_context.as_ref().unwrap().current_mode
             {
-                if let Err(e) = handle_private_dm_message(
+                match handle_private_dm_message(
                     &line,
                     target_peer_id,
                     &mut noise_session_manager,
@@ -2069,7 +2069,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await
                 {
-                    app.add_log_message(format!("system: Failed to send DM: {}", e));
+                    Ok(Some(message_id)) => {
+                        app.add_pending_mesh_dm_message(
+                            target_nickname.clone(),
+                            line.clone(),
+                            message_id,
+                        );
+                    }
+                    Ok(None) => {
+                        app.add_dm_message(target_nickname.clone(), line.clone());
+                    }
+                    Err(e) => {
+                        app.add_log_message(format!("system: Failed to send DM: {}", e));
+                    }
                 }
                 continue;
             }

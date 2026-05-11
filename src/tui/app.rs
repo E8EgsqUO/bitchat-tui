@@ -623,6 +623,23 @@ impl App {
             }
         }
 
+        if trimmed.starts_with("__DM_STATUS__:") {
+            let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
+            if parts.len() >= 3 {
+                let local_id = parts[1];
+                let status = match parts[2] {
+                    "delivered" => Some(MessageStatus::Delivered),
+                    "read" => Some(MessageStatus::Read),
+                    "failed" => Some(MessageStatus::Failed),
+                    _ => None,
+                };
+                if let Some(status) = status {
+                    self.update_dm_message_status(local_id, status);
+                }
+                return;
+            }
+        }
+
         if trimmed.starts_with("__GEO_PERSON__:") {
             let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
             if parts.len() >= 4 {
@@ -1022,15 +1039,29 @@ impl App {
         self.scroll_to_bottom_current_conversation();
     }
 
+    pub fn add_pending_mesh_dm_message(&mut self, target: String, text: String, local_id: String) {
+        let timestamp = chrono::Local::now().format("%H:%M").to_string();
+        let msg = Message {
+            sender: self.nickname.clone(),
+            sender_pubkey: None,
+            timestamp,
+            content: text,
+            is_self: true,
+            status: MessageStatus::Sending,
+            local_id: Some(local_id),
+        };
+
+        self.dm_messages.entry(target).or_default().push(msg);
+        self.scroll_to_bottom_current_conversation();
+    }
+
     pub fn update_dm_message_status(&mut self, local_id: &str, status: MessageStatus) -> bool {
         for messages in self.dm_messages.values_mut() {
             if let Some(message) = messages
                 .iter_mut()
                 .find(|message| message.local_id.as_deref() == Some(local_id))
             {
-                if matches!(message.status, MessageStatus::Read)
-                    && matches!(status, MessageStatus::Delivered)
-                {
+                if !Self::should_apply_dm_status(message.status, status) {
                     return true;
                 }
                 message.status = status;
@@ -1038,6 +1069,23 @@ impl App {
             }
         }
         false
+    }
+
+    fn should_apply_dm_status(current: MessageStatus, next: MessageStatus) -> bool {
+        match current {
+            MessageStatus::Read => matches!(next, MessageStatus::Read),
+            MessageStatus::Delivered => {
+                matches!(next, MessageStatus::Delivered | MessageStatus::Read)
+            }
+            MessageStatus::Failed => {
+                matches!(
+                    next,
+                    MessageStatus::Failed | MessageStatus::Delivered | MessageStatus::Read
+                )
+            }
+            MessageStatus::None => !matches!(next, MessageStatus::Sending),
+            MessageStatus::Sending => true,
+        }
     }
 
     pub fn add_dm_message(&mut self, target_nickname: String, content: String) {
@@ -1532,9 +1580,31 @@ mod tests {
         let msg = app.dm_messages.get(&key).unwrap().first().unwrap();
         assert_eq!(msg.status, MessageStatus::Read);
 
+        app.add_log_message("__GEO_DM_STATUS__:local-1:sent".to_string());
+        let msg = app.dm_messages.get(&key).unwrap().first().unwrap();
+        assert_eq!(msg.status, MessageStatus::Read);
+
         app.add_log_message("__GEO_DM_STATUS__:local-1:delivered".to_string());
         let msg = app.dm_messages.get(&key).unwrap().first().unwrap();
         assert_eq!(msg.status, MessageStatus::Read);
+    }
+
+    #[test]
+    fn dm_status_does_not_downgrade_delivered_to_sent() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let pubkey = "4ccaa3888b3b303d28bd9ae6aa2278530232b404abccffa83d9aa815ed2ca4e2";
+
+        app.join_channel("#ws".to_string());
+        app.add_log_message(format!("__GEO_PERSON__:#ws:alice:{}", pubkey));
+        app.switch_to_geohash_dm("alice".to_string());
+        app.add_pending_geohash_dm_message("hello".to_string(), "local-1".to_string());
+
+        let key = App::geohash_dm_pubkey_key("#ws", pubkey);
+        app.add_log_message("__GEO_DM_STATUS__:local-1:delivered".to_string());
+        app.add_log_message("__GEO_DM_STATUS__:local-1:sent".to_string());
+
+        let msg = app.dm_messages.get(&key).unwrap().first().unwrap();
+        assert_eq!(msg.status, MessageStatus::Delivered);
     }
 
     #[test]

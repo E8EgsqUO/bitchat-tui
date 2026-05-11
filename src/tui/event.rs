@@ -200,7 +200,16 @@ fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Send
             let input_str = app.input.value().to_string();
             if !input_str.is_empty() {
                 if input_tx.try_send(input_str.clone()).is_ok() {
-                    if !input_str.starts_with('/') && app.current_geohash_dm().is_none() {
+                    let is_mesh_dm = app.current_geohash_dm().is_none()
+                        && app
+                            .current_conv
+                            .as_ref()
+                            .and_then(|(dm, _)| dm.as_ref())
+                            .is_some();
+                    if !input_str.starts_with('/')
+                        && app.current_geohash_dm().is_none()
+                        && !is_mesh_dm
+                    {
                         app.add_sent_message(input_str);
                     }
                     app.input.reset();

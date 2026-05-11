@@ -51,7 +51,7 @@ pub async fn handle_private_dm_message(
     cmd_char: &btleplug::api::Characteristic,
     my_peer_id: &str,
     ui_tx: mpsc::Sender<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     write_noise_debug_log(&format!(
         "[DEBUG] Starting handle_private_dm_message to peer: {}",
         target_peer_id
@@ -134,6 +134,7 @@ pub async fn handle_private_dm_message(
                                                 target_peer_id
                                             ))
                                             .await;
+                                        return Ok(None);
                                     }
                                     Err(e) => {
                                         write_noise_debug_log(&format!(
@@ -169,97 +170,85 @@ pub async fn handle_private_dm_message(
                 return Err(format!("Failed to create session: {}", e).into());
             }
         }
-    } else {
-        write_noise_debug_log("[DEBUG] Session is established, sending encrypted message");
-
-        // Send encrypted message
-        write_noise_debug_log("[DEBUG] About to encrypt message");
-
-        // Create iOS-compatible Noise private message payload.
-        write_noise_debug_log(&format!(
-            "[DEBUG] Creating private Noise payload for message: '{}'",
-            message
-        ));
-        let message_id = Uuid::new_v4().to_string();
-        let noise_payload = create_private_noise_payload(&message_id, message)
-            .map_err(|e| format!("Failed to create private Noise payload: {}", e))?;
-        write_noise_debug_log(&format!(
-            "[DEBUG] Created private Noise payload, length: {}, message_id: {}",
-            noise_payload.len(),
-            message_id
-        ));
-        write_noise_debug_log(&format!(
-            "[DEBUG] Payload bytes: {:?}",
-            &noise_payload[..std::cmp::min(32, noise_payload.len())]
-        ));
-
-        write_noise_debug_log(&format!(
-            "[DEBUG] About to encrypt message with Noise for peer: {}",
-            target_peer_id
-        ));
-        match noise_manager.encrypt_message(target_peer_id, &noise_payload) {
-            Ok(encrypted_data) => {
-                write_noise_debug_log(&format!(
-                    "[DEBUG] Message encrypted successfully, length: {}, first 16 bytes: {:?}",
-                    encrypted_data.len(),
-                    &encrypted_data[..std::cmp::min(16, encrypted_data.len())]
-                ));
-
-                // Create and send the encrypted message packet
-                write_noise_debug_log(&format!(
-                    "[DEBUG] About to create encrypted message packet for peer: {}",
-                    target_peer_id
-                ));
-                let encrypted_packet = create_bitchat_packet_with_recipient(
-                    my_peer_id,
-                    Some(target_peer_id),
-                    crate::data_structures::MessageType::NoiseEncrypted,
-                    encrypted_data.clone(),
-                    None,
-                );
-
-                write_noise_debug_log(&format!(
-                    "[DEBUG] Created encrypted packet, length: {}, about to send via Bluetooth",
-                    encrypted_packet.len()
-                ));
-                match peripheral
-                    .write(
-                        cmd_char,
-                        &encrypted_packet,
-                        btleplug::api::WriteType::WithoutResponse,
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        write_noise_debug_log(&format!(
-                            "[DEBUG] Encrypted message sent successfully to peer: {}",
-                            target_peer_id
-                        ));
-                        let _ = ui_tx
-                            .send(format!("[DM] Message sent to {}\n> ", target_peer_id))
-                            .await;
-                    }
-                    Err(e) => {
-                        write_noise_debug_log(&format!(
-                            "[DEBUG] Failed to send encrypted message via Bluetooth: {:?}",
-                            e
-                        ));
-                        return Err(format!("Failed to send encrypted message: {}", e).into());
-                    }
-                }
-            }
-            Err(e) => {
-                write_noise_debug_log(&format!(
-                    "[DEBUG] Failed to encrypt message with Noise: {:?}",
-                    e
-                ));
-                return Err(format!("Failed to encrypt message: {}", e).into());
-            }
-        }
     }
 
+    write_noise_debug_log("[DEBUG] Session is established, sending encrypted message");
+    write_noise_debug_log("[DEBUG] About to encrypt message");
+    write_noise_debug_log(&format!(
+        "[DEBUG] Creating private Noise payload for message: '{}'",
+        message
+    ));
+    let message_id = Uuid::new_v4().to_string();
+    let noise_payload = create_private_noise_payload(&message_id, message)
+        .map_err(|e| format!("Failed to create private Noise payload: {}", e))?;
+    write_noise_debug_log(&format!(
+        "[DEBUG] Created private Noise payload, length: {}, message_id: {}",
+        noise_payload.len(),
+        message_id
+    ));
+    write_noise_debug_log(&format!(
+        "[DEBUG] Payload bytes: {:?}",
+        &noise_payload[..std::cmp::min(32, noise_payload.len())]
+    ));
+
+    write_noise_debug_log(&format!(
+        "[DEBUG] About to encrypt message with Noise for peer: {}",
+        target_peer_id
+    ));
+    let encrypted_data = noise_manager
+        .encrypt_message(target_peer_id, &noise_payload)
+        .map_err(|e| {
+            write_noise_debug_log(&format!(
+                "[DEBUG] Failed to encrypt message with Noise: {:?}",
+                e
+            ));
+            format!("Failed to encrypt message: {}", e)
+        })?;
+    write_noise_debug_log(&format!(
+        "[DEBUG] Message encrypted successfully, length: {}, first 16 bytes: {:?}",
+        encrypted_data.len(),
+        &encrypted_data[..std::cmp::min(16, encrypted_data.len())]
+    ));
+
+    write_noise_debug_log(&format!(
+        "[DEBUG] About to create encrypted message packet for peer: {}",
+        target_peer_id
+    ));
+    let encrypted_packet = create_bitchat_packet_with_recipient(
+        my_peer_id,
+        Some(target_peer_id),
+        crate::data_structures::MessageType::NoiseEncrypted,
+        encrypted_data.clone(),
+        None,
+    );
+
+    write_noise_debug_log(&format!(
+        "[DEBUG] Created encrypted packet, length: {}, about to send via Bluetooth",
+        encrypted_packet.len()
+    ));
+    peripheral
+        .write(
+            cmd_char,
+            &encrypted_packet,
+            btleplug::api::WriteType::WithoutResponse,
+        )
+        .await
+        .map_err(|e| {
+            write_noise_debug_log(&format!(
+                "[DEBUG] Failed to send encrypted message via Bluetooth: {:?}",
+                e
+            ));
+            format!("Failed to send encrypted message: {}", e)
+        })?;
+    write_noise_debug_log(&format!(
+        "[DEBUG] Encrypted message sent successfully to peer: {}",
+        target_peer_id
+    ));
+    let _ = ui_tx
+        .send(format!("[DM] Message sent to {}\n> ", target_peer_id))
+        .await;
     write_noise_debug_log("[DEBUG] Completed handle_private_dm_message");
-    Ok(())
+    Ok(Some(message_id))
 }
 
 // Fallback handler using the old encryption method

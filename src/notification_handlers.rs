@@ -26,9 +26,9 @@ use crate::packet_creation::{create_bitchat_packet, create_bitchat_packet_with_r
 use crate::packet_delivery::{create_delivery_ack, should_send_ack};
 use crate::packet_parser::{generate_keys_and_payload, parse_bitchat_packet};
 use crate::payload_handling::{
-    create_private_noise_payload, parse_bitchat_message_payload, parse_private_noise_payload,
-    unpad_message, NOISE_PAYLOAD_DELIVERED, NOISE_PAYLOAD_PRIVATE_MESSAGE,
-    NOISE_PAYLOAD_READ_RECEIPT,
+    create_private_noise_payload, parse_bitchat_message_payload, parse_private_noise_ack_payload,
+    parse_private_noise_payload, unpad_message, NOISE_PAYLOAD_DELIVERED,
+    NOISE_PAYLOAD_PRIVATE_MESSAGE, NOISE_PAYLOAD_READ_RECEIPT,
 };
 use crate::persistence::{save_state, AppState, EncryptedPassword};
 use crate::terminal_ux::{ChatContext, ChatMode};
@@ -2091,6 +2091,16 @@ pub async fn handle_noise_encrypted_message(
                                     content
                                 );
                                 let _ = ui_tx.send(structured_msg).await;
+                                send_private_noise_ack(
+                                    noise_manager,
+                                    peripheral,
+                                    cmd_char,
+                                    my_peer_id,
+                                    &packet.sender_id_str,
+                                    NOISE_PAYLOAD_DELIVERED,
+                                    &message_id,
+                                )
+                                .await;
                                 write_noise_debug_log(&format!(
                                     "[DEBUG] Displayed private Noise message: {}",
                                     message_id
@@ -2110,7 +2120,19 @@ pub async fn handle_noise_encrypted_message(
                         return;
                     }
                     NOISE_PAYLOAD_DELIVERED => {
-                        write_noise_debug_log("[DEBUG] Ignoring Noise delivered payload");
+                        match parse_private_noise_ack_payload(payload_data) {
+                            Ok(message_id) => {
+                                let _ = ui_tx
+                                    .send(format!("__DM_STATUS__:{}:delivered", message_id))
+                                    .await;
+                            }
+                            Err(e) => {
+                                write_noise_debug_log(&format!(
+                                    "[DEBUG] Failed to parse Noise delivered payload: {}",
+                                    e
+                                ));
+                            }
+                        }
                         return;
                     }
                     _ => {}
@@ -2192,6 +2214,49 @@ pub async fn handle_noise_encrypted_message(
     }
 
     write_noise_debug_log("[DEBUG] Completed handle_noise_encrypted_message");
+}
+
+async fn send_private_noise_ack(
+    noise_manager: &mut NoiseSessionManager,
+    peripheral: &Peripheral,
+    cmd_char: &btleplug::api::Characteristic,
+    my_peer_id: &str,
+    target_peer_id: &str,
+    payload_type: u8,
+    message_id: &str,
+) {
+    let mut payload = Vec::with_capacity(1 + message_id.len());
+    payload.push(payload_type);
+    payload.extend_from_slice(message_id.as_bytes());
+
+    let encrypted = match noise_manager.encrypt_message(target_peer_id, &payload) {
+        Ok(encrypted) => encrypted,
+        Err(e) => {
+            write_noise_debug_log(&format!(
+                "[DEBUG] Failed to encrypt private Noise ack {}: {:?}",
+                message_id, e
+            ));
+            return;
+        }
+    };
+
+    let packet = create_bitchat_packet_with_recipient(
+        my_peer_id,
+        Some(target_peer_id),
+        MessageType::NoiseEncrypted,
+        encrypted,
+        None,
+    );
+
+    if let Err(e) = peripheral
+        .write(cmd_char, &packet, WriteType::WithoutResponse)
+        .await
+    {
+        write_noise_debug_log(&format!(
+            "[DEBUG] Failed to send private Noise ack {}: {}",
+            message_id, e
+        ));
+    }
 }
 
 // FIXED: Add helper function to process decrypted messages
