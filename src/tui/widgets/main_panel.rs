@@ -13,8 +13,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::tui::app::{App, FocusArea, Message, MessageStatus};
 
 const TIME_DIVIDER_GAP_MINUTES: i32 = 15;
-const OTHER_MESSAGE_INDENT: usize = 4;
+const OTHER_MESSAGE_INDENT: usize = 2;
 const DM_OTHER_INDENT: usize = 2;
+const SELF_MESSAGE_RIGHT_PADDING: usize = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MessageRole {
@@ -292,7 +293,9 @@ fn render_aligned_message_line(
         _ if reserve_status_slot => {
             let total_width = line_width.saturating_add(2);
             let leading = match role {
-                MessageRole::SelfUser => available_width.saturating_sub(total_width),
+                MessageRole::SelfUser => available_width
+                    .saturating_sub(total_width)
+                    .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
                 MessageRole::Other => content_indent,
                 MessageRole::System => available_width.saturating_sub(total_width) / 2,
             };
@@ -313,7 +316,9 @@ fn render_aligned_message_line(
         _ => {
             let leading = match role {
                 MessageRole::System => available_width.saturating_sub(line_width) / 2,
-                MessageRole::SelfUser => available_width.saturating_sub(line_width),
+                MessageRole::SelfUser => available_width
+                    .saturating_sub(line_width)
+                    .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
                 MessageRole::Other => content_indent,
             };
             let mut spans = vec![Span::raw(" ".repeat(leading))];
@@ -355,7 +360,9 @@ fn separator_item(role: MessageRole, available_width: usize) -> ListItem<'static
     let line_width = (available_width / 3).max(8).min(available_width);
     let leading = match role {
         MessageRole::Other => 0,
-        MessageRole::SelfUser => available_width.saturating_sub(line_width),
+        MessageRole::SelfUser => available_width
+            .saturating_sub(line_width)
+            .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
         MessageRole::System => available_width.saturating_sub(line_width) / 2,
     };
     let separator = "-".repeat(line_width);
