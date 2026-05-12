@@ -141,6 +141,7 @@ fn build_app_state_factory(
 async fn setup_bluetooth_connection(
     ui_tx: mpsc::Sender<String>,
 ) -> Result<Peripheral, Box<dyn std::error::Error + Send + Sync>> {
+    let debug_enabled = crate::tui::app::bitchat_debug_enabled();
     let manager = Manager::new().await?;
     let adapters = manager.adapters().await?;
     let adapter = match adapters.into_iter().nth(0) {
@@ -161,14 +162,16 @@ async fn setup_bluetooth_connection(
 
     adapter.start_scan(ScanFilter::default()).await?;
 
-    ui_tx
-        .send("\x1b[90m» Scanning for bitchat service...\x1b[0m\n".to_string())
-        .await
-        .map_err(|e| e.to_string())?;
+    if debug_enabled {
+        ui_tx
+            .send("\x1b[90m» Scanning for bitchat service...\x1b[0m\n".to_string())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     // We can't use debug_println! here directly as it's not async-aware and prints directly.
     // Instead, we replicate its logic and send to the UI channel.
-    if unsafe { DEBUG_LEVEL } >= DebugLevel::Basic {
+    if debug_enabled && unsafe { DEBUG_LEVEL } >= DebugLevel::Basic {
         ui_tx
             .send("[1] Scanning for bitchat service...\n".to_string())
             .await
@@ -180,11 +183,13 @@ async fn setup_bluetooth_connection(
 
     let peripheral = loop {
         if let Some(p) = find_peripheral(&adapter).await? {
-            ui_tx
-                .send("\x1b[90m» Found bitchat service! Connecting...\x1b[0m\n".to_string())
-                .await
-                .map_err(|e| e.to_string())?;
-            if unsafe { DEBUG_LEVEL } >= DebugLevel::Basic {
+            if debug_enabled {
+                ui_tx
+                    .send("\x1b[90m» Found bitchat service! Connecting...\x1b[0m\n".to_string())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            if debug_enabled && unsafe { DEBUG_LEVEL } >= DebugLevel::Basic {
                 ui_tx
                     .send("[1] Match Found! Connecting...\n".to_string())
                     .await
@@ -197,17 +202,19 @@ async fn setup_bluetooth_connection(
         // Check if we've exceeded the timeout
         if start_time.elapsed() >= timeout_duration {
             adapter.stop_scan().await?;
-            let error_message = [
-                "\n\x1b[91m❌ No BitChat service found\x1b[0m",
-                "\x1b[90mScan timed out after 15 seconds.\x1b[0m",
-                "\x1b[90mPlease check:\x1b[0m",
-                "\x1b[90m  • Another device is running BitChat\x1b[0m",
-                "\x1b[90m  • Bluetooth is enabled on both devices\x1b[0m",
-                "\x1b[90m  • You're within Bluetooth range\x1b[0m",
-                "\x1b[90m  • The other device is advertising the BitChat service\x1b[0m",
-            ]
-            .join("\n");
-            ui_tx.send(error_message).await.map_err(|e| e.to_string())?;
+            if debug_enabled {
+                let error_message = [
+                    "\n\x1b[91m❌ No BitChat service found\x1b[0m",
+                    "\x1b[90mScan timed out after 15 seconds.\x1b[0m",
+                    "\x1b[90mPlease check:\x1b[0m",
+                    "\x1b[90m  • Another device is running BitChat\x1b[0m",
+                    "\x1b[90m  • Bluetooth is enabled on both devices\x1b[0m",
+                    "\x1b[90m  • You're within Bluetooth range\x1b[0m",
+                    "\x1b[90m  • The other device is advertising the BitChat service\x1b[0m",
+                ]
+                .join("\n");
+                ui_tx.send(error_message).await.map_err(|e| e.to_string())?;
+            }
             return Err("No BitChat service found within 30 seconds.".into());
         }
 
@@ -1653,7 +1660,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         sanitize_status_field(&e.to_string())
                                     ))
                                     .await;
-                            } else if std::env::var_os("BITCHAT_DEBUG").is_some() {
+                            } else if crate::tui::app::bitchat_debug_enabled() {
                                 let _ = ui_tx
                                     .send(format!(
                                         "system: Wormhole send complete: {} ({})",
@@ -2119,6 +2126,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         last_tick = std::time::Instant::now();
     }
+
+    // Always persist state on shutdown so state.json mtime reflects the latest exit.
+    if let (
+        Some(chat_context),
+        Some(blocked_peers),
+        Some(channel_creators),
+        Some(password_protected_channels),
+        Some(channel_key_commitments),
+        Some(app_state),
+        Some(create_app_state),
+    ) = (
+        chat_context.as_ref(),
+        blocked_peers.as_ref(),
+        channel_creators.as_ref(),
+        password_protected_channels.as_ref(),
+        channel_key_commitments.as_ref(),
+        app_state.as_ref(),
+        create_app_state.as_ref(),
+    ) {
+        let channels_vec: Vec<String> = chat_context
+            .active_channels
+            .iter()
+            .filter(|channel| !nostr_geo::is_geohash_channel(channel))
+            .cloned()
+            .collect();
+        let state_to_save = create_app_state(
+            blocked_peers,
+            channel_creators,
+            &channels_vec,
+            password_protected_channels,
+            channel_key_commitments,
+            &app_state.encrypted_channel_passwords,
+            &nickname,
+        );
+        let _ = save_state(&state_to_save);
+    }
+
     // Restore the terminal
     tui_mod::restore().expect("Failed to restore terminal");
     Ok(())

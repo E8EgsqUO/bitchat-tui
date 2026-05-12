@@ -23,6 +23,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::{Duration as StdDuration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
@@ -38,7 +39,8 @@ const GEO_RELAY_CSV_URL: &str =
     "https://raw.githubusercontent.com/permissionlesstech/georelays/main/nostr_relays.csv";
 const GEOHASH_ALPHABET: &str = "0123456789bcdefghjkmnpqrstuvwxyz";
 const SUBSCRIBE_SINCE_SECONDS: i64 = 300;
-const DM_SUBSCRIBE_SINCE_SECONDS: i64 = 86_400;
+const DM_SUBSCRIBE_MAX_SECONDS: i64 = 15 * 60;
+const DM_SUBSCRIBE_FALLBACK_SECONDS: i64 = 10 * 60;
 const RECONNECT_DELAY_SECONDS: u64 = 10;
 const CONNECT_TIMEOUT_SECONDS: u64 = 8;
 const PUBLISH_TIMEOUT_SECONDS: u64 = 8;
@@ -606,7 +608,7 @@ async fn subscribe_once(
     let sub_id = format!("bitchat-tui-{}-{}", geohash, Uuid::new_v4());
     let now = Local::now().timestamp();
     let public_since = now.saturating_sub(SUBSCRIBE_SINCE_SECONDS);
-    let dm_since = now.saturating_sub(DM_SUBSCRIBE_SINCE_SECONDS);
+    let dm_since = now.saturating_sub(compute_dm_subscribe_window_seconds());
     let req = json!([
         "REQ",
         sub_id,
@@ -651,6 +653,22 @@ async fn subscribe_once(
     }
 
     Ok(())
+}
+
+fn compute_dm_subscribe_window_seconds() -> i64 {
+    let path = crate::persistence::get_state_file_path();
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return DM_SUBSCRIBE_FALLBACK_SECONDS;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return DM_SUBSCRIBE_FALLBACK_SECONDS;
+    };
+    let now = SystemTime::now();
+    let elapsed = now
+        .duration_since(modified)
+        .unwrap_or_else(|_| StdDuration::from_secs(DM_SUBSCRIBE_FALLBACK_SECONDS as u64))
+        .as_secs() as i64;
+    elapsed.clamp(1, DM_SUBSCRIBE_MAX_SECONDS)
 }
 
 async fn handle_relay_text(

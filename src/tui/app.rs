@@ -9,6 +9,18 @@ use unicode_width::UnicodeWidthChar;
 const GEOHASH_ACTIVE_WINDOW_SECONDS: i64 = crate::nostr_geo::PRESENCE_ACTIVE_WINDOW_SECONDS;
 const COMPACT_FILE_NAME_MAX_CHARS: usize = 52;
 
+pub fn bitchat_debug_enabled() -> bool {
+    let Ok(raw) = std::env::var("BITCHAT_DEBUG") else {
+        return false;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    !(normalized.is_empty()
+        || normalized == "0"
+        || normalized == "false"
+        || normalized == "off"
+        || normalized == "no")
+}
+
 pub fn compact_file_message(file_name: &str) -> String {
     format!(
         "📎 {}",
@@ -1111,12 +1123,17 @@ impl App {
     }
 
     fn debug_logs_enabled() -> bool {
-        std::env::var_os("BITCHAT_DEBUG").is_some()
+        bitchat_debug_enabled()
     }
 
     fn should_suppress_noisy_line(line: &str) -> bool {
         line.contains("Scanning for bitchat service")
             || line.contains("Restarting Bluetooth mesh scan...")
+            || line.starts_with("[DM] ")
+            || line.contains("No BitChat service found")
+            || line.contains("Another device is running BitChat")
+            || line.starts_with("Scan timed out after")
+            || line.starts_with("Bluetooth mesh unavailable:")
             || line
                 == "Bluetooth mesh is offline. Join a Nostr geohash channel such as /j #ws, or wait for mesh discovery to finish."
             || line == "Bluetooth mesh is still offline. Nostr geohash channels are available with /j #ws."
