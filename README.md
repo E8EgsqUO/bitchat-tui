@@ -169,6 +169,17 @@ To disable file logging, set:
 BITCHAT_TUI_FILE_LOG=0
 ```
 
+`BITCHAT_TUI_FILE_LOG` only controls whether log files are written to disk.
+
+To enable verbose runtime/system debug messages in the TUI, set:
+
+```bash
+BITCHAT_DEBUG=1
+```
+
+`BITCHAT_DEBUG` is enabled for any non-empty value except `0`, `false`, `off`, or `no`.
+`BITCHT_DEBUG` (missing `A`) is not recognized.
+
 ## Notes
 
 - Mesh mode and geohash mode are both supported, but they are different transports.
