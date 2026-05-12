@@ -7,6 +7,30 @@ use tui_input::Input;
 use unicode_width::UnicodeWidthChar;
 
 const GEOHASH_ACTIVE_WINDOW_SECONDS: i64 = crate::nostr_geo::PRESENCE_ACTIVE_WINDOW_SECONDS;
+const COMPACT_FILE_NAME_MAX_CHARS: usize = 52;
+
+pub fn compact_file_message(file_name: &str) -> String {
+    format!(
+        "📎 {}",
+        compact_file_name(file_name, COMPACT_FILE_NAME_MAX_CHARS)
+    )
+}
+
+fn compact_file_name(file_name: &str, max_chars: usize) -> String {
+    let char_count = file_name.chars().count();
+    if char_count <= max_chars {
+        return file_name.to_string();
+    }
+
+    if max_chars <= 3 {
+        return "...".to_string();
+    }
+
+    let front_len = max_chars - 3;
+    let mut truncated: String = file_name.chars().take(front_len).collect();
+    truncated.push_str("...");
+    truncated
+}
 
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -578,8 +602,13 @@ impl App {
         let cleaned_message =
             String::from_utf8(strip_ansi_escapes::strip(&raw_message)).unwrap_or_default();
         let trimmed = cleaned_message.trim();
+        let debug_enabled = Self::debug_logs_enabled();
 
         if trimmed.is_empty() || trimmed.starts_with('>') || trimmed.starts_with("Â»") {
+            return;
+        }
+
+        if !debug_enabled && Self::should_suppress_noisy_line(trimmed) {
             return;
         }
 
@@ -628,6 +657,7 @@ impl App {
             if parts.len() >= 3 {
                 let local_id = parts[1];
                 let status = match parts[2] {
+                    "sent" => Some(MessageStatus::Delivered),
                     "delivered" => Some(MessageStatus::Delivered),
                     "read" => Some(MessageStatus::Read),
                     "failed" => Some(MessageStatus::Failed),
@@ -675,7 +705,7 @@ impl App {
             if parts.len() >= 3 {
                 let local_id = parts[1];
                 let status = match parts[2] {
-                    "sent" => Some(MessageStatus::None),
+                    "sent" => Some(MessageStatus::Delivered),
                     "delivered" => Some(MessageStatus::Delivered),
                     "read" => Some(MessageStatus::Read),
                     "failed" => Some(MessageStatus::Failed),
@@ -730,11 +760,7 @@ impl App {
                             file_size_bytes,
                         },
                     );
-                    let content = format!(
-                        "[file] {} ({}) - type /receive to accept",
-                        file_name,
-                        crate::command_handling::format_file_size(file_size_bytes)
-                    );
+                    let content = compact_file_message(&file_name);
                     let msg = Message {
                         sender,
                         sender_pubkey: Some(pubkey.clone()),
@@ -924,51 +950,47 @@ impl App {
             return;
         }
 
-        if Regex::new(r"^system: (.+)$").unwrap().is_match(trimmed) {
-            // For system messages, we need to preserve the original message with colors
-            // So we'll work with the original raw_message instead of the cleaned one
-            if let Some(captures_raw) = Regex::new(r"^system: (.+)$")
-                .unwrap()
-                .captures(&raw_message)
-            {
-                let content = captures_raw.get(1).unwrap().as_str().to_string();
-                let lines: Vec<&str> = content.split('\n').collect();
+        if let Some(content) = trimmed.strip_prefix("system:") {
+            let lines: Vec<&str> = content.split('\n').collect();
 
-                for line in lines {
-                    let trimmed_line = line.trim();
-                    if !trimmed_line.is_empty() {
-                        let msg = Message {
-                            sender: "system".to_string(),
-                            sender_pubkey: None,
-                            timestamp: chrono::Local::now().format("%H:%M").to_string(),
-                            content: trimmed_line.to_string(),
-                            is_self: false,
-                            status: MessageStatus::None,
-                            local_id: None,
-                        };
-
-                        // Check if we're in a DM conversation or channel conversation
-                        let (dm_target, channel_name) =
-                            self.current_conv.clone().unwrap_or((None, None));
-                        if let Some(target) = dm_target {
-                            // We're in a DM, add to DM messages
-                            self.dm_messages.entry(target).or_default().push(msg);
-                        } else if let Some(channel) = channel_name {
-                            // We're in a channel, add to channel messages
-                            self.channel_messages.entry(channel).or_default().push(msg);
-                        } else {
-                            // Fallback to current channel (shouldn't happen but just in case)
-                            let current_channel = self.get_selected_channel_name();
-                            self.channel_messages
-                                .entry(current_channel.clone())
-                                .or_default()
-                                .push(msg);
-                        }
-                    }
+            for line in lines {
+                let trimmed_line = line.trim();
+                if trimmed_line.is_empty() {
+                    continue;
                 }
-                self.scroll_to_bottom_current_conversation();
-                return;
+                let Some(content) = Self::filter_system_message_line(trimmed_line, debug_enabled)
+                else {
+                    continue;
+                };
+                let msg = Message {
+                    sender: "system".to_string(),
+                    sender_pubkey: None,
+                    timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                    content,
+                    is_self: false,
+                    status: MessageStatus::None,
+                    local_id: None,
+                };
+
+                // Check if we're in a DM conversation or channel conversation
+                let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
+                if let Some(target) = dm_target {
+                    // We're in a DM, add to DM messages
+                    self.dm_messages.entry(target).or_default().push(msg);
+                } else if let Some(channel) = channel_name {
+                    // We're in a channel, add to channel messages
+                    self.channel_messages.entry(channel).or_default().push(msg);
+                } else {
+                    // Fallback to current channel (shouldn't happen but just in case)
+                    let current_channel = self.get_selected_channel_name();
+                    self.channel_messages
+                        .entry(current_channel.clone())
+                        .or_default()
+                        .push(msg);
+                }
             }
+            self.scroll_to_bottom_current_conversation();
+            return;
         }
 
         if trimmed.contains(&self.nickname) {
@@ -1086,6 +1108,44 @@ impl App {
             MessageStatus::None => !matches!(next, MessageStatus::Sending),
             MessageStatus::Sending => true,
         }
+    }
+
+    fn debug_logs_enabled() -> bool {
+        std::env::var_os("BITCHAT_DEBUG").is_some()
+    }
+
+    fn should_suppress_noisy_line(line: &str) -> bool {
+        line.contains("Scanning for bitchat service")
+            || line.contains("Restarting Bluetooth mesh scan...")
+            || line
+                == "Bluetooth mesh is offline. Join a Nostr geohash channel such as /j #ws, or wait for mesh discovery to finish."
+            || line == "Bluetooth mesh is still offline. Nostr geohash channels are available with /j #ws."
+    }
+
+    fn filter_system_message_line(line: &str, debug_enabled: bool) -> Option<String> {
+        if debug_enabled {
+            return Some(line.to_string());
+        }
+
+        if Self::should_suppress_noisy_line(line) {
+            return None;
+        }
+
+        if line.contains("iOS only listens on those relays") {
+            if line.contains("Failed to send geohash DM") {
+                return Some(
+                    "Failed to send geohash DM. Check relay/network and retry.".to_string(),
+                );
+            }
+            if line.contains("Failed to send geohash message") {
+                return Some(
+                    "Failed to send geohash message. Check relay/network and retry.".to_string(),
+                );
+            }
+            return Some("Relay publish failed. Check relay/network and retry.".to_string());
+        }
+
+        Some(line.to_string())
     }
 
     pub fn add_dm_message(&mut self, target_nickname: String, content: String) {
@@ -1570,7 +1630,7 @@ mod tests {
 
         app.add_log_message("__GEO_DM_STATUS__:local-1:sent".to_string());
         let msg = app.dm_messages.get(&key).unwrap().first().unwrap();
-        assert_eq!(msg.status, MessageStatus::None);
+        assert_eq!(msg.status, MessageStatus::Delivered);
 
         app.add_log_message("__GEO_DM_STATUS__:local-1:delivered".to_string());
         let msg = app.dm_messages.get(&key).unwrap().first().unwrap();

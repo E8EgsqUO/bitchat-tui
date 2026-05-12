@@ -12,6 +12,17 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::app::{App, FocusArea, Message, MessageStatus};
 
+const TIME_DIVIDER_GAP_MINUTES: i32 = 15;
+const OTHER_MESSAGE_INDENT: usize = 4;
+const DM_OTHER_INDENT: usize = 2;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MessageRole {
+    System,
+    SelfUser,
+    Other,
+}
+
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -31,9 +42,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let (messages, dm_target, channel_name) = app.get_current_messages();
 
     // --- Header Rendering ---
-    let header_text = if let Some(user) = dm_target {
-        format!("Direct Message with {}", app.display_dm_target(&user))
-    } else if let Some(channel) = channel_name {
+    let header_text = if let Some(ref user) = dm_target {
+        format!("Direct Message with {}", app.display_dm_target(user))
+    } else if let Some(ref channel) = channel_name {
         if channel == "#public" {
             "Public Chat".to_string()
         } else if crate::nostr_geo::is_geohash_channel(&channel) {
@@ -72,7 +83,13 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     // --- Message Panel Rendering ---
     let messages_height = app.message_viewport_height;
-    let all_msg_items = render_message_lines(app, messages, messages_area.width);
+    let all_msg_items = render_message_lines(
+        app,
+        messages,
+        messages_area.width,
+        dm_target.as_deref(),
+        channel_name.as_deref(),
+    );
     let total_lines = all_msg_items.len();
     app.message_rendered_line_count = total_lines;
 
@@ -134,91 +151,97 @@ fn render_message_lines(
     app: &App,
     messages: &[Message],
     area_width: u16,
+    dm_target: Option<&str>,
+    channel_name: Option<&str>,
 ) -> Vec<ListItem<'static>> {
-    messages
-        .iter()
-        .flat_map(|msg| message_to_list_items(app, msg, area_width))
-        .collect()
-}
-
-fn message_to_list_items(app: &App, msg: &Message, area_width: u16) -> Vec<ListItem<'static>> {
-    let color = if msg.sender == "system" {
-        Color::White
-    } else if msg.is_self {
-        Color::Cyan
-    } else {
-        Color::LightGreen
-    };
-
-    let timestamp = format!("[{}]", msg.timestamp);
-    let sender_text = if let Some(pubkey) = &msg.sender_pubkey {
-        if let Some(channel) = app.current_geohash_context_channel() {
-            app.geohash_person_name_by_pubkey(&channel, pubkey)
-                .unwrap_or_else(|| App::short_pubkey(pubkey))
-        } else {
-            App::short_pubkey(pubkey)
-        }
-    } else {
-        msg.sender.clone()
-    };
-    let sender = format!("{}:", sender_text);
-    let timestamp_width = UnicodeWidthStr::width(timestamp.as_str());
-    let sender_width = UnicodeWidthStr::width(sender.as_str());
-    let prefix_width = timestamp_width + 1 + sender_width + 1;
     let available_width = area_width.saturating_sub(2) as usize;
-    let status_marker = message_status_marker(msg.status);
-    let status_reserve = status_marker
-        .as_ref()
-        .map(|(text, _)| UnicodeWidthStr::width(*text) + 1)
-        .unwrap_or_default();
-    let content_width = available_width
-        .saturating_sub(prefix_width + status_reserve)
-        .max(1);
-    let continuation_indent = " ".repeat(prefix_width.min(available_width.saturating_sub(1)));
+    let geohash_channel = channel_name
+        .filter(|channel| crate::nostr_geo::is_geohash_channel(channel))
+        .map(ToString::to_string)
+        .or_else(|| app.current_geohash_context_channel());
+    let is_dm = dm_target.is_some();
+    let last_self_idx = messages.iter().rposition(|msg| msg.is_self);
 
-    let wrapped_lines = wrap_display_width(&msg.content, content_width);
-    let last_idx = wrapped_lines.len().saturating_sub(1);
-    wrapped_lines
-        .into_iter()
-        .enumerate()
-        .map(|(idx, line_content)| {
-            let is_last_line = idx == last_idx;
-            if idx == 0 {
-                let mut spans = vec![
-                    Span::styled(timestamp.clone(), Style::default().fg(Color::DarkGray)),
-                    Span::raw(" "),
-                    Span::styled(
-                        sender.clone(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::raw(line_content),
-                ];
-                append_status_marker(
-                    &mut spans,
-                    status_marker,
-                    is_last_line,
-                    available_width,
-                    prefix_width,
-                );
-                ListItem::new(Line::from(spans))
+    let mut items = Vec::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        let prev = idx
+            .checked_sub(1)
+            .and_then(|prev_idx| messages.get(prev_idx));
+        let group_starts_here = is_group_start(app, messages, idx, geohash_channel.as_deref());
+        if should_insert_time_divider(prev, msg) {
+            items.push(centered_item(
+                msg.timestamp.clone(),
+                available_width,
+                Style::default().fg(Color::Gray),
+            ));
+        }
+
+        let role = message_role(msg);
+        let sender_display = resolved_sender(app, msg, geohash_channel.as_deref());
+        let show_sender_label = !is_dm && role == MessageRole::Other && group_starts_here;
+        let content_indent = if role == MessageRole::Other {
+            if is_dm {
+                DM_OTHER_INDENT
             } else {
-                let indent_width = UnicodeWidthStr::width(continuation_indent.as_str());
-                let mut spans = vec![
-                    Span::raw(continuation_indent.clone()),
-                    Span::raw(line_content),
-                ];
-                append_status_marker(
-                    &mut spans,
-                    status_marker,
-                    is_last_line,
-                    available_width,
-                    indent_width,
-                );
-                ListItem::new(Line::from(spans))
+                OTHER_MESSAGE_INDENT
             }
-        })
-        .collect()
+        } else {
+            0
+        };
+        if show_sender_label {
+            if idx > 0 {
+                items.push(empty_line_item());
+            }
+            items.push(render_aligned_message_line(
+                format!("{}:", sender_display),
+                role,
+                available_width,
+                None,
+                0,
+                true,
+                false,
+            ));
+        }
+        let body = format_message_body(msg, role);
+        let reserve_trailing_slot = is_dm && role != MessageRole::System;
+        let show_status = if role == MessageRole::SelfUser && Some(idx) == last_self_idx {
+            message_status_marker(msg.status)
+        } else {
+            None
+        };
+        let status_reserve = if reserve_trailing_slot { 2 } else { 0 };
+        let wrap_width = available_width
+            .saturating_sub(status_reserve)
+            .saturating_sub(content_indent)
+            .max(1);
+        let wrapped_lines = wrap_display_width(&body, wrap_width);
+        let last_line_idx = wrapped_lines.len().saturating_sub(1);
+
+        for (line_idx, wrapped) in wrapped_lines.into_iter().enumerate() {
+            let status = if line_idx == last_line_idx {
+                show_status
+            } else {
+                None
+            };
+            items.push(render_aligned_message_line(
+                wrapped,
+                role,
+                available_width,
+                status,
+                content_indent,
+                false,
+                reserve_trailing_slot && line_idx == last_line_idx,
+            ));
+        }
+
+        if role == MessageRole::SelfUser
+            && is_group_end(app, messages, idx, geohash_channel.as_deref())
+        {
+            items.push(separator_item(role, available_width));
+        }
+    }
+
+    items
 }
 
 fn message_status_marker(status: MessageStatus) -> Option<(&'static str, Style)> {
@@ -233,31 +256,218 @@ fn message_status_marker(status: MessageStatus) -> Option<(&'static str, Style)>
     }
 }
 
-fn append_status_marker(
-    spans: &mut Vec<Span<'static>>,
-    marker: Option<(&'static str, Style)>,
-    is_last_line: bool,
+fn render_aligned_message_line(
+    line: String,
+    role: MessageRole,
     available_width: usize,
-    prefix_width: usize,
-) {
-    let Some((text, style)) = marker else {
-        return;
+    status: Option<(&'static str, Style)>,
+    content_indent: usize,
+    is_sender_label: bool,
+    reserve_status_slot: bool,
+) -> ListItem<'static> {
+    let base_style = match role {
+        MessageRole::System => Style::default().fg(Color::Gray),
+        MessageRole::SelfUser => Style::default().fg(Color::LightGreen),
+        MessageRole::Other => {
+            if is_sender_label {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            }
+        }
     };
-    if !is_last_line {
-        return;
-    }
+    let line_width = UnicodeWidthStr::width(line.as_str());
 
-    let marker_width = UnicodeWidthStr::width(text);
-    let content_width = spans
-        .last()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .unwrap_or_default();
-    let current_width = prefix_width + content_width;
-    let padding_width = available_width.saturating_sub(current_width + marker_width);
-    if padding_width > 0 {
-        spans.push(Span::raw(" ".repeat(padding_width)));
+    match role {
+        _ if reserve_status_slot => {
+            let total_width = line_width.saturating_add(2);
+            let leading = match role {
+                MessageRole::SelfUser => available_width.saturating_sub(total_width),
+                MessageRole::Other => content_indent,
+                MessageRole::System => available_width.saturating_sub(total_width) / 2,
+            };
+            let mut spans = vec![Span::raw(" ".repeat(leading))];
+            spans.extend(content_spans_with_file_icon(line, base_style));
+            spans.push(Span::raw(" "));
+            if role == MessageRole::SelfUser {
+                if let Some((marker, marker_style)) = status {
+                    spans.push(Span::styled(marker, marker_style));
+                } else {
+                    spans.push(Span::raw(" "));
+                }
+            } else {
+                spans.push(Span::raw(" "));
+            }
+            ListItem::new(Line::from(spans))
+        }
+        _ => {
+            let leading = match role {
+                MessageRole::System => available_width.saturating_sub(line_width) / 2,
+                MessageRole::SelfUser => available_width.saturating_sub(line_width),
+                MessageRole::Other => content_indent,
+            };
+            let mut spans = vec![Span::raw(" ".repeat(leading))];
+            spans.extend(content_spans_with_file_icon(line, base_style));
+            ListItem::new(Line::from(spans))
+        }
     }
-    spans.push(Span::styled(text, style));
+}
+
+fn content_spans_with_file_icon(line: String, base_style: Style) -> Vec<Span<'static>> {
+    let Some((icon_idx, _)) = line.char_indices().find(|(_, ch)| *ch == '📎') else {
+        return vec![Span::styled(line, base_style)];
+    };
+
+    let icon_end = icon_idx + '📎'.len_utf8();
+    let before = &line[..icon_idx];
+    let after = &line[icon_end..];
+    let mut spans = Vec::new();
+    if !before.is_empty() {
+        spans.push(Span::styled(before.to_string(), base_style));
+    }
+    spans.push(Span::styled("📎", Style::default().fg(Color::Yellow)));
+    if !after.is_empty() {
+        spans.push(Span::styled(after.to_string(), base_style));
+    }
+    spans
+}
+
+fn centered_item(text: String, available_width: usize, style: Style) -> ListItem<'static> {
+    let text_width = UnicodeWidthStr::width(text.as_str());
+    let leading = available_width.saturating_sub(text_width) / 2;
+    ListItem::new(Line::from(vec![
+        Span::raw(" ".repeat(leading)),
+        Span::styled(text, style),
+    ]))
+}
+
+fn separator_item(role: MessageRole, available_width: usize) -> ListItem<'static> {
+    let line_width = (available_width / 3).max(8).min(available_width);
+    let leading = match role {
+        MessageRole::Other => 0,
+        MessageRole::SelfUser => available_width.saturating_sub(line_width),
+        MessageRole::System => available_width.saturating_sub(line_width) / 2,
+    };
+    let separator = "-".repeat(line_width);
+    ListItem::new(Line::from(vec![
+        Span::raw(" ".repeat(leading)),
+        Span::styled(
+            separator,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+    ]))
+}
+
+fn empty_line_item() -> ListItem<'static> {
+    ListItem::new(Line::from(Span::raw(String::new())))
+}
+
+fn format_message_body(msg: &Message, role: MessageRole) -> String {
+    match role {
+        MessageRole::System | MessageRole::SelfUser | MessageRole::Other => msg.content.clone(),
+    }
+}
+
+fn resolved_sender(app: &App, msg: &Message, geohash_channel: Option<&str>) -> String {
+    if let Some(pubkey) = &msg.sender_pubkey {
+        if let Some(channel) = geohash_channel {
+            return app
+                .geohash_person_name_by_pubkey(channel, pubkey)
+                .unwrap_or_else(|| App::short_pubkey(pubkey));
+        }
+        return App::short_pubkey(pubkey);
+    }
+    msg.sender.clone()
+}
+
+fn message_role(message: &Message) -> MessageRole {
+    if message.sender == "system" {
+        MessageRole::System
+    } else if message.is_self {
+        MessageRole::SelfUser
+    } else {
+        MessageRole::Other
+    }
+}
+
+fn message_group_key(app: &App, message: &Message, geohash_channel: Option<&str>) -> String {
+    match message_role(message) {
+        MessageRole::System => "system".to_string(),
+        MessageRole::SelfUser => "self".to_string(),
+        MessageRole::Other => {
+            if let Some(pubkey) = &message.sender_pubkey {
+                if let Some(channel) = geohash_channel {
+                    if let Some(name) = app.geohash_person_name_by_pubkey(channel, pubkey) {
+                        return format!("other:{name}:{pubkey}");
+                    }
+                }
+                return format!("other:{pubkey}");
+            }
+            format!("other:{}", message.sender)
+        }
+    }
+}
+
+fn is_group_end(
+    app: &App,
+    messages: &[Message],
+    index: usize,
+    geohash_channel: Option<&str>,
+) -> bool {
+    let Some(current) = messages.get(index) else {
+        return false;
+    };
+    let Some(next) = messages.get(index + 1) else {
+        return true;
+    };
+    message_group_key(app, current, geohash_channel)
+        != message_group_key(app, next, geohash_channel)
+}
+
+fn is_group_start(
+    app: &App,
+    messages: &[Message],
+    index: usize,
+    geohash_channel: Option<&str>,
+) -> bool {
+    let Some(current) = messages.get(index) else {
+        return false;
+    };
+    let Some(previous) = index.checked_sub(1).and_then(|prev| messages.get(prev)) else {
+        return true;
+    };
+    message_group_key(app, current, geohash_channel)
+        != message_group_key(app, previous, geohash_channel)
+}
+
+fn should_insert_time_divider(previous: Option<&Message>, current: &Message) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    let Some(prev_minutes) = parse_timestamp_minutes(&previous.timestamp) else {
+        return true;
+    };
+    let Some(curr_minutes) = parse_timestamp_minutes(&current.timestamp) else {
+        return true;
+    };
+
+    let mut delta = curr_minutes - prev_minutes;
+    if delta < 0 {
+        delta += 24 * 60;
+    }
+    delta > TIME_DIVIDER_GAP_MINUTES
+}
+
+fn parse_timestamp_minutes(value: &str) -> Option<i32> {
+    let (hour, minute) = value.split_once(':')?;
+    let hour = hour.parse::<i32>().ok()?;
+    let minute = minute.parse::<i32>().ok()?;
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) {
+        return None;
+    }
+    Some(hour * 60 + minute)
 }
 
 fn wrap_display_width(text: &str, max_width: usize) -> Vec<String> {
@@ -320,23 +530,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wraps_long_messages_into_visual_lines() {
-        let app = App::new_with_nickname("me".to_string());
-        let message = Message {
-            sender: "bot".to_string(),
+    fn wraps_wide_characters_by_display_width() {
+        assert_eq!(wrap_display_width("你好世界", 4), vec!["你好", "世界"]);
+    }
+
+    #[test]
+    fn inserts_time_divider_for_first_message_and_large_gap() {
+        let first = Message {
+            sender: "alice".to_string(),
             sender_pubkey: None,
-            timestamp: "12:00".to_string(),
-            content: "one two three four five six seven".to_string(),
+            timestamp: "10:00".to_string(),
+            content: "hello".to_string(),
             is_self: false,
             status: MessageStatus::None,
             local_id: None,
         };
+        let second = Message {
+            timestamp: "10:10".to_string(),
+            ..first.clone()
+        };
+        let third = Message {
+            timestamp: "10:31".to_string(),
+            ..first.clone()
+        };
 
-        assert!(message_to_list_items(&app, &message, 24).len() > 1);
+        assert!(should_insert_time_divider(None, &first));
+        assert!(!should_insert_time_divider(Some(&first), &second));
+        assert!(should_insert_time_divider(Some(&second), &third));
     }
 
     #[test]
-    fn wraps_wide_characters_by_display_width() {
-        assert_eq!(wrap_display_width("你好世界", 4), vec!["你好", "世界"]);
+    fn detects_group_end_only_when_sender_changes() {
+        let app = App::new_with_nickname("me".to_string());
+        let messages = vec![
+            Message {
+                sender: "alice".to_string(),
+                sender_pubkey: None,
+                timestamp: "10:00".to_string(),
+                content: "a".to_string(),
+                is_self: false,
+                status: MessageStatus::None,
+                local_id: None,
+            },
+            Message {
+                sender: "alice".to_string(),
+                sender_pubkey: None,
+                timestamp: "10:01".to_string(),
+                content: "b".to_string(),
+                is_self: false,
+                status: MessageStatus::None,
+                local_id: None,
+            },
+            Message {
+                sender: "me".to_string(),
+                sender_pubkey: None,
+                timestamp: "10:02".to_string(),
+                content: "c".to_string(),
+                is_self: true,
+                status: MessageStatus::None,
+                local_id: None,
+            },
+        ];
+
+        assert!(!is_group_end(&app, &messages, 0, None));
+        assert!(is_group_end(&app, &messages, 1, None));
+        assert!(is_group_end(&app, &messages, 2, None));
     }
 }

@@ -280,8 +280,35 @@ fn queue_geohash_dm_send(
     my_peer_id: String,
     sender_nickname: String,
 ) {
+    queue_geohash_dm_send_with_display(
+        app,
+        nostr_geo_client,
+        ui_tx,
+        channel,
+        target_label,
+        recipient_pubkey,
+        message,
+        None,
+        my_peer_id,
+        sender_nickname,
+    );
+}
+
+fn queue_geohash_dm_send_with_display(
+    app: &mut App,
+    nostr_geo_client: nostr_geo::NostrGeoClient,
+    ui_tx: mpsc::Sender<String>,
+    channel: String,
+    target_label: String,
+    recipient_pubkey: String,
+    message: String,
+    display_message: Option<String>,
+    my_peer_id: String,
+    sender_nickname: String,
+) {
     let message_id = Uuid::new_v4().to_string();
-    app.add_pending_geohash_dm_message(message.clone(), message_id.clone());
+    let display = display_message.unwrap_or_else(|| message.clone());
+    app.add_pending_geohash_dm_message(display, message_id.clone());
     write_debug_log(&format!(
         "Queued geohash DM: channel={}, target={}, recipient={}, message={}",
         channel,
@@ -1602,53 +1629,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &transfer.file_name,
                             transfer.file_size,
                         );
-                        let nostr_geo_client = nostr_geo_client.clone();
-                        let offer_ui_tx = ui_tx.clone();
-                        let channel = geohash_channel.clone();
-                        let target_nickname = target_label.clone();
-                        let my_peer_id = my_peer_id.clone();
-                        let sender_nickname = nickname.clone();
-                        let code_for_log = transfer.code.clone();
-                        tokio::spawn(async move {
-                            let message_id = Uuid::new_v4().to_string();
-                            if let Err(e) = nostr_geo_client
-                                .send_private_message(
-                                    &channel,
-                                    &recipient_pubkey,
-                                    &offer_msg,
-                                    &my_peer_id,
-                                    &sender_nickname,
-                                    &message_id,
-                                )
-                                .await
-                            {
-                                let _ = offer_ui_tx
-                                    .send(format!(
-                                        "system: Failed to send file offer to {}: {}",
-                                        target_nickname, e
-                                    ))
-                                    .await;
-                            }
-                        });
+                        queue_geohash_dm_send_with_display(
+                            &mut app,
+                            nostr_geo_client.clone(),
+                            ui_tx.clone(),
+                            geohash_channel.clone(),
+                            target_label.clone(),
+                            recipient_pubkey.clone(),
+                            offer_msg,
+                            Some(crate::tui::app::compact_file_message(&file_name)),
+                            my_peer_id.clone(),
+                            nickname.clone(),
+                        );
 
-                        app.add_log_message(format!(
-                            "system: Wormhole offer {} sent to {}. Type /receive in the same geohash DM to accept.",
-                            code_for_log, target_label
-                        ));
                         let transfer_ui_tx = ui_tx.clone();
+                        let code_for_log = transfer.code.clone();
+                        let sent_file_name = file_name.clone();
                         tokio::spawn(async move {
                             if let Err(e) = wormhole_transfer::send_file(transfer).await {
                                 let _ = transfer_ui_tx
                                     .send(format!(
-                                        "system: Wormhole transfer {} failed: {}",
-                                        code_for_log, e
+                                        "system: File transfer failed: {}",
+                                        sanitize_status_field(&e.to_string())
                                     ))
                                     .await;
-                            } else {
+                            } else if std::env::var_os("BITCHAT_DEBUG").is_some() {
                                 let _ = ui_tx
                                     .send(format!(
-                                        "system: Wormhole transfer {} completed.",
-                                        code_for_log
+                                        "system: Wormhole send complete: {} ({})",
+                                        sent_file_name, code_for_log
                                     ))
                                     .await;
                             }
@@ -1677,19 +1686,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     };
                     app.add_log_message(format!(
-                        "system: Accepted file offer for {} ({}). Receiving with Wormhole code {}...",
-                        offer.file_name,
-                        command_handling::format_file_size(offer.file_size_bytes),
-                        offer.code
+                        "system: Receiving {}",
+                        crate::tui::app::compact_file_message(&offer.file_name)
                     ));
                     let receive_ui_tx = ui_tx.clone();
                     let code_for_log = offer.code.clone();
+                    let receive_file_name = offer.file_name.clone();
                     tokio::spawn(async move {
                         match wormhole_transfer::receive_file(&offer.code).await {
                             Ok(path) => {
                                 let _ = receive_ui_tx
                                     .send(format!(
-                                        "system: Saved incoming file to {}",
+                                        "system: Saved {} to {}",
+                                        receive_file_name,
                                         path.display()
                                     ))
                                     .await;
@@ -1697,8 +1706,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Err(e) => {
                                 let _ = receive_ui_tx
                                     .send(format!(
-                                        "system: Wormhole receive {} failed: {}",
-                                        code_for_log, e
+                                        "system: Receive failed ({}): {}",
+                                        code_for_log,
+                                        sanitize_status_field(&e.to_string())
                                     ))
                                     .await;
                             }

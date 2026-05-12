@@ -996,7 +996,7 @@ pub async fn handle_file_command(
     .await
     {
         Ok(()) => {
-            let display = format!("[file] {} ({})", file_name, format_file_size(file_size));
+            let display = crate::tui::app::compact_file_message(file_name);
             if let Some(target_nickname) = recipient_nickname {
                 app.add_dm_message(target_nickname.clone(), display);
                 app.add_log_message(format!("system: Sent file to {}", target_nickname));
