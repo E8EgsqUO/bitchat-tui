@@ -83,13 +83,14 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     // --- Message Panel Rendering ---
     let messages_height = app.message_viewport_height;
-    let all_msg_items = render_message_lines(
+    let (all_msg_items, unseen_divider_line_index) = render_message_lines(
         app,
         messages,
         messages_area.width,
         dm_target.as_deref(),
         channel_name.as_deref(),
     );
+    app.unseen_divider_line_index = unseen_divider_line_index;
     let total_lines = all_msg_items.len();
     app.message_rendered_line_count = total_lines;
 
@@ -153,7 +154,7 @@ fn render_message_lines(
     area_width: u16,
     dm_target: Option<&str>,
     channel_name: Option<&str>,
-) -> Vec<ListItem<'static>> {
+) -> (Vec<ListItem<'static>>, Option<usize>) {
     let available_width = area_width.saturating_sub(2) as usize;
     let geohash_channel = channel_name
         .filter(|channel| crate::nostr_geo::is_geohash_channel(channel))
@@ -161,16 +162,25 @@ fn render_message_lines(
         .or_else(|| app.current_geohash_context_channel());
     let is_dm = dm_target.is_some();
     let last_self_idx = messages.iter().rposition(|msg| msg.is_self);
+    let unseen_divider_idx = app
+        .unseen_divider_message_index
+        .filter(|_| app.msg_scroll > 0);
 
     let mut items = Vec::new();
+    let mut unseen_divider_line_index = None;
     for (idx, msg) in messages.iter().enumerate() {
+        if Some(idx) == unseen_divider_idx {
+            unseen_divider_line_index = Some(items.len());
+            items.push(new_messages_divider_item(available_width));
+        }
         let prev = idx
             .checked_sub(1)
             .and_then(|prev_idx| messages.get(prev_idx));
         let group_starts_here = is_group_start(app, messages, idx, geohash_channel.as_deref());
         if should_insert_time_divider(prev, msg) {
+            let time_label = app.format_timestamp_for_display(msg, prev);
             items.push(centered_item(
-                msg.timestamp.clone(),
+                time_label,
                 available_width,
                 Style::default().fg(Color::Gray),
             ));
@@ -241,7 +251,7 @@ fn render_message_lines(
         }
     }
 
-    items
+    (items, unseen_divider_line_index)
 }
 
 fn message_status_marker(status: MessageStatus) -> Option<(&'static str, Style)> {
@@ -360,6 +370,29 @@ fn separator_item(role: MessageRole, available_width: usize) -> ListItem<'static
     ]))
 }
 
+fn new_messages_divider_item(available_width: usize) -> ListItem<'static> {
+    let label = " New Messages ";
+    let label_width = UnicodeWidthStr::width(label);
+    let min_dash_each_side = 3usize;
+    if available_width <= label_width + min_dash_each_side * 2 {
+        let text = "-".repeat((available_width / 3).max(8).min(available_width));
+        return centered_item(
+            text,
+            available_width,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        );
+    }
+
+    let total_dash = available_width.saturating_sub(label_width);
+    let left_dash = total_dash / 2;
+    let right_dash = total_dash.saturating_sub(left_dash);
+    let line = format!("{}{}{}", "-".repeat(left_dash), label, "-".repeat(right_dash));
+    ListItem::new(Line::from(Span::styled(
+        line,
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )))
+}
+
 fn empty_line_item() -> ListItem<'static> {
     ListItem::new(Line::from(Span::raw(String::new())))
 }
@@ -453,11 +486,15 @@ fn should_insert_time_divider(previous: Option<&Message>, current: &Message) -> 
         return true;
     };
 
-    let mut delta = curr_minutes - prev_minutes;
-    if delta < 0 {
-        delta += 24 * 60;
+    if curr_minutes >= prev_minutes {
+        return (curr_minutes - prev_minutes) > TIME_DIVIDER_GAP_MINUTES;
     }
-    delta > TIME_DIVIDER_GAP_MINUTES
+
+    // Handle cross-midnight rollover (e.g. 23:58 -> 00:14), but avoid
+    // treating random out-of-order messages as a large forward jump.
+    let rollover_delta = curr_minutes + (24 * 60 - prev_minutes);
+    let looks_like_midnight_rollover = prev_minutes >= (20 * 60) && curr_minutes <= (4 * 60);
+    looks_like_midnight_rollover && rollover_delta > TIME_DIVIDER_GAP_MINUTES
 }
 
 fn parse_timestamp_minutes(value: &str) -> Option<i32> {
@@ -540,6 +577,7 @@ mod tests {
             sender: "alice".to_string(),
             sender_pubkey: None,
             timestamp: "10:00".to_string(),
+            timestamp_epoch: None,
             content: "hello".to_string(),
             is_self: false,
             status: MessageStatus::None,
@@ -560,6 +598,48 @@ mod tests {
     }
 
     #[test]
+    fn avoids_false_time_divider_on_out_of_order_timestamps() {
+        let older = Message {
+            sender: "alice".to_string(),
+            sender_pubkey: None,
+            timestamp: "22:22".to_string(),
+            timestamp_epoch: None,
+            content: "newer packet".to_string(),
+            is_self: false,
+            status: MessageStatus::None,
+            local_id: None,
+        };
+        let out_of_order = Message {
+            timestamp: "21:23".to_string(),
+            content: "late packet".to_string(),
+            ..older.clone()
+        };
+
+        assert!(!should_insert_time_divider(Some(&older), &out_of_order));
+    }
+
+    #[test]
+    fn still_shows_divider_for_short_cross_midnight_rollover() {
+        let prev = Message {
+            sender: "alice".to_string(),
+            sender_pubkey: None,
+            timestamp: "23:58".to_string(),
+            timestamp_epoch: None,
+            content: "before midnight".to_string(),
+            is_self: false,
+            status: MessageStatus::None,
+            local_id: None,
+        };
+        let curr = Message {
+            timestamp: "00:14".to_string(),
+            content: "after midnight".to_string(),
+            ..prev.clone()
+        };
+
+        assert!(should_insert_time_divider(Some(&prev), &curr));
+    }
+
+    #[test]
     fn detects_group_end_only_when_sender_changes() {
         let app = App::new_with_nickname("me".to_string());
         let messages = vec![
@@ -567,6 +647,7 @@ mod tests {
                 sender: "alice".to_string(),
                 sender_pubkey: None,
                 timestamp: "10:00".to_string(),
+                timestamp_epoch: None,
                 content: "a".to_string(),
                 is_self: false,
                 status: MessageStatus::None,
@@ -576,6 +657,7 @@ mod tests {
                 sender: "alice".to_string(),
                 sender_pubkey: None,
                 timestamp: "10:01".to_string(),
+                timestamp_epoch: None,
                 content: "b".to_string(),
                 is_self: false,
                 status: MessageStatus::None,
@@ -585,6 +667,7 @@ mod tests {
                 sender: "me".to_string(),
                 sender_pubkey: None,
                 timestamp: "10:02".to_string(),
+                timestamp_epoch: None,
                 content: "c".to_string(),
                 is_self: true,
                 status: MessageStatus::None,

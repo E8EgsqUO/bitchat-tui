@@ -754,11 +754,12 @@ async fn handle_relay_text(
         .single()
         .unwrap_or_else(Local::now);
     let structured = format!(
-        "__CHANNEL__:{}:{}:{}:{}:{}",
+        "__CHANNEL__:{}:{}:{}:{}:{}:{}",
         channel,
         sender,
         event.pubkey,
         timestamp.format("%H%M"),
+        event.created_at,
         event.content
     );
     write_nostr_debug_log(&format!(
@@ -1002,11 +1003,12 @@ async fn handle_private_text_event(
         .single()
         .unwrap_or_else(Local::now);
     let structured = format!(
-        "__GEO_DM__:{}:{}:{}:{}:{}:{}",
+        "__GEO_DM__:{}:{}:{}:{}:{}:{}:{}",
         channel,
         sender,
         sender_pubkey,
         timestamp.format("%H%M"),
+        timestamp.timestamp(),
         sanitize_display_field(&message_id),
         content
     );

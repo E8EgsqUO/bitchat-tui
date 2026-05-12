@@ -364,11 +364,13 @@ pub async fn handle_file_transfer_packet(
 
     let content = format!("{}{}", prefix, destination.to_string_lossy());
     let timestamp = chrono::Local::now();
+    let timestamp_epoch = timestamp.timestamp();
     let structured_msg = if !is_broadcast {
         format!(
-            "__DM__:{}:{}:{}",
+            "__DM__:{}:{}:{}:{}",
             sender_nick,
             timestamp.format("%H%M"),
+            timestamp_epoch,
             content
         )
     } else {
@@ -378,10 +380,11 @@ pub async fn handle_file_transfer_packet(
             .filter(|channel| channel.starts_with('#'))
             .unwrap_or("#public");
         format!(
-            "__CHANNEL__:{}:{}:{}:{}",
+            "__CHANNEL__:{}:{}:{}:{}:{}",
             channel,
             sender_nick,
             timestamp.format("%H%M"),
+            timestamp_epoch,
             content
         )
     };
@@ -722,6 +725,7 @@ pub async fn handle_message_packet(
             };
 
             let timestamp = chrono::Local::now();
+            let timestamp_epoch = timestamp.timestamp();
 
             if is_private_message {
                 if display_content.starts_with(COVER_TRAFFIC_PREFIX) {
@@ -742,9 +746,10 @@ pub async fn handle_message_packet(
 
                 // Send structured message for TUI to parse
                 let structured_msg = format!(
-                    "__DM__:{}:{}:{}",
+                    "__DM__:{}:{}:{}:{}",
                     sender_nick,
                     timestamp.format("%H%M"),
+                    timestamp_epoch,
                     display_content
                 );
                 let _ = ui_tx.send(structured_msg).await;
@@ -765,10 +770,11 @@ pub async fn handle_message_packet(
                 // Send structured message for TUI to parse
                 let channel_key = channel_name.unwrap_or("#public");
                 let structured_msg = format!(
-                    "__CHANNEL__:{}:{}:{}:{}",
+                    "__CHANNEL__:{}:{}:{}:{}:{}",
                     channel_key,
                     sender_nick,
                     timestamp.format("%H%M"),
+                    timestamp_epoch,
                     display_content
                 );
                 let _ = ui_tx.send(structured_msg).await;
@@ -854,10 +860,12 @@ pub async fn handle_message_packet(
                         });
 
                     let timestamp = chrono::Local::now();
+                    let timestamp_epoch = timestamp.timestamp();
                     let structured_msg = format!(
-                        "__CHANNEL__:#public:{}:{}:{}",
+                        "__CHANNEL__:#public:{}:{}:{}:{}",
                         sender_nick,
                         timestamp.format("%H%M"),
+                        timestamp_epoch,
                         content
                     );
                     let _ = ui_tx.send(structured_msg).await;
@@ -1016,23 +1024,26 @@ pub async fn handle_fragment_packet(
                             }
 
                             let timestamp = chrono::Local::now();
+                            let timestamp_epoch = timestamp.timestamp();
 
                             // Send structured message for TUI to parse
                             if is_private_message {
                                 let structured_msg = format!(
-                                    "__DM__:{}:{}:{}",
+                                    "__DM__:{}:{}:{}:{}",
                                     sender_nick,
                                     timestamp.format("%H%M"),
+                                    timestamp_epoch,
                                     message.content
                                 );
                                 let _ = ui_tx.send(structured_msg).await;
                             } else {
                                 let channel_key = message.channel.as_deref().unwrap_or("#public");
                                 let structured_msg = format!(
-                                    "__CHANNEL__:{}:{}:{}:{}",
+                                    "__CHANNEL__:{}:{}:{}:{}:{}",
                                     channel_key,
                                     sender_nick,
                                     timestamp.format("%H%M"),
+                                    timestamp_epoch,
                                     message.content
                                 );
                                 let _ = ui_tx.send(structured_msg).await;
@@ -1073,10 +1084,12 @@ pub async fn handle_fragment_packet(
                                     });
 
                                 let timestamp = chrono::Local::now();
+                                let timestamp_epoch = timestamp.timestamp();
                                 let structured_msg = format!(
-                                    "__CHANNEL__:#public:{}:{}:{}",
+                                    "__CHANNEL__:#public:{}:{}:{}:{}",
                                     sender_nick,
                                     timestamp.format("%H%M"),
+                                    timestamp_epoch,
                                     content
                                 );
                                 let _ = ui_tx.send(structured_msg).await;
@@ -2080,14 +2093,16 @@ pub async fn handle_noise_encrypted_message(
                                 }
 
                                 let timestamp = chrono::Local::now();
+                                let timestamp_epoch = timestamp.timestamp();
                                 chat_context.last_private_sender =
                                     Some((packet.sender_id_str.clone(), sender_nick.clone()));
                                 chat_context.add_dm(&sender_nick, &packet.sender_id_str);
 
                                 let structured_msg = format!(
-                                    "__DM__:{}:{}:{}",
+                                    "__DM__:{}:{}:{}:{}",
                                     sender_nick,
                                     timestamp.format("%H%M"),
+                                    timestamp_epoch,
                                     content
                                 );
                                 let _ = ui_tx.send(structured_msg).await;
@@ -2325,6 +2340,7 @@ async fn handle_decrypted_message(
         };
 
         let timestamp = chrono::Local::now();
+        let timestamp_epoch = timestamp.timestamp();
 
         // This is a private message since it was Noise-encrypted
         chat_context.last_private_sender =
@@ -2333,9 +2349,10 @@ async fn handle_decrypted_message(
 
         // Send structured message for TUI
         let structured_msg = format!(
-            "__DM__:{}:{}:{}",
+            "__DM__:{}:{}:{}:{}",
             message.sender,
             timestamp.format("%H%M"),
+            timestamp_epoch,
             display_content
         );
         let _ = ui_tx.send(structured_msg).await;

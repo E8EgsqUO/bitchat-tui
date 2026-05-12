@@ -1,6 +1,6 @@
 // src/tui/app.rs
 
-use chrono;
+use chrono::{Local, TimeZone};
 use regex::Regex;
 use std::collections::HashMap;
 use tui_input::Input;
@@ -49,6 +49,7 @@ pub struct Message {
     pub sender: String,
     pub sender_pubkey: Option<String>,
     pub timestamp: String,
+    pub timestamp_epoch: Option<i64>,
     pub content: String,
     pub is_self: bool,
     pub status: MessageStatus,
@@ -131,6 +132,8 @@ pub struct App {
     pub msg_scroll: usize,
     pub message_viewport_height: usize, // ADDED: To store the height of the message panel
     pub message_rendered_line_count: usize,
+    pub unseen_divider_message_index: Option<usize>,
+    pub unseen_divider_line_index: Option<usize>,
 
     // Data state for rendering
     pub nickname: String,
@@ -198,6 +201,8 @@ impl App {
             msg_scroll: 0,
             message_viewport_height: 10, // ADDED: Default value
             message_rendered_line_count: 0,
+            unseen_divider_message_index: None,
+            unseen_divider_line_index: None,
             nickname,
             network_name: "BitChat Mesh".to_string(),
             connected: false,
@@ -610,6 +615,44 @@ impl App {
         (messages, None, Some(ch))
     }
 
+    fn parse_display_and_epoch(
+        timestamp_hhmm: &str,
+        timestamp_epoch_raw: Option<&str>,
+    ) -> (String, Option<i64>) {
+        let display = if timestamp_hhmm.len() == 4 {
+            format!("{}:{}", &timestamp_hhmm[0..2], &timestamp_hhmm[2..4])
+        } else {
+            timestamp_hhmm.to_string()
+        };
+        let epoch = timestamp_epoch_raw.and_then(|raw| raw.parse::<i64>().ok());
+        (display, epoch)
+    }
+
+    pub fn format_timestamp_for_display(
+        &self,
+        message: &Message,
+        previous: Option<&Message>,
+    ) -> String {
+        let Some(current_epoch) = message.timestamp_epoch else {
+            return message.timestamp.clone();
+        };
+        let Some(current_dt) = Local.timestamp_opt(current_epoch, 0).single() else {
+            return message.timestamp.clone();
+        };
+
+        let previous_same_day = previous
+            .and_then(|m| m.timestamp_epoch)
+            .and_then(|epoch| Local.timestamp_opt(epoch, 0).single())
+            .map(|prev_dt| prev_dt.date_naive() == current_dt.date_naive())
+            .unwrap_or(true);
+
+        if previous_same_day {
+            current_dt.format("%H:%M").to_string()
+        } else {
+            current_dt.format("%m-%d %H:%M").to_string()
+        }
+    }
+
     pub fn add_log_message(&mut self, raw_message: String) {
         let cleaned_message =
             String::from_utf8(strip_ansi_escapes::strip(&raw_message)).unwrap_or_default();
@@ -625,16 +668,19 @@ impl App {
         }
 
         if trimmed.starts_with("__DM__:") {
-            let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
+            let parts: Vec<&str> = trimmed.splitn(5, ':').collect();
             if parts.len() >= 4 {
                 let sender = parts[1].to_string();
-                let timestamp_raw = parts[2].to_string();
-                let content = parts[3].to_string();
-
-                let timestamp = if timestamp_raw.len() == 4 {
-                    format!("{}:{}", &timestamp_raw[0..2], &timestamp_raw[2..4])
+                let timestamp_raw = parts[2];
+                let (timestamp, timestamp_epoch) = if parts.len() >= 5 {
+                    Self::parse_display_and_epoch(timestamp_raw, parts.get(3).copied())
                 } else {
-                    timestamp_raw
+                    Self::parse_display_and_epoch(timestamp_raw, None)
+                };
+                let content = if parts.len() >= 5 {
+                    parts[4].to_string()
+                } else {
+                    parts[3].to_string()
                 };
 
                 let sender_clone = sender.clone();
@@ -642,6 +688,7 @@ impl App {
                     sender,
                     sender_pubkey: None,
                     timestamp,
+                    timestamp_epoch,
                     content,
                     is_self: false,
                     status: MessageStatus::None,
@@ -659,7 +706,7 @@ impl App {
                     self.add_unread_message(dm_key);
                 }
 
-                self.scroll_to_bottom_current_conversation();
+                self.follow_or_mark_new_message();
                 return;
             }
         }
@@ -738,26 +785,33 @@ impl App {
         }
 
         if trimmed.starts_with("__GEO_DM__:") {
-            let parts: Vec<&str> = trimmed.splitn(7, ':').collect();
+            let parts: Vec<&str> = trimmed.splitn(8, ':').collect();
             if parts.len() >= 7 {
                 let channel = parts[1].to_string();
                 let sender = parts[2].to_string();
                 let pubkey = parts[3].to_string();
-                let timestamp_raw = parts[4].to_string();
-                let message_id = parts[5].to_string();
-                let content = parts[6].to_string();
+                let timestamp_raw = parts[4];
+                let (timestamp, timestamp_epoch) = if parts.len() >= 8 {
+                    Self::parse_display_and_epoch(timestamp_raw, parts.get(5).copied())
+                } else {
+                    Self::parse_display_and_epoch(timestamp_raw, None)
+                };
+                let message_id = if parts.len() >= 8 {
+                    parts[6].to_string()
+                } else {
+                    parts[5].to_string()
+                };
+                let content = if parts.len() >= 8 {
+                    parts[7].to_string()
+                } else {
+                    parts[6].to_string()
+                };
 
                 if !self.channels.contains(&channel) {
                     self.channels.push(channel.clone());
                 }
                 self.note_geohash_presence(&channel, &pubkey, chrono::Local::now().timestamp());
                 self.add_geohash_person(&channel, &sender, Some(&pubkey));
-
-                let timestamp = if timestamp_raw.len() == 4 {
-                    format!("{}:{}", &timestamp_raw[0..2], &timestamp_raw[2..4])
-                } else {
-                    timestamp_raw
-                };
 
                 let target_key = Self::geohash_dm_pubkey_key(&channel, &pubkey);
                 if let Some((code, file_name, file_size_bytes)) =
@@ -777,6 +831,7 @@ impl App {
                         sender,
                         sender_pubkey: Some(pubkey.clone()),
                         timestamp,
+                        timestamp_epoch,
                         content,
                         is_self: false,
                         status: MessageStatus::None,
@@ -791,7 +846,7 @@ impl App {
                     {
                         self.add_unread_message(format!("dm:{}", target_key));
                     }
-                    self.scroll_to_bottom_current_conversation();
+                    self.follow_or_mark_new_message();
                     return;
                 }
 
@@ -799,6 +854,7 @@ impl App {
                     sender,
                     sender_pubkey: Some(pubkey),
                     timestamp,
+                    timestamp_epoch,
                     content,
                     is_self: false,
                     status: MessageStatus::None,
@@ -814,17 +870,26 @@ impl App {
                     self.add_unread_message(format!("dm:{}", target_key));
                 }
 
-                self.scroll_to_bottom_current_conversation();
+                self.follow_or_mark_new_message();
                 return;
             }
 
-            let parts: Vec<&str> = trimmed.splitn(6, ':').collect();
+            let parts: Vec<&str> = trimmed.splitn(7, ':').collect();
             if parts.len() >= 6 {
                 let channel = parts[1].to_string();
                 let sender = parts[2].to_string();
                 let pubkey = parts[3].to_string();
-                let timestamp_raw = parts[4].to_string();
-                let content = parts[5].to_string();
+                let timestamp_raw = parts[4];
+                let (timestamp, timestamp_epoch) = if parts.len() >= 7 {
+                    Self::parse_display_and_epoch(timestamp_raw, parts.get(5).copied())
+                } else {
+                    Self::parse_display_and_epoch(timestamp_raw, None)
+                };
+                let content = if parts.len() >= 7 {
+                    parts[6].to_string()
+                } else {
+                    parts[5].to_string()
+                };
 
                 if !self.channels.contains(&channel) {
                     self.channels.push(channel.clone());
@@ -832,17 +897,12 @@ impl App {
                 self.note_geohash_presence(&channel, &pubkey, chrono::Local::now().timestamp());
                 self.add_geohash_person(&channel, &sender, Some(&pubkey));
 
-                let timestamp = if timestamp_raw.len() == 4 {
-                    format!("{}:{}", &timestamp_raw[0..2], &timestamp_raw[2..4])
-                } else {
-                    timestamp_raw
-                };
-
                 let target_key = Self::geohash_dm_pubkey_key(&channel, &pubkey);
                 let msg = Message {
                     sender,
                     sender_pubkey: Some(pubkey),
                     timestamp,
+                    timestamp_epoch,
                     content,
                     is_self: false,
                     status: MessageStatus::None,
@@ -858,27 +918,41 @@ impl App {
                     self.add_unread_message(format!("dm:{}", target_key));
                 }
 
-                self.scroll_to_bottom_current_conversation();
+                self.follow_or_mark_new_message();
                 return;
             }
         }
 
         if trimmed.starts_with("__CHANNEL__:") {
-            let parts: Vec<&str> = trimmed.splitn(6, ':').collect();
+            let parts: Vec<&str> = trimmed.splitn(7, ':').collect();
             if parts.len() >= 5 {
                 let channel = parts[1].to_string();
                 let sender = parts[2].to_string();
                 let has_pubkey = parts.len() >= 6 && crate::nostr_geo::is_geohash_channel(&channel);
                 let sender_pubkey = has_pubkey.then(|| parts[3].to_string());
                 let timestamp_raw = if has_pubkey {
-                    parts[4].to_string()
+                    parts[4]
                 } else {
-                    parts[3].to_string()
+                    parts[3]
                 };
-                let content = if has_pubkey {
-                    parts[5].to_string()
+                let (timestamp, timestamp_epoch, content) = if has_pubkey {
+                    if parts.len() >= 7 {
+                        let (ts, epoch) =
+                            Self::parse_display_and_epoch(timestamp_raw, parts.get(5).copied());
+                        (ts, epoch, parts[6].to_string())
+                    } else {
+                        let (ts, epoch) = Self::parse_display_and_epoch(timestamp_raw, None);
+                        (ts, epoch, parts[5].to_string())
+                    }
                 } else {
-                    parts[4].to_string()
+                    if parts.len() >= 6 {
+                        let (ts, epoch) =
+                            Self::parse_display_and_epoch(timestamp_raw, parts.get(4).copied());
+                        (ts, epoch, parts[5].to_string())
+                    } else {
+                        let (ts, epoch) = Self::parse_display_and_epoch(timestamp_raw, None);
+                        (ts, epoch, parts[4].to_string())
+                    }
                 };
                 if crate::nostr_geo::is_geohash_channel(&channel) {
                     if !self.channels.contains(&channel) {
@@ -887,16 +961,11 @@ impl App {
                     self.add_geohash_person(&channel, &sender, sender_pubkey.as_deref());
                 }
 
-                let timestamp = if timestamp_raw.len() == 4 {
-                    format!("{}:{}", &timestamp_raw[0..2], &timestamp_raw[2..4])
-                } else {
-                    timestamp_raw
-                };
-
                 let msg = Message {
                     sender,
                     sender_pubkey,
                     timestamp,
+                    timestamp_epoch,
                     content,
                     is_self: false,
                     status: MessageStatus::None,
@@ -922,7 +991,7 @@ impl App {
                     }
                 }
 
-                self.scroll_to_bottom_current_conversation();
+                self.follow_or_mark_new_message();
                 return;
             }
         }
@@ -948,6 +1017,7 @@ impl App {
                 sender,
                 sender_pubkey: None,
                 timestamp,
+                timestamp_epoch: None,
                 content,
                 is_self: false,
                 status: MessageStatus::None,
@@ -958,7 +1028,7 @@ impl App {
                 .entry(current_channel)
                 .or_default()
                 .push(msg);
-            self.scroll_to_bottom_current_conversation();
+            self.follow_or_mark_new_message();
             return;
         }
 
@@ -978,6 +1048,7 @@ impl App {
                     sender: "system".to_string(),
                     sender_pubkey: None,
                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                    timestamp_epoch: Some(chrono::Local::now().timestamp()),
                     content,
                     is_self: false,
                     status: MessageStatus::None,
@@ -1001,7 +1072,7 @@ impl App {
                         .push(msg);
                 }
             }
-            self.scroll_to_bottom_current_conversation();
+            self.follow_or_mark_new_message();
             return;
         }
 
@@ -1019,6 +1090,7 @@ impl App {
                     sender: "system".to_string(),
                     sender_pubkey: None,
                     timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                    timestamp_epoch: Some(chrono::Local::now().timestamp()),
                     content: trimmed_line.to_string(),
                     is_self: false,
                     status: MessageStatus::None,
@@ -1030,7 +1102,7 @@ impl App {
                     .push(msg);
             }
         }
-        self.scroll_to_bottom_current_conversation();
+        self.follow_or_mark_new_message();
     }
 
     pub fn add_sent_message(&mut self, text: String) {
@@ -1039,6 +1111,7 @@ impl App {
             sender: self.nickname.clone(),
             sender_pubkey: None,
             timestamp,
+            timestamp_epoch: Some(chrono::Local::now().timestamp()),
             content: text,
             is_self: true,
             status: MessageStatus::None,
@@ -1051,7 +1124,7 @@ impl App {
         } else if let Some(channel) = channel_name {
             self.channel_messages.entry(channel).or_default().push(msg);
         }
-        self.scroll_to_bottom_current_conversation();
+        self.follow_or_mark_new_message();
     }
 
     pub fn add_pending_geohash_dm_message(&mut self, text: String, local_id: String) {
@@ -1060,6 +1133,7 @@ impl App {
             sender: self.nickname.clone(),
             sender_pubkey: None,
             timestamp,
+            timestamp_epoch: Some(chrono::Local::now().timestamp()),
             content: text,
             is_self: true,
             status: MessageStatus::Sending,
@@ -1070,7 +1144,7 @@ impl App {
         if let Some(target) = dm_target {
             self.dm_messages.entry(target).or_default().push(msg);
         }
-        self.scroll_to_bottom_current_conversation();
+        self.follow_or_mark_new_message();
     }
 
     pub fn add_pending_mesh_dm_message(&mut self, target: String, text: String, local_id: String) {
@@ -1079,6 +1153,7 @@ impl App {
             sender: self.nickname.clone(),
             sender_pubkey: None,
             timestamp,
+            timestamp_epoch: Some(chrono::Local::now().timestamp()),
             content: text,
             is_self: true,
             status: MessageStatus::Sending,
@@ -1086,7 +1161,7 @@ impl App {
         };
 
         self.dm_messages.entry(target).or_default().push(msg);
-        self.scroll_to_bottom_current_conversation();
+        self.follow_or_mark_new_message();
     }
 
     pub fn update_dm_message_status(&mut self, local_id: &str, status: MessageStatus) -> bool {
@@ -1171,6 +1246,7 @@ impl App {
             sender: self.nickname.clone(),
             sender_pubkey: None,
             timestamp,
+            timestamp_epoch: Some(chrono::Local::now().timestamp()),
             content,
             is_self: true,
             status: MessageStatus::None,
@@ -1180,7 +1256,7 @@ impl App {
             .entry(target_nickname)
             .or_default()
             .push(msg);
-        self.scroll_to_bottom_current_conversation();
+        self.follow_or_mark_new_message();
     }
 
     pub fn take_pending_wormhole_offer(
@@ -1192,6 +1268,44 @@ impl App {
 
     pub fn scroll_to_bottom_current_conversation(&mut self) {
         self.msg_scroll = 0;
+        self.unseen_divider_message_index = None;
+        self.unseen_divider_line_index = None;
+    }
+
+    pub fn is_viewing_bottom(&self) -> bool {
+        self.msg_scroll == 0
+    }
+
+    pub fn note_user_scrolled(&mut self) {
+        if self.is_viewing_bottom() {
+            self.unseen_divider_message_index = None;
+            self.unseen_divider_line_index = None;
+        }
+    }
+
+    pub fn follow_or_mark_new_message(&mut self) {
+        if self.is_viewing_bottom() {
+            self.scroll_to_bottom_current_conversation();
+            return;
+        }
+
+        if self.unseen_divider_message_index.is_none() {
+            let (messages, _, _) = self.get_current_messages();
+            self.unseen_divider_message_index = Some(messages.len().saturating_sub(1));
+            self.unseen_divider_line_index = None;
+        }
+    }
+
+    pub fn jump_to_unseen_or_bottom(&mut self) {
+        if let Some(line_idx) = self.unseen_divider_line_index {
+            let viewport = self.message_viewport_height.max(1);
+            let target_end = line_idx.saturating_add(viewport);
+            self.msg_scroll = self.message_rendered_line_count.saturating_sub(target_end);
+            self.unseen_divider_message_index = None;
+            self.unseen_divider_line_index = None;
+            return;
+        }
+        self.scroll_to_bottom_current_conversation();
     }
 
     pub fn transition_to_connected(&mut self) {
@@ -1205,6 +1319,7 @@ impl App {
                 sender: "system".to_string(),
                 sender_pubkey: None,
                 timestamp: chrono::Local::now().format("%H:%M").to_string(),
+                timestamp_epoch: Some(chrono::Local::now().timestamp()),
                 content,
                 is_self: false,
                 status: MessageStatus::None,
@@ -1261,6 +1376,7 @@ impl App {
             self.update_current_conversation();
             self.update_sidebar_flat_selection();
             self.mark_current_conversation_as_read();
+            self.scroll_to_bottom_current_conversation();
             self.pending_channel_switch = Some(channel_name);
         }
     }
@@ -1272,6 +1388,7 @@ impl App {
         self.update_current_conversation();
         self.update_sidebar_flat_selection();
         self.mark_current_conversation_as_read();
+        self.scroll_to_bottom_current_conversation();
         self.pending_channel_switch = Some("#public".to_string());
     }
 
@@ -1283,6 +1400,7 @@ impl App {
             self.update_current_conversation();
             self.update_sidebar_flat_selection();
             self.mark_current_conversation_as_read();
+            self.scroll_to_bottom_current_conversation();
             self.pending_dm_switch = Some((target_nickname, String::new()));
         }
     }
@@ -1315,6 +1433,7 @@ impl App {
         ));
         self.update_sidebar_flat_selection();
         self.mark_current_conversation_as_read();
+        self.scroll_to_bottom_current_conversation();
     }
 
     pub fn leave_geohash_channel(&mut self, channel: &str) {
@@ -1455,7 +1574,7 @@ impl App {
                 messages.clear();
             }
         }
-        self.msg_scroll = 0;
+        self.scroll_to_bottom_current_conversation();
     }
 
     pub fn update_blocked_list(&mut self, blocked_nicknames: Vec<String>) {
@@ -1549,6 +1668,52 @@ mod tests {
 
         assert_eq!(app.get_visible_person_unread_count("anon7301"), 0);
         assert_eq!(app.get_section_unread_count(2), 0);
+    }
+
+    #[test]
+    fn keeps_scroll_position_and_marks_unseen_when_not_at_bottom() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.add_log_message("__CHANNEL__:#public:alice:1200:first".to_string());
+        app.add_log_message("__CHANNEL__:#public:alice:1201:second".to_string());
+
+        app.msg_scroll = 1;
+        app.note_user_scrolled();
+        app.add_log_message("__CHANNEL__:#public:alice:1202:third".to_string());
+
+        assert_eq!(app.msg_scroll, 1);
+        assert_eq!(app.unseen_divider_message_index, Some(2));
+    }
+
+    #[test]
+    fn clears_unseen_marker_when_back_to_bottom() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.add_log_message("__CHANNEL__:#public:alice:1200:first".to_string());
+        app.add_log_message("__CHANNEL__:#public:alice:1201:second".to_string());
+
+        app.msg_scroll = 1;
+        app.note_user_scrolled();
+        app.add_log_message("__CHANNEL__:#public:alice:1202:third".to_string());
+        assert!(app.unseen_divider_message_index.is_some());
+
+        app.msg_scroll = 0;
+        app.note_user_scrolled();
+        assert_eq!(app.unseen_divider_message_index, None);
+    }
+
+    #[test]
+    fn end_prefers_unseen_marker_then_clears_it() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.message_viewport_height = 5;
+        app.message_rendered_line_count = 20;
+        app.msg_scroll = 4;
+        app.unseen_divider_message_index = Some(10);
+        app.unseen_divider_line_index = Some(12);
+
+        app.jump_to_unseen_or_bottom();
+
+        assert_eq!(app.msg_scroll, 3);
+        assert_eq!(app.unseen_divider_message_index, None);
+        assert_eq!(app.unseen_divider_line_index, None);
     }
 
     #[test]

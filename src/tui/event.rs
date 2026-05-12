@@ -75,10 +75,21 @@ fn handle_global_message_scroll(app: &mut App, key_event: KeyEvent) -> bool {
     match key_event.code {
         KeyCode::PageUp => {
             app.msg_scroll = (app.msg_scroll + scroll_step).min(max_scroll);
+            app.note_user_scrolled();
             true
         }
         KeyCode::PageDown => {
             app.msg_scroll = app.msg_scroll.saturating_sub(scroll_step);
+            app.note_user_scrolled();
+            true
+        }
+        KeyCode::Home => {
+            app.msg_scroll = max_scroll;
+            app.note_user_scrolled();
+            true
+        }
+        KeyCode::End => {
+            app.jump_to_unseen_or_bottom();
             true
         }
         _ => false,
@@ -161,12 +172,15 @@ fn handle_main_panel_events(app: &mut App, key_event: KeyEvent) {
         KeyCode::Tab => app.focus_area = FocusArea::InputBox,
         KeyCode::Up => {
             app.msg_scroll = (app.msg_scroll + 1).min(max_scroll);
+            app.note_user_scrolled();
         }
         KeyCode::Down => {
             app.msg_scroll = app.msg_scroll.saturating_sub(1);
+            app.note_user_scrolled();
         }
         KeyCode::Home => {
             app.msg_scroll = max_scroll;
+            app.note_user_scrolled();
         }
         KeyCode::End => {
             app.scroll_to_bottom_current_conversation();
