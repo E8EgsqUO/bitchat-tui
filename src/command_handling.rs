@@ -25,6 +25,17 @@ const MAX_FILE_TRANSFER_BYTES: u64 = 1024 * 1024;
 const TUI_FILE_TRANSFER_MIME: &str = "application/vnd.bitchat-tui.file";
 const TUI_FILE_TRANSFER_MAGIC: &[u8] = b"bitchat-tui-file-v1";
 
+fn strip_display_suffix(target: &str) -> &str {
+    let trimmed = target.trim();
+    let Some((base, suffix)) = trimmed.rsplit_once('#') else {
+        return trimmed;
+    };
+    if base.is_empty() || suffix.len() != 4 || !suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return trimmed;
+    }
+    base
+}
+
 fn persistent_channels(chat_context: &ChatContext) -> Vec<String> {
     chat_context
         .active_channels
@@ -630,6 +641,7 @@ pub async fn handle_dm_command(
         }
 
         let target_nickname = parts[1];
+        let target_lookup = strip_display_suffix(target_nickname);
 
         // Find peer ID for nickname
         let peer_id = {
@@ -637,14 +649,14 @@ pub async fn handle_dm_command(
                 .lock()
                 .await
                 .iter()
-                .find(|(_, peer)| peer.nickname.as_deref() == Some(target_nickname))
+                .find(|(_, peer)| peer.nickname.as_deref() == Some(target_lookup))
                 .map(|(id, _)| id.clone())
         };
 
         if let Some(target_peer_id) = peer_id {
             // If no message provided, enter DM mode
             if parts.len() == 2 {
-                chat_context.enter_dm_mode(target_nickname, &target_peer_id);
+                chat_context.enter_dm_mode(target_lookup, &target_peer_id);
                 if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
                     let _ = ui_tx
                         .send(format!("{}\n", chat_context.get_status_line()))
@@ -660,7 +672,7 @@ pub async fn handle_dm_command(
                 let _ = ui_tx
                     .send(format!(
                         "[PRIVATE] Sending encrypted message to {}\n",
-                        target_nickname
+                        target_lookup
                     ))
                     .await;
             }
@@ -806,21 +818,21 @@ pub async fn handle_dm_command(
                 let _ = ui_tx.send("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m\n".to_string()).await;
             } else {
                 // Add the message to the TUI's DM conversation
-                app.add_dm_message(target_nickname.to_string(), private_message.to_string());
+                app.add_dm_message(target_lookup.to_string(), private_message.to_string());
 
                 // Add a system message to the current conversation to confirm the DM was sent
                 let timestamp = chrono::Local::now();
                 let system_msg = format!(
                     "[{}|DM] <you → {}> {}",
                     timestamp.format("%H:%M"),
-                    target_nickname,
+                    target_lookup,
                     private_message
                 );
                 app.add_log_message(format!("system: {}", system_msg));
 
                 if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
                     let _ = ui_tx
-                        .send(format!("[PRIVATE] Message sent to {}\n", target_nickname))
+                        .send(format!("[PRIVATE] Message sent to {}\n", target_lookup))
                         .await;
                 }
             }

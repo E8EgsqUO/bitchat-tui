@@ -2,6 +2,7 @@
 
 use chrono::{Local, TimeZone};
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tui_input::Input;
 use unicode_width::UnicodeWidthChar;
@@ -143,6 +144,7 @@ pub struct App {
     pub mesh_status: String,
     pub channels: Vec<String>,
     pub people: Vec<String>,
+    pub mesh_people_peer_ids: HashMap<String, String>,
     pub geohash_people: HashMap<String, Vec<String>>,
     pub geohash_people_pubkeys: HashMap<String, HashMap<String, String>>,
     pub geohash_presence: HashMap<String, HashMap<String, i64>>,
@@ -209,6 +211,7 @@ impl App {
             mesh_status: "Scanning".to_string(),
             channels,
             people: Vec::new(),
+            mesh_people_peer_ids: HashMap::new(),
             geohash_people: HashMap::new(),
             geohash_people_pubkeys: HashMap::new(),
             geohash_presence: HashMap::new(),
@@ -309,6 +312,20 @@ impl App {
             .or_else(|| crate::nostr_geo::normalize_dm_pubkey(target))
     }
 
+    fn stable_suffix_from_id(stable_id: &str) -> String {
+        let digest = Sha256::digest(stable_id.as_bytes());
+        hex::encode(digest)[..4].to_ascii_lowercase()
+    }
+
+    fn label_with_suffix(name: Option<&str>, stable_id: &str) -> String {
+        let suffix = Self::stable_suffix_from_id(stable_id);
+        let base = name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("anon");
+        format!("{base}#{suffix}")
+    }
+
     fn is_pubkey_placeholder(name: &str) -> bool {
         crate::nostr_geo::looks_like_dm_pubkey(name) || name.starts_with("npub")
     }
@@ -328,18 +345,15 @@ impl App {
     }
 
     fn geohash_pubkey_display_name(&self, channel: &str, pubkey: &str) -> String {
-        self.geohash_person_name_by_pubkey(channel, pubkey)
-            .filter(|name| !Self::is_pubkey_placeholder(name))
-            .unwrap_or_else(|| Self::short_pubkey(pubkey))
+        let name = self
+            .geohash_person_name_by_pubkey(channel, pubkey)
+            .filter(|value| !Self::is_pubkey_placeholder(value));
+        Self::label_with_suffix(name.as_deref(), pubkey)
     }
 
     fn geohash_display_name(&self, channel: &str, target: &str) -> String {
         let Some(pubkey) = self.resolve_geohash_target_pubkey(channel, target) else {
-            return if crate::nostr_geo::looks_like_dm_pubkey(target) {
-                Self::short_pubkey(target)
-            } else {
-                target.to_string()
-            };
+            return Self::label_with_suffix(Some(target), target);
         };
         self.geohash_pubkey_display_name(channel, &pubkey)
     }
@@ -361,11 +375,7 @@ impl App {
             );
         }
 
-        if crate::nostr_geo::looks_like_dm_pubkey(target) {
-            Self::short_pubkey(target)
-        } else {
-            target.to_string()
-        }
+        target.to_string()
     }
 
     pub fn short_pubkey(pubkey: &str) -> String {
@@ -388,12 +398,12 @@ impl App {
             if let Some(pubkey) = self.resolve_geohash_target_pubkey(&channel, person) {
                 return self.geohash_pubkey_display_name(&channel, &pubkey);
             }
+            if crate::nostr_geo::looks_like_dm_pubkey(person) {
+                return Self::label_with_suffix(None, person);
+            }
+            return person.to_string();
         }
-        if crate::nostr_geo::looks_like_dm_pubkey(person) {
-            Self::short_pubkey(person)
-        } else {
-            person.to_string()
-        }
+        person.to_string()
     }
 
     pub fn current_geohash_dm(&self) -> Option<(String, String, String)> {
@@ -533,7 +543,7 @@ impl App {
         }
     }
 
-    fn add_mesh_person(&mut self, name: &str) {
+    fn add_mesh_person(&mut self, name: &str, peer_id: Option<&str>) {
         let name = name.trim().trim_start_matches('@');
         if name.is_empty() || name == self.nickname || name == "system" {
             return;
@@ -548,6 +558,10 @@ impl App {
         if !self.people.iter().any(|person| person == name) {
             self.people.push(name.to_string());
             self.people.sort();
+        }
+        if let Some(peer_id) = peer_id.filter(|value| !value.trim().is_empty()) {
+            self.mesh_people_peer_ids
+                .insert(name.to_string(), peer_id.to_string());
         }
     }
 
@@ -996,8 +1010,11 @@ impl App {
             }
         }
 
-        if let Some(name) = trimmed.strip_prefix("__PEER_CONNECTED__:") {
-            self.add_mesh_person(name);
+        if let Some(payload) = trimmed.strip_prefix("__PEER_CONNECTED__:") {
+            let mut parts = payload.splitn(2, ':');
+            let name = parts.next().unwrap_or_default();
+            let peer_id = parts.next();
+            self.add_mesh_person(name, peer_id);
             return;
         }
 
@@ -1761,19 +1778,26 @@ mod tests {
         app.switch_to_geohash_dm(npub.to_string());
 
         let key = App::geohash_dm_pubkey_key("#ws", &pubkey);
+        let expected_suffix = App::stable_suffix_from_id(&pubkey);
         assert_eq!(
             app.display_dm_target(&key),
-            format!("{} in #ws", App::short_pubkey(&pubkey))
+            format!("anon#{} in #ws", expected_suffix)
         );
         assert_eq!(
             app.display_visible_person(&pubkey),
-            App::short_pubkey(&pubkey)
+            format!("anon#{}", expected_suffix)
         );
 
         app.add_log_message(format!("__GEO_PERSON__:#ws:bob:{}", pubkey));
 
-        assert_eq!(app.display_dm_target(&key), "bob in #ws");
-        assert_eq!(app.display_visible_person("bob"), "bob");
+        assert_eq!(
+            app.display_dm_target(&key),
+            format!("bob#{} in #ws", expected_suffix)
+        );
+        assert_eq!(
+            app.display_visible_person("bob"),
+            format!("bob#{}", expected_suffix)
+        );
     }
 
     #[test]
@@ -1784,16 +1808,23 @@ mod tests {
         app.join_channel("#ws".to_string());
         app.add_log_message(format!("__CHANNEL__:#ws:npub9fdca93:{}:1201:hello", pubkey));
 
+        let expected_suffix = App::stable_suffix_from_id(pubkey);
         assert_eq!(
             app.display_visible_person(pubkey),
-            App::short_pubkey(pubkey)
+            format!("anon#{}", expected_suffix)
         );
 
         app.add_log_message(format!("__GEO_PERSON__:#ws:g8.bot:{}", pubkey));
 
-        assert_eq!(app.display_visible_person("g8.bot"), "g8.bot");
+        assert_eq!(
+            app.display_visible_person("g8.bot"),
+            format!("g8.bot#{}", expected_suffix)
+        );
         let msg = app.channel_messages.get("#ws").unwrap().first().unwrap();
-        assert_eq!(app.display_geohash_sender("#ws", msg), "g8.bot");
+        assert_eq!(
+            app.display_geohash_sender("#ws", msg),
+            format!("g8.bot#{}", expected_suffix)
+        );
     }
 
     #[test]
@@ -1869,7 +1900,11 @@ mod tests {
             app.current_geohash_dm(),
             Some(("#ws".to_string(), pubkey.to_string(), pubkey.to_string()))
         );
-        assert_eq!(app.display_dm_target(&key), "g8.bot in #ws");
+        let expected_suffix = App::stable_suffix_from_id(pubkey);
+        assert_eq!(
+            app.display_dm_target(&key),
+            format!("g8.bot#{} in #ws", expected_suffix)
+        );
     }
 
     #[test]
@@ -1895,10 +1930,13 @@ mod tests {
     fn counts_unread_mesh_dm_for_visible_people() {
         let mut app = App::new_with_nickname("me".to_string());
         app.people.push("anon7301".to_string());
+        app.mesh_people_peer_ids
+            .insert("anon7301".to_string(), "peer7301".to_string());
 
         app.add_log_message("__DM__:anon7301:1201:hello".to_string());
 
         assert_eq!(app.get_visible_person_unread_count("anon7301"), 1);
+        assert_eq!(app.display_visible_person("anon7301"), "anon7301");
 
         app.switch_to_dm("anon7301".to_string());
 
@@ -1909,9 +1947,10 @@ mod tests {
     fn structured_peer_connected_updates_people() {
         let mut app = App::new_with_nickname("me".to_string());
 
-        app.add_log_message("__PEER_CONNECTED__:anon7301".to_string());
+        app.add_log_message("__PEER_CONNECTED__:anon7301:peer7301".to_string());
 
         assert_eq!(app.people, vec!["anon7301".to_string()]);
+        assert!(app.mesh_people_peer_ids.contains_key("anon7301"));
     }
 
     #[test]

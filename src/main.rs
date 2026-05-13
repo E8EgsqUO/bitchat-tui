@@ -252,6 +252,17 @@ fn parse_dm_command(line: &str) -> Option<(String, Option<String>)> {
     Some((target.to_string(), message))
 }
 
+fn strip_display_suffix(target: &str) -> &str {
+    let trimmed = target.trim();
+    let Some((base, suffix)) = trimmed.rsplit_once('#') else {
+        return trimmed;
+    };
+    if base.is_empty() || suffix.len() != 4 || !suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return trimmed;
+    }
+    base
+}
+
 enum GeohashDmTargetError {
     UnknownName,
     UnknownPubkey,
@@ -262,6 +273,7 @@ fn resolve_geohash_dm_target(
     channel: &str,
     target: &str,
 ) -> Result<(String, String), GeohashDmTargetError> {
+    let target = strip_display_suffix(target);
     if let Some(pubkey) = app.geohash_person_pubkey(channel, target) {
         return Ok((target.to_string(), pubkey));
     }
@@ -2217,6 +2229,10 @@ mod tests {
         assert_eq!(
             parse_dm_command("/dm   npub1abc\twith tabs"),
             Some(("npub1abc".to_string(), Some("with tabs".to_string())))
+        );
+        assert_eq!(
+            parse_dm_command("/dm @alice#ffe6 hey"),
+            Some(("alice#ffe6".to_string(), Some("hey".to_string())))
         );
         assert_eq!(parse_dm_command("/dm"), None);
     }

@@ -408,7 +408,10 @@ pub async fn handle_announce_message(
 
     if is_new_peer {
         let _ = ui_tx
-            .send(format!("__PEER_CONNECTED__:{}", peer_nickname))
+            .send(format!(
+                "__PEER_CONNECTED__:{}:{}",
+                peer_nickname, packet.sender_id_str
+            ))
             .await;
     }
 
@@ -677,7 +680,10 @@ pub async fn handle_message_packet(
                 }
                 // Send structured peer discovery to TUI so it updates the people list.
                 let _ = ui_tx
-                    .send(format!("__PEER_CONNECTED__:{}", sender_nick))
+                    .send(format!(
+                        "__PEER_CONNECTED__:{}:{}",
+                        sender_nick, packet.sender_id_str
+                    ))
                     .await;
             }
 
@@ -1004,7 +1010,10 @@ pub async fn handle_fragment_packet(
                                 }
                                 // Send structured peer discovery to TUI so it updates the people list.
                                 let _ = ui_tx
-                                    .send(format!("__PEER_CONNECTED__:{}", message.sender))
+                                    .send(format!(
+                                        "__PEER_CONNECTED__:{}:{}",
+                                        message.sender, reassembled.sender_id_str
+                                    ))
                                     .await;
                             }
 
@@ -2303,7 +2312,10 @@ async fn handle_decrypted_message(
                 .or_default();
             peer_entry.nickname = Some(message.sender.clone());
             let _ = ui_tx
-                .send(format!("__PEER_CONNECTED__:{}", message.sender))
+                .send(format!(
+                    "__PEER_CONNECTED__:{}:{}",
+                    message.sender, inner_packet.sender_id_str
+                ))
                 .await;
         }
 
