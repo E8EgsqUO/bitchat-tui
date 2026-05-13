@@ -1,14 +1,22 @@
 // src/tui/event.rs
 
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use base64::Engine as _;
+use crossterm::event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
+};
+use std::io::Write;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::InputRequest;
 
-use crate::tui::app::{App, FocusArea};
+use crate::tui::app::{App, FocusArea, MessageLineCopyTarget};
 use crate::tui::widgets::sidebar::sidebar_visible_items;
 
 const MAX_GLOBAL_HISTORY_SCROLL_STEP: usize = 8;
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
+const COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(1000);
 
 pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sender<String>) {
     if key_event.kind != KeyEventKind::Press {
@@ -53,6 +61,89 @@ pub fn handle_paste_event(app: &mut App, pasted: &str) {
 
     app.focus_area = FocusArea::InputBox;
     insert_text_into_input(&mut app.input, pasted);
+}
+
+pub fn handle_mouse_event(app: &mut App, mouse_event: MouseEvent) {
+    if app.popup_active {
+        return;
+    }
+    if !matches!(
+        mouse_event.kind,
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+    ) {
+        return;
+    }
+
+    let Some(target) = app.visible_copy_target_at_position(mouse_event.row, mouse_event.column)
+    else {
+        return;
+    };
+    let conversation_key = app.current_conversation_key();
+    let now = Instant::now();
+    let click_kind = match mouse_event.kind {
+        MouseEventKind::Down(MouseButton::Left) => 0,
+        MouseEventKind::Up(MouseButton::Left) => 1,
+        _ => 2,
+    };
+
+    let is_double_click = app
+        .last_message_click
+        .as_ref()
+        .map(|last| {
+            last.kind == click_kind
+                && last.target == target
+                && last.row == mouse_event.row
+                && last.conversation_key == conversation_key
+                && now.duration_since(last.clicked_at) <= DOUBLE_CLICK_WINDOW
+        })
+        .unwrap_or(false);
+
+    if is_double_click {
+        app.last_message_click = None;
+        if let Some(text) = app.copy_text_for_target(&target) {
+            if let Err(err) = copy_message_text(&text) {
+                app.add_log_message(format!("system: Failed to copy message: {}", err));
+            } else {
+                app.show_copy_highlight(target, COPY_HIGHLIGHT_DURATION);
+            }
+        }
+        return;
+    }
+
+    app.last_message_click = Some(crate::tui::app::MessageClickState {
+        row: mouse_event.row,
+        kind: click_kind,
+        target,
+        conversation_key,
+        clicked_at: now,
+    });
+}
+
+fn copy_message_text(text: &str) -> Result<(), String> {
+    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string())) {
+        Ok(_) => Ok(()),
+        Err(arboard_error) => copy_via_osc52(text).map_err(|osc_error| {
+            format!("{} (OSC52 fallback failed: {})", arboard_error, osc_error)
+        }),
+    }
+}
+
+fn copy_via_osc52(text: &str) -> Result<(), String> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let sequence = if std::env::var_os("TMUX").is_some() {
+        format!("\x1bPtmux;\x1b\x1b]52;c;{}\x07\x1b\\", encoded)
+    } else {
+        format!("\x1b]52;c;{}\x07", encoded)
+    };
+
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(sequence.as_bytes())
+        .map_err(|e| format!("stdout write error: {}", e))?;
+    stdout
+        .flush()
+        .map_err(|e| format!("stdout flush error: {}", e))?;
+    Ok(())
 }
 
 fn insert_text_into_input(input: &mut tui_input::Input, text: &str) {
@@ -246,6 +337,24 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn mouse_down_left(row: u16, column: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn mouse_up_left(row: u16, column: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn release_char(ch: char) -> KeyEvent {
         KeyEvent::new_with_kind(KeyCode::Char(ch), KeyModifiers::NONE, KeyEventKind::Release)
     }
@@ -341,5 +450,31 @@ mod tests {
 
         assert!(app.pending_connection_retry);
         assert_eq!(app.input.value(), "");
+    }
+
+    #[test]
+    fn single_click_records_last_message_click() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.messages_area_rect = Some((0, 0, 40, 8));
+        app.message_first_visible_index = 0;
+        app.message_line_copy_targets = vec![Some(MessageLineCopyTarget::Message(0))];
+        app.add_sent_message("hello".to_string());
+
+        handle_mouse_event(&mut app, mouse_down_left(1, 5));
+
+        assert!(app.last_message_click.is_some());
+    }
+
+    #[test]
+    fn single_mouse_up_click_is_tracked_for_double_click_compatibility() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.messages_area_rect = Some((0, 0, 40, 8));
+        app.message_first_visible_index = 0;
+        app.message_line_copy_targets = vec![Some(MessageLineCopyTarget::Message(0))];
+        app.add_sent_message("hello".to_string());
+
+        handle_mouse_event(&mut app, mouse_up_left(1, 5));
+
+        assert!(app.last_message_click.is_some());
     }
 }

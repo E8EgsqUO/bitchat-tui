@@ -4,6 +4,8 @@ use chrono::{Local, TimeZone};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::time::Duration;
+use std::time::Instant;
 use tui_input::Input;
 use unicode_width::UnicodeWidthChar;
 
@@ -181,6 +183,32 @@ pub struct App {
     pub popup_active: bool,
     pub popup_input: Input,
     pub popup_title: String,
+    pub messages_area_rect: Option<(u16, u16, u16, u16)>,
+    pub message_first_visible_index: usize,
+    pub message_line_copy_targets: Vec<Option<MessageLineCopyTarget>>,
+    pub last_message_click: Option<MessageClickState>,
+    pub copy_highlight: Option<CopyHighlightState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageLineCopyTarget {
+    Message(usize),
+    SenderLabel(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageClickState {
+    pub row: u16,
+    pub kind: u8,
+    pub target: MessageLineCopyTarget,
+    pub conversation_key: String,
+    pub clicked_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct CopyHighlightState {
+    pub target: MessageLineCopyTarget,
+    pub expires_at: Instant,
 }
 
 impl App {
@@ -232,6 +260,11 @@ impl App {
             popup_active: false,
             popup_input: Input::default(),
             popup_title: String::new(),
+            messages_area_rect: None,
+            message_first_visible_index: 0,
+            message_line_copy_targets: Vec::new(),
+            last_message_click: None,
+            copy_highlight: None,
         };
 
         app.update_current_conversation();
@@ -944,11 +977,7 @@ impl App {
                 let sender = parts[2].to_string();
                 let has_pubkey = parts.len() >= 6 && crate::nostr_geo::is_geohash_channel(&channel);
                 let sender_pubkey = has_pubkey.then(|| parts[3].to_string());
-                let timestamp_raw = if has_pubkey {
-                    parts[4]
-                } else {
-                    parts[3]
-                };
+                let timestamp_raw = if has_pubkey { parts[4] } else { parts[3] };
                 let (timestamp, timestamp_epoch, content) = if has_pubkey {
                     if parts.len() >= 7 {
                         let (ts, epoch) =
@@ -1162,6 +1191,83 @@ impl App {
             self.dm_messages.entry(target).or_default().push(msg);
         }
         self.follow_or_mark_new_message();
+    }
+
+    pub fn current_conversation_key(&self) -> String {
+        let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
+        if let Some(target) = dm_target {
+            format!("dm:{}", target)
+        } else if let Some(channel) = channel_name {
+            channel
+        } else {
+            self.get_selected_channel_name()
+        }
+    }
+
+    pub fn visible_copy_target_at_position(
+        &self,
+        row: u16,
+        column: u16,
+    ) -> Option<MessageLineCopyTarget> {
+        let (x, y, width, height) = self.messages_area_rect?;
+        if width < 2 || height < 2 {
+            return None;
+        }
+        if column <= x || column >= x.saturating_add(width).saturating_sub(1) {
+            return None;
+        }
+        if row <= y || row >= y.saturating_add(height).saturating_sub(1) {
+            return None;
+        }
+
+        let inner_row = row.saturating_sub(y + 1) as usize;
+        let rendered_row = self.message_first_visible_index.saturating_add(inner_row);
+        self.message_line_copy_targets
+            .get(rendered_row)
+            .cloned()
+            .flatten()
+    }
+
+    pub fn current_message_text_for_copy(&self, index: usize) -> Option<String> {
+        let (messages, _, _) = self.get_current_messages();
+        let msg = messages.get(index)?;
+        let text = msg.content.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        }
+    }
+
+    pub fn copy_text_for_target(&self, target: &MessageLineCopyTarget) -> Option<String> {
+        match target {
+            MessageLineCopyTarget::Message(index) => self.current_message_text_for_copy(*index),
+            MessageLineCopyTarget::SenderLabel(name) => {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+        }
+    }
+
+    pub fn show_copy_highlight(&mut self, target: MessageLineCopyTarget, duration: Duration) {
+        self.copy_highlight = Some(CopyHighlightState {
+            target,
+            expires_at: Instant::now() + duration,
+        });
+    }
+
+    pub fn should_highlight_copy_target(&self, target: &MessageLineCopyTarget) -> bool {
+        let Some(active) = self.copy_highlight.as_ref() else {
+            return false;
+        };
+        if Instant::now() >= active.expires_at {
+            return false;
+        }
+        &active.target == target
     }
 
     pub fn add_pending_mesh_dm_message(&mut self, target: String, text: String, local_id: String) {

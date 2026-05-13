@@ -1010,6 +1010,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CrosstermEvent::Paste(pasted) => {
                     event::handle_paste_event(&mut app, &pasted);
                 }
+                CrosstermEvent::Mouse(mouse_event) => {
+                    event::handle_mouse_event(&mut app, mouse_event);
+                }
                 _ => {}
             }
         }

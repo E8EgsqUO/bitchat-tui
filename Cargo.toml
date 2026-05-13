@@ -47,6 +47,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 unicode-width = "0.1"
 magic-wormhole = "0.8"
 url = "2"
+arboard = "3"
 
 # For Cryptography
 x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }

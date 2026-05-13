@@ -10,7 +10,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::tui::app::{App, FocusArea, Message, MessageStatus};
+use crate::tui::app::{App, FocusArea, Message, MessageLineCopyTarget, MessageStatus};
 
 const TIME_DIVIDER_GAP_MINUTES: i32 = 15;
 const OTHER_MESSAGE_INDENT: usize = 2;
@@ -35,6 +35,12 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     let header_area = chunks[0];
     let messages_area = chunks[1];
+    app.messages_area_rect = Some((
+        messages_area.x,
+        messages_area.y,
+        messages_area.width,
+        messages_area.height,
+    ));
 
     // Update the viewport height before borrowing `app` for messages
     app.message_viewport_height = messages_area.height.saturating_sub(2) as usize;
@@ -84,13 +90,15 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     // --- Message Panel Rendering ---
     let messages_height = app.message_viewport_height;
-    let (all_msg_items, unseen_divider_line_index) = render_message_lines(
-        app,
-        messages,
-        messages_area.width,
-        dm_target.as_deref(),
-        channel_name.as_deref(),
-    );
+    let (all_msg_items, message_line_copy_targets, unseen_divider_line_index) =
+        render_message_lines(
+            app,
+            messages,
+            messages_area.width,
+            dm_target.as_deref(),
+            channel_name.as_deref(),
+        );
+    app.message_line_copy_targets = message_line_copy_targets;
     app.unseen_divider_line_index = unseen_divider_line_index;
     let total_lines = all_msg_items.len();
     app.message_rendered_line_count = total_lines;
@@ -99,6 +107,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     app.msg_scroll = app.msg_scroll.min(max_scroll);
     let end = total_lines.saturating_sub(app.msg_scroll);
     let start = end.saturating_sub(messages_height);
+    app.message_first_visible_index = start;
     let msg_items = all_msg_items.into_iter().skip(start).take(end - start);
 
     let border_style = if app.focus_area == FocusArea::MainPanel {
@@ -155,7 +164,11 @@ fn render_message_lines(
     area_width: u16,
     dm_target: Option<&str>,
     channel_name: Option<&str>,
-) -> (Vec<ListItem<'static>>, Option<usize>) {
+) -> (
+    Vec<ListItem<'static>>,
+    Vec<Option<MessageLineCopyTarget>>,
+    Option<usize>,
+) {
     let available_width = area_width.saturating_sub(2) as usize;
     let geohash_channel = channel_name
         .filter(|channel| crate::nostr_geo::is_geohash_channel(channel))
@@ -168,11 +181,13 @@ fn render_message_lines(
         .filter(|_| app.msg_scroll > 0);
 
     let mut items = Vec::new();
+    let mut line_copy_targets = Vec::new();
     let mut unseen_divider_line_index = None;
     for (idx, msg) in messages.iter().enumerate() {
         if Some(idx) == unseen_divider_idx {
             unseen_divider_line_index = Some(items.len());
             items.push(new_messages_divider_item(available_width));
+            line_copy_targets.push(None);
         }
         let prev = idx
             .checked_sub(1)
@@ -185,6 +200,7 @@ fn render_message_lines(
                 available_width,
                 Style::default().fg(Color::Gray),
             ));
+            line_copy_targets.push(None);
         }
 
         let role = message_role(msg);
@@ -200,8 +216,10 @@ fn render_message_lines(
             0
         };
         if show_sender_label {
+            let sender_target = MessageLineCopyTarget::SenderLabel(sender_display.clone());
             if idx > 0 {
                 items.push(empty_line_item());
+                line_copy_targets.push(None);
             }
             items.push(render_aligned_message_line(
                 format!("{}:", sender_display),
@@ -211,7 +229,9 @@ fn render_message_lines(
                 0,
                 true,
                 false,
+                app.should_highlight_copy_target(&sender_target),
             ));
+            line_copy_targets.push(Some(sender_target));
         }
         let body = format_message_body(msg, role);
         let reserve_trailing_slot = is_dm && role != MessageRole::System;
@@ -242,17 +262,20 @@ fn render_message_lines(
                 content_indent,
                 false,
                 reserve_trailing_slot && line_idx == last_line_idx,
+                app.should_highlight_copy_target(&MessageLineCopyTarget::Message(idx)),
             ));
+            line_copy_targets.push(Some(MessageLineCopyTarget::Message(idx)));
         }
 
         if role == MessageRole::SelfUser
             && is_group_end(app, messages, idx, geohash_channel.as_deref())
         {
             items.push(separator_item(role, available_width));
+            line_copy_targets.push(None);
         }
     }
 
-    (items, unseen_divider_line_index)
+    (items, line_copy_targets, unseen_divider_line_index)
 }
 
 fn message_status_marker(status: MessageStatus) -> Option<(&'static str, Style)> {
@@ -275,6 +298,7 @@ fn render_aligned_message_line(
     content_indent: usize,
     is_sender_label: bool,
     reserve_status_slot: bool,
+    highlight: bool,
 ) -> ListItem<'static> {
     let base_style = match role {
         MessageRole::System => Style::default().fg(Color::Gray),
@@ -311,7 +335,11 @@ fn render_aligned_message_line(
             } else {
                 spans.push(Span::raw(" "));
             }
-            ListItem::new(Line::from(spans))
+            let mut item = ListItem::new(Line::from(spans));
+            if highlight {
+                item = item.style(Style::default().bg(Color::DarkGray));
+            }
+            item
         }
         _ => {
             let leading = match role {
@@ -323,7 +351,11 @@ fn render_aligned_message_line(
             };
             let mut spans = vec![Span::raw(" ".repeat(leading))];
             spans.extend(content_spans_with_file_icon(line, base_style));
-            ListItem::new(Line::from(spans))
+            let mut item = ListItem::new(Line::from(spans));
+            if highlight {
+                item = item.style(Style::default().bg(Color::DarkGray));
+            }
+            item
         }
     }
 }
@@ -386,17 +418,26 @@ fn new_messages_divider_item(available_width: usize) -> ListItem<'static> {
         return centered_item(
             text,
             available_width,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         );
     }
 
     let total_dash = available_width.saturating_sub(label_width);
     let left_dash = total_dash / 2;
     let right_dash = total_dash.saturating_sub(left_dash);
-    let line = format!("{}{}{}", "-".repeat(left_dash), label, "-".repeat(right_dash));
+    let line = format!(
+        "{}{}{}",
+        "-".repeat(left_dash),
+        label,
+        "-".repeat(right_dash)
+    );
     ListItem::new(Line::from(Span::styled(
         line,
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     )))
 }
 
