@@ -1276,11 +1276,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let help_text = terminal_ux::get_help_text();
                 let lines: Vec<&str> = help_text.split('\n').collect();
                 for line in lines {
-                    let trimmed_line = line.trim();
-                    if !trimmed_line.is_empty() {
-                        app.add_log_message(format!("system: {}", trimmed_line));
+                    let formatted_line = line.trim_end();
+                    if !formatted_line.trim().is_empty() {
+                        app.add_log_message(format!("system: {}", formatted_line));
                     }
                 }
+                // `/help` is a local self command output; don't mark it as unseen/new messages.
+                app.unseen_divider_message_index = None;
+                app.unseen_divider_line_index = None;
                 continue;
             }
 

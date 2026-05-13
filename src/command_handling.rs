@@ -57,6 +57,53 @@ fn persistent_channels(chat_context: &ChatContext) -> Vec<String> {
     channels
 }
 
+fn short_fingerprint(value: &str) -> String {
+    value.chars().take(10).collect()
+}
+
+fn short_peer_id(value: &str) -> String {
+    value.chars().take(8).collect()
+}
+
+async fn collect_blocked_display_entries(
+    blocked_peers: &HashSet<String>,
+    peers: &Arc<Mutex<HashMap<String, Peer>>>,
+    encryption_service: &EncryptionService,
+) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut matched_fingerprints = HashSet::new();
+    let peers_guard = peers.lock().await;
+
+    for (peer_id, peer) in peers_guard.iter() {
+        let Some(fingerprint) = encryption_service.get_peer_fingerprint(peer_id) else {
+            continue;
+        };
+        if !blocked_peers.contains(&fingerprint) {
+            continue;
+        }
+        matched_fingerprints.insert(fingerprint.clone());
+        let label = if let Some(nickname) = &peer.nickname {
+            format!("{} ({})", nickname, short_fingerprint(&fingerprint))
+        } else {
+            format!(
+                "peer:{} ({})",
+                short_peer_id(peer_id),
+                short_fingerprint(&fingerprint)
+            )
+        };
+        entries.push(label);
+    }
+
+    for fingerprint in blocked_peers.iter() {
+        if !matched_fingerprints.contains(fingerprint) {
+            entries.push(format!("fingerprint:{}", short_fingerprint(fingerprint)));
+        }
+    }
+
+    entries.sort();
+    entries
+}
+
 struct FileCommand<'a> {
     target_nickname: Option<&'a str>,
     path: &'a str,
@@ -1069,31 +1116,21 @@ pub async fn handle_block_command(
 
         // Handle /block without arguments - show list of blocked users
         if parts.len() == 1 {
-            let blocked_nicknames: Vec<String> = peers
-                .lock()
-                .await
-                .iter()
-                .filter_map(|(peer_id, peer)| {
-                    if let Some(fp) = encryption_service.get_peer_fingerprint(peer_id) {
-                        if blocked_peers.contains(&fp) {
-                            peer.nickname.clone()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let blocked_entries =
+                collect_blocked_display_entries(blocked_peers, peers, encryption_service).await;
 
-            if blocked_nicknames.is_empty() {
+            if blocked_entries.is_empty() {
                 let _ = ui_tx
                     .send("system: No users are currently blocked.".to_string())
                     .await;
             } else {
-                let blocked_list = blocked_nicknames.join(", ");
+                let blocked_list = blocked_entries.join(", ");
                 let _ = ui_tx
-                    .send(format!("system: Blocked users: {}", blocked_list))
+                    .send(format!(
+                        "system: Blocked users ({}): {}",
+                        blocked_peers.len(),
+                        blocked_list
+                    ))
                     .await;
             }
             return true;
@@ -1111,7 +1148,12 @@ pub async fn handle_block_command(
 
             if let Some(peer_id) = peer_id_to_block {
                 if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&peer_id) {
-                    blocked_peers.insert(fingerprint);
+                    if !blocked_peers.insert(fingerprint) {
+                        let _ = ui_tx
+                            .send(format!("system: User '{}' is already blocked.", target_name))
+                            .await;
+                        return true;
+                    }
                     let channels_vec = persistent_channels(chat_context);
                     let state_to_save = create_app_state(
                         blocked_peers,

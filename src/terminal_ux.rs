@@ -153,34 +153,44 @@ pub fn format_message_display(
 
 // FIX 7: Converted print_help to return a string.
 pub fn get_help_text() -> String {
-    vec![
-        "\n━━━ BitChat Commands ━━━\n",
-        "▶ General",
-        "  /help                    Show this help menu",
-        "  /name <name>           Change your nickname",
-        "  /status                  Show connection info",
-        "  /clear                   Clear the screen",
-        "  /r                       Restart Bluetooth mesh scan",
-        "  /exit                    Quit BitChat\n",
-        "▶ Navigation",
-        "  /public                  Go to public chat\n",
-        "▶ Messaging",
-        "  /dm <name> [msg]       Start or send a private message",
-        "  /file [@user] <path>   Send a TUI-to-TUI mesh file",
-        "  /reply                   Reply to last private message\n",
-        "▶ Channels",
-        "  /j #channel            Join/create a channel",
-        "  /leave                   Leave current channel",
-        "▶ Discovery",
-        "  /channels                List all discovered channels",
-        "  /w, /online           Show who's online\n",
-        "▶ Privacy & Security",
-        "  /block @user           Block a user",
-        "  /block                   List blocked users",
-        "  /unblock @user         Unblock a user\n",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    .join("\n")
+    fn cmd_line(cmd: &str, desc: &str) -> String {
+        format!("  {:<22} {}", cmd, desc)
+    }
+
+    let lines = vec![
+        "".to_string(),
+        "==================== BitChat Commands ====================".to_string(),
+        "".to_string(),
+        "[General]".to_string(),
+        cmd_line("/help", "Show this help menu"),
+        cmd_line("/name <name>", "Change your nickname"),
+        cmd_line("/status", "Show connection info"),
+        cmd_line("/clear", "Clear current conversation view"),
+        cmd_line("/r", "Restart Bluetooth mesh scan"),
+        cmd_line("/exit", "Quit BitChat"),
+        "".to_string(),
+        "[Navigation]".to_string(),
+        cmd_line("/public", "Go to public chat"),
+        cmd_line("/leave", "Leave current channel"),
+        "".to_string(),
+        "[Messaging]".to_string(),
+        cmd_line("/dm <name> [msg]", "Start or send a direct message"),
+        cmd_line("/reply", "Reply to last private message"),
+        cmd_line("/file [@user] <path>", "Send a TUI-to-TUI mesh file"),
+        "".to_string(),
+        "[Channels]".to_string(),
+        cmd_line("/j #channel", "Join a channel"),
+        cmd_line("/channels", "List discovered channels"),
+        cmd_line("/w, /online", "Show online users"),
+        "".to_string(),
+        "[Privacy]".to_string(),
+        cmd_line("/block @user", "Block a user"),
+        cmd_line("/block", "List blocked users"),
+        cmd_line("/unblock @user", "Unblock a user"),
+        "".to_string(),
+        "==========================================================".to_string(),
+    ];
+    lines.join("\n")
 }
 
 // Helper to extract message target from chat mode

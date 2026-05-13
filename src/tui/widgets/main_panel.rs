@@ -14,8 +14,9 @@ use crate::tui::app::{App, FocusArea, Message, MessageLineCopyTarget, MessageSta
 
 const TIME_DIVIDER_GAP_MINUTES: i32 = 15;
 const OTHER_MESSAGE_INDENT: usize = 2;
-const DM_OTHER_INDENT: usize = 2;
-const SELF_MESSAGE_RIGHT_PADDING: usize = 2;
+const DM_OTHER_INDENT: usize = 0;
+const SELF_MESSAGE_RIGHT_PADDING: usize = 0;
+const BUBBLE_MAX_WIDTH_PERCENT: usize = 90;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MessageRole {
@@ -193,7 +194,7 @@ fn render_message_lines(
             .checked_sub(1)
             .and_then(|prev_idx| messages.get(prev_idx));
         let group_starts_here = is_group_start(app, messages, idx, geohash_channel.as_deref());
-        if should_insert_time_divider(prev, msg) {
+        if !is_dm && should_insert_time_divider(prev, msg) {
             let time_label = app.format_timestamp_for_display(msg, prev);
             items.push(centered_item(
                 time_label,
@@ -225,66 +226,99 @@ fn render_message_lines(
                 format!("{}:", sender_display),
                 role,
                 available_width,
-                None,
                 0,
                 true,
-                false,
                 app.should_highlight_copy_target(&sender_target),
             ));
             line_copy_targets.push(Some(sender_target));
         }
         let body = format_message_body(msg, role);
-        let reserve_trailing_slot = is_dm && role != MessageRole::System;
-        let show_status = if role == MessageRole::SelfUser && Some(idx) == last_self_idx {
-            message_status_marker(msg.status)
-        } else {
-            None
-        };
-        let status_reserve = if reserve_trailing_slot { 2 } else { 0 };
-        let wrap_width = available_width
-            .saturating_sub(status_reserve)
-            .saturating_sub(content_indent)
-            .max(1);
+        let bubble_max_total_width = max_bubble_total_width(available_width, content_indent);
+        let wrap_width = bubble_max_total_width.saturating_sub(4).max(1);
         let wrapped_lines = wrap_display_width(&body, wrap_width);
-        let last_line_idx = wrapped_lines.len().saturating_sub(1);
-
-        for (line_idx, wrapped) in wrapped_lines.into_iter().enumerate() {
-            let status = if line_idx == last_line_idx {
-                show_status
-            } else {
-                None
-            };
-            items.push(render_aligned_message_line(
-                wrapped,
+        if role == MessageRole::System {
+            for wrapped in wrapped_lines {
+                items.push(render_aligned_message_line(
+                    wrapped,
+                    role,
+                    available_width,
+                    content_indent,
+                    false,
+                    app.should_highlight_copy_target(&MessageLineCopyTarget::Message(idx)),
+                ));
+                line_copy_targets.push(Some(MessageLineCopyTarget::Message(idx)));
+            }
+        } else {
+            let bubble_inner_width = wrapped_lines
+                .iter()
+                .map(|line| UnicodeWidthStr::width(line.as_str()))
+                .max()
+                .unwrap_or(0);
+            items.push(render_bubble_border_line(
                 role,
                 available_width,
-                status,
                 content_indent,
-                false,
-                reserve_trailing_slot && line_idx == last_line_idx,
-                app.should_highlight_copy_target(&MessageLineCopyTarget::Message(idx)),
+                bubble_inner_width,
+                true,
             ));
-            line_copy_targets.push(Some(MessageLineCopyTarget::Message(idx)));
-        }
-
-        if role == MessageRole::SelfUser
-            && is_group_end(app, messages, idx, geohash_channel.as_deref())
-        {
-            items.push(separator_item(role, available_width));
+            line_copy_targets.push(None);
+            for wrapped in wrapped_lines {
+                items.push(render_bubble_content_line(
+                    wrapped,
+                    role,
+                    available_width,
+                    content_indent,
+                    app.should_highlight_copy_target(&MessageLineCopyTarget::Message(idx)),
+                    bubble_inner_width,
+                ));
+                line_copy_targets.push(Some(MessageLineCopyTarget::Message(idx)));
+            }
+            items.push(render_bubble_border_line(
+                role,
+                available_width,
+                content_indent,
+                bubble_inner_width,
+                false,
+            ));
             line_copy_targets.push(None);
         }
+        if is_dm && role == MessageRole::SelfUser && Some(idx) == last_self_idx {
+            items.push(render_meta_line(
+                msg.timestamp.clone(),
+                role,
+                available_width,
+                content_indent,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ));
+            line_copy_targets.push(None);
+        }
+        if is_dm && role == MessageRole::SelfUser && Some(idx) == last_self_idx {
+            if let Some((label, style)) = message_status_label_for_dm_tail(msg.status) {
+                items.push(render_meta_line(
+                    label.to_string(),
+                    role,
+                    available_width,
+                    0,
+                    style.add_modifier(Modifier::DIM),
+                ));
+                line_copy_targets.push(None);
+            }
+        }
+
     }
 
     (items, line_copy_targets, unseen_divider_line_index)
 }
 
-fn message_status_marker(status: MessageStatus) -> Option<(&'static str, Style)> {
+fn message_status_label_for_dm_tail(status: MessageStatus) -> Option<(&'static str, Style)> {
     match status {
-        MessageStatus::None | MessageStatus::Sending => None,
-        MessageStatus::Delivered => Some(("✓", Style::default().fg(Color::Green))),
-        MessageStatus::Read => Some(("✓", Style::default().fg(Color::LightBlue))),
+        MessageStatus::None | MessageStatus::Read => None,
+        MessageStatus::Sending => Some(("Sending…", Style::default().fg(Color::Gray))),
+        MessageStatus::Delivered => Some(("Delivered", Style::default().fg(Color::Green))),
         MessageStatus::Failed => Some((
-            "!",
+            "Failed",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )),
     }
@@ -294,13 +328,11 @@ fn render_aligned_message_line(
     line: String,
     role: MessageRole,
     available_width: usize,
-    status: Option<(&'static str, Style)>,
     content_indent: usize,
     is_sender_label: bool,
-    reserve_status_slot: bool,
     highlight: bool,
 ) -> ListItem<'static> {
-    let base_style = match role {
+    let mut base_style = match role {
         MessageRole::System => Style::default().fg(Color::Gray),
         MessageRole::SelfUser => Style::default().fg(Color::LightGreen),
         MessageRole::Other => {
@@ -311,53 +343,121 @@ fn render_aligned_message_line(
             }
         }
     };
+    if highlight {
+        base_style = base_style.bg(Color::DarkGray);
+    }
     let line_width = UnicodeWidthStr::width(line.as_str());
 
+    let leading = match role {
+        MessageRole::System => 0,
+        MessageRole::SelfUser => available_width
+            .saturating_sub(line_width)
+            .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
+        MessageRole::Other => content_indent,
+    };
+    let mut spans = vec![Span::raw(" ".repeat(leading))];
+    spans.extend(content_spans_with_file_icon(line, base_style));
+    ListItem::new(Line::from(spans))
+}
+
+fn render_bubble_border_line(
+    role: MessageRole,
+    available_width: usize,
+    content_indent: usize,
+    bubble_inner_width: usize,
+    is_top: bool,
+) -> ListItem<'static> {
+    let horizontal = "─".repeat(bubble_inner_width.saturating_add(2));
+    let (left, right) = if is_top { ("╭", "╮") } else { ("╰", "╯") };
+    let line = format!("{left}{horizontal}{right}");
+    let line_width = UnicodeWidthStr::width(line.as_str());
+    let bubble_total_width = max_bubble_total_width(available_width, content_indent).min(line_width);
+    let leading = match role {
+        MessageRole::System => available_width.saturating_sub(bubble_total_width) / 2,
+        MessageRole::SelfUser => available_width
+            .saturating_sub(bubble_total_width)
+            .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
+        MessageRole::Other => content_indent,
+    };
+    let style = bubble_border_style();
+    ListItem::new(Line::from(vec![
+        Span::raw(" ".repeat(leading)),
+        Span::styled(line, style),
+    ]))
+}
+
+fn render_bubble_content_line(
+    line: String,
+    role: MessageRole,
+    available_width: usize,
+    content_indent: usize,
+    highlight: bool,
+    bubble_inner_width: usize,
+) -> ListItem<'static> {
+    let text_width = UnicodeWidthStr::width(line.as_str());
+    let trailing_pad = " ".repeat(bubble_inner_width.saturating_sub(text_width));
+    let bubble_total_width = bubble_inner_width.saturating_add(4);
+    let bubble_total_width = max_bubble_total_width(available_width, content_indent).min(bubble_total_width);
+    let leading = match role {
+        MessageRole::System => available_width.saturating_sub(bubble_total_width) / 2,
+        MessageRole::SelfUser => available_width
+            .saturating_sub(bubble_total_width)
+            .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
+        MessageRole::Other => content_indent,
+    };
+    let border_style = bubble_border_style();
+    let text_style = if highlight {
+        bubble_text_style(role).bg(Color::DarkGray)
+    } else {
+        bubble_text_style(role)
+    };
+    let mut spans = vec![
+        Span::raw(" ".repeat(leading)),
+        Span::styled("│ ", border_style),
+    ];
+    spans.extend(content_spans_with_file_icon(line, text_style));
+    spans.push(Span::styled(trailing_pad, border_style));
+    spans.push(Span::styled(" │", border_style));
+    ListItem::new(Line::from(spans))
+}
+
+fn max_bubble_total_width(available_width: usize, content_indent: usize) -> usize {
+    let usable = available_width.saturating_sub(content_indent);
+    let ninety = usable.saturating_mul(BUBBLE_MAX_WIDTH_PERCENT) / 100;
+    ninety.max(8).min(usable.max(1))
+}
+
+fn bubble_border_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn bubble_text_style(role: MessageRole) -> Style {
     match role {
-        _ if reserve_status_slot => {
-            let total_width = line_width.saturating_add(2);
-            let leading = match role {
-                MessageRole::SelfUser => available_width
-                    .saturating_sub(total_width)
-                    .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
-                MessageRole::Other => content_indent,
-                MessageRole::System => available_width.saturating_sub(total_width) / 2,
-            };
-            let mut spans = vec![Span::raw(" ".repeat(leading))];
-            spans.extend(content_spans_with_file_icon(line, base_style));
-            spans.push(Span::raw(" "));
-            if role == MessageRole::SelfUser {
-                if let Some((marker, marker_style)) = status {
-                    spans.push(Span::styled(marker, marker_style));
-                } else {
-                    spans.push(Span::raw(" "));
-                }
-            } else {
-                spans.push(Span::raw(" "));
-            }
-            let mut item = ListItem::new(Line::from(spans));
-            if highlight {
-                item = item.style(Style::default().bg(Color::DarkGray));
-            }
-            item
-        }
-        _ => {
-            let leading = match role {
-                MessageRole::System => available_width.saturating_sub(line_width) / 2,
-                MessageRole::SelfUser => available_width
-                    .saturating_sub(line_width)
-                    .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
-                MessageRole::Other => content_indent,
-            };
-            let mut spans = vec![Span::raw(" ".repeat(leading))];
-            spans.extend(content_spans_with_file_icon(line, base_style));
-            let mut item = ListItem::new(Line::from(spans));
-            if highlight {
-                item = item.style(Style::default().bg(Color::DarkGray));
-            }
-            item
-        }
+        MessageRole::System => Style::default().fg(Color::Gray),
+        MessageRole::SelfUser => Style::default().fg(Color::LightGreen),
+        MessageRole::Other => Style::default().fg(Color::White),
     }
+}
+
+fn render_meta_line(
+    text: String,
+    role: MessageRole,
+    available_width: usize,
+    content_indent: usize,
+    style: Style,
+) -> ListItem<'static> {
+    let text_width = UnicodeWidthStr::width(text.as_str());
+    let leading = match role {
+        MessageRole::System => 0,
+        MessageRole::SelfUser => available_width
+            .saturating_sub(text_width)
+            .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
+        MessageRole::Other => content_indent,
+    };
+    ListItem::new(Line::from(vec![
+        Span::raw(" ".repeat(leading)),
+        Span::styled(text, style),
+    ]))
 }
 
 fn content_spans_with_file_icon(line: String, base_style: Style) -> Vec<Span<'static>> {
@@ -385,27 +485,6 @@ fn centered_item(text: String, available_width: usize, style: Style) -> ListItem
     ListItem::new(Line::from(vec![
         Span::raw(" ".repeat(leading)),
         Span::styled(text, style),
-    ]))
-}
-
-fn separator_item(role: MessageRole, available_width: usize) -> ListItem<'static> {
-    let line_width = (available_width / 3).max(8).min(available_width);
-    let leading = match role {
-        MessageRole::Other => 0,
-        MessageRole::SelfUser => available_width
-            .saturating_sub(line_width)
-            .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
-        MessageRole::System => available_width.saturating_sub(line_width) / 2,
-    };
-    let separator = "-".repeat(line_width);
-    ListItem::new(Line::from(vec![
-        Span::raw(" ".repeat(leading)),
-        Span::styled(
-            separator,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        ),
     ]))
 }
 
@@ -489,22 +568,6 @@ fn message_group_key(app: &App, message: &Message, geohash_channel: Option<&str>
             format!("other:{}", message.sender)
         }
     }
-}
-
-fn is_group_end(
-    app: &App,
-    messages: &[Message],
-    index: usize,
-    geohash_channel: Option<&str>,
-) -> bool {
-    let Some(current) = messages.get(index) else {
-        return false;
-    };
-    let Some(next) = messages.get(index + 1) else {
-        return true;
-    };
-    message_group_key(app, current, geohash_channel)
-        != message_group_key(app, next, geohash_channel)
 }
 
 fn is_group_start(

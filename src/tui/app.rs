@@ -718,6 +718,9 @@ impl App {
             let parts: Vec<&str> = trimmed.splitn(5, ':').collect();
             if parts.len() >= 4 {
                 let sender = parts[1].to_string();
+                if self.is_sender_blocked(&sender) {
+                    return;
+                }
                 let timestamp_raw = parts[2];
                 let (timestamp, timestamp_epoch) = if parts.len() >= 5 {
                     Self::parse_display_and_epoch(timestamp_raw, parts.get(3).copied())
@@ -836,6 +839,9 @@ impl App {
             if parts.len() >= 7 {
                 let channel = parts[1].to_string();
                 let sender = parts[2].to_string();
+                if self.is_sender_blocked(&sender) {
+                    return;
+                }
                 let pubkey = parts[3].to_string();
                 let timestamp_raw = parts[4];
                 let (timestamp, timestamp_epoch) = if parts.len() >= 8 {
@@ -925,6 +931,9 @@ impl App {
             if parts.len() >= 6 {
                 let channel = parts[1].to_string();
                 let sender = parts[2].to_string();
+                if self.is_sender_blocked(&sender) {
+                    return;
+                }
                 let pubkey = parts[3].to_string();
                 let timestamp_raw = parts[4];
                 let (timestamp, timestamp_epoch) = if parts.len() >= 7 {
@@ -975,6 +984,9 @@ impl App {
             if parts.len() >= 5 {
                 let channel = parts[1].to_string();
                 let sender = parts[2].to_string();
+                if self.is_sender_blocked(&sender) {
+                    return;
+                }
                 let has_pubkey = parts.len() >= 6 && crate::nostr_geo::is_geohash_channel(&channel);
                 let sender_pubkey = has_pubkey.then(|| parts[3].to_string());
                 let timestamp_raw = if has_pubkey { parts[4] } else { parts[3] };
@@ -1082,11 +1094,12 @@ impl App {
             let lines: Vec<&str> = content.split('\n').collect();
 
             for line in lines {
-                let trimmed_line = line.trim();
-                if trimmed_line.is_empty() {
+                let line_no_trailing = line.trim_end();
+                if line_no_trailing.trim().is_empty() {
                     continue;
                 }
-                let Some(content) = Self::filter_system_message_line(trimmed_line, debug_enabled)
+                let Some(content) =
+                    Self::filter_system_message_line(line_no_trailing, debug_enabled)
                 else {
                     continue;
                 };
@@ -1171,6 +1184,30 @@ impl App {
             self.channel_messages.entry(channel).or_default().push(msg);
         }
         self.follow_or_mark_new_message();
+    }
+
+    fn normalized_block_name(value: &str) -> String {
+        let mut trimmed = value.trim().trim_start_matches('@').to_ascii_lowercase();
+        if let Some((base, suffix)) = trimmed.rsplit_once('#') {
+            if !base.is_empty()
+                && suffix.len() == 4
+                && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
+            {
+                trimmed = base.to_string();
+            }
+        }
+        trimmed
+    }
+
+    fn is_sender_blocked(&self, sender: &str) -> bool {
+        let sender_norm = Self::normalized_block_name(sender);
+        if sender_norm.is_empty() {
+            return false;
+        }
+        self.blocked
+            .iter()
+            .map(|entry| Self::normalized_block_name(entry))
+            .any(|entry| !entry.is_empty() && entry == sender_norm)
     }
 
     pub fn add_pending_geohash_dm_message(&mut self, text: String, local_id: String) {
