@@ -223,7 +223,7 @@ fn render_message_lines(
                 line_copy_targets.push(None);
             }
             items.push(render_aligned_message_line(
-                format!("{}:", sender_display),
+                sender_display.clone(),
                 role,
                 available_width,
                 0,
@@ -332,7 +332,7 @@ fn render_aligned_message_line(
     is_sender_label: bool,
     highlight: bool,
 ) -> ListItem<'static> {
-    let mut base_style = match role {
+    let base_style = match role {
         MessageRole::System => Style::default().fg(Color::Gray),
         MessageRole::SelfUser => Style::default().fg(Color::LightGreen),
         MessageRole::Other => {
@@ -343,20 +343,37 @@ fn render_aligned_message_line(
             }
         }
     };
-    if highlight {
-        base_style = base_style.bg(Color::DarkGray);
-    }
     let line_width = UnicodeWidthStr::width(line.as_str());
+    let display_width = if is_sender_label {
+        line_width.saturating_add(1)
+    } else {
+        line_width
+    };
 
     let leading = match role {
         MessageRole::System => 0,
         MessageRole::SelfUser => available_width
-            .saturating_sub(line_width)
+            .saturating_sub(display_width)
             .saturating_sub(SELF_MESSAGE_RIGHT_PADDING),
         MessageRole::Other => content_indent,
     };
     let mut spans = vec![Span::raw(" ".repeat(leading))];
-    spans.extend(content_spans_with_file_icon(line, base_style));
+    if is_sender_label {
+        let label_style = if highlight {
+            base_style.bg(Color::DarkGray)
+        } else {
+            base_style
+        };
+        spans.extend(content_spans_with_file_icon(line, label_style));
+        spans.push(Span::styled(":", base_style));
+    } else {
+        let style = if highlight {
+            base_style.bg(Color::DarkGray)
+        } else {
+            base_style
+        };
+        spans.extend(content_spans_with_file_icon(line, style));
+    }
     ListItem::new(Line::from(spans))
 }
 

@@ -2,7 +2,7 @@ use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteTyp
 use btleplug::platform::{Manager, Peripheral};
 
 use futures::stream::StreamExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
@@ -523,6 +523,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let mut pending_saved_geohash_joins: VecDeque<String> = VecDeque::new();
     for channel in &restored_channels {
         if !app.channels.contains(channel) {
             app.channels.push(channel.clone());
@@ -535,18 +536,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chat_context.as_mut().unwrap().add_channel(channel);
 
         if nostr_geo::is_geohash_channel(channel) {
-            if let Err(e) = nostr_geo_client.join_channel(channel, &nickname).await {
-                app.add_log_message(format!(
-                    "system: Failed to auto-join saved geohash channel {}: {}",
-                    channel, e
-                ));
-            }
+            pending_saved_geohash_joins.push_back(channel.clone());
         }
     }
+    let mut active_saved_geohash_join: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut last_tick = std::time::Instant::now();
     let tick_rate = StdDuration::from_millis(100);
     'mainloop: loop {
+        if let Some(handle) = active_saved_geohash_join.as_ref() {
+            if handle.is_finished() {
+                let handle = active_saved_geohash_join.take().unwrap();
+                let _ = handle.await;
+            }
+        }
+        if active_saved_geohash_join.is_none() {
+            if let Some(channel) = pending_saved_geohash_joins.pop_front() {
+                let client = nostr_geo_client.clone();
+                let nickname_for_join = nickname.clone();
+                let ui_tx_for_join = ui_tx.clone();
+                active_saved_geohash_join = Some(tokio::spawn(async move {
+                    if let Err(e) = client.join_channel(&channel, &nickname_for_join).await {
+                        let _ = ui_tx_for_join
+                            .send(format!(
+                                "system: Failed to auto-join saved geohash channel {}: {}",
+                                channel, e
+                            ))
+                            .await;
+                    }
+                }));
+            }
+        }
+
         // 1. Handle UI messages
         for _ in 0..MAX_UI_MESSAGES_PER_TICK {
             let Ok(msg) = ui_rx.try_recv() else {

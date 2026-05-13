@@ -1280,7 +1280,7 @@ impl App {
         match target {
             MessageLineCopyTarget::Message(index) => self.current_message_text_for_copy(*index),
             MessageLineCopyTarget::SenderLabel(name) => {
-                let trimmed = name.trim();
+                let trimmed = name.trim().trim_end_matches(':').trim_end();
                 if trimmed.is_empty() {
                     None
                 } else {
