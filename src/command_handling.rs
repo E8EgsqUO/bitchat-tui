@@ -37,12 +37,24 @@ fn strip_display_suffix(target: &str) -> &str {
 }
 
 fn persistent_channels(chat_context: &ChatContext) -> Vec<String> {
-    chat_context
+    let mut channels: Vec<String> = chat_context
         .active_channels
         .iter()
-        .filter(|channel| !crate::nostr_geo::is_geohash_channel(channel))
-        .cloned()
-        .collect()
+        .filter_map(|channel| {
+            let trimmed = channel.trim();
+            if trimmed.is_empty() || trimmed == "#public" {
+                return None;
+            }
+            Some(if trimmed.starts_with('#') {
+                trimmed.to_string()
+            } else {
+                format!("#{}", trimmed)
+            })
+        })
+        .collect();
+    channels.sort();
+    channels.dedup();
+    channels
 }
 
 struct FileCommand<'a> {

@@ -136,6 +136,50 @@ fn build_app_state_factory(
     )
 }
 
+fn collect_persisted_joined_channels(chat_context: &ChatContext) -> Vec<String> {
+    let mut channels: Vec<String> = chat_context
+        .active_channels
+        .iter()
+        .filter_map(|channel| {
+            let trimmed = channel.trim();
+            if trimmed.is_empty() || trimmed == "#public" {
+                return None;
+            }
+            Some(if trimmed.starts_with('#') {
+                trimmed.to_string()
+            } else {
+                format!("#{}", trimmed)
+            })
+        })
+        .collect();
+    channels.sort();
+    channels.dedup();
+    channels
+}
+
+fn persist_runtime_state(
+    chat_context: &ChatContext,
+    blocked_peers: &HashSet<String>,
+    channel_creators: &HashMap<String, String>,
+    password_protected_channels: &HashSet<String>,
+    channel_key_commitments: &HashMap<String, String>,
+    app_state: &AppState,
+    create_app_state: &AppStateFactory,
+    nickname: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let channels_vec = collect_persisted_joined_channels(chat_context);
+    let state_to_save = create_app_state(
+        blocked_peers,
+        channel_creators,
+        &channels_vec,
+        password_protected_channels,
+        channel_key_commitments,
+        &app_state.encrypted_channel_passwords,
+        nickname,
+    );
+    save_state(&state_to_save)
+}
+
 // This function now takes a UI channel sender to direct its output.
 // It still reads from stdin directly but sends user input over its own channel.
 async fn setup_bluetooth_connection(
@@ -455,39 +499,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let mut noise_session_manager: Option<NoiseSessionManager> = None;
 
-    if let Some(state) = app_state.as_mut() {
-        let original_len = state.joined_channels.len();
-        state.joined_channels.retain(|raw_channel| {
-            let trimmed = raw_channel.trim();
-            let channel = if trimmed.starts_with('#') {
-                trimmed.to_string()
-            } else {
-                format!("#{}", trimmed)
-            };
-            !nostr_geo::is_geohash_channel(&channel)
-        });
-        if state.joined_channels.len() != original_len {
-            let _ = save_state(state);
-        }
-    }
-
+    let mut restored_channels: Vec<String> = Vec::new();
+    let mut seen_restored_channels: HashSet<String> = HashSet::new();
     for raw_channel in &saved_state.joined_channels {
         let trimmed = raw_channel.trim();
         if trimmed.is_empty() || trimmed == "#public" {
             continue;
         }
-
-        let channel = if trimmed.starts_with('#') {
+        let normalized = if trimmed.starts_with('#') {
             trimmed.to_string()
         } else {
             format!("#{}", trimmed)
         };
-
-        if nostr_geo::is_geohash_channel(&channel) {
-            continue;
+        if seen_restored_channels.insert(normalized.clone()) {
+            restored_channels.push(normalized);
         }
+    }
 
-        if !app.channels.contains(&channel) {
+    if let Some(state) = app_state.as_mut() {
+        if state.joined_channels != restored_channels {
+            state.joined_channels = restored_channels.clone();
+            let _ = save_state(state);
+        }
+    }
+
+    for channel in &restored_channels {
+        if !app.channels.contains(channel) {
             app.channels.push(channel.clone());
         }
         app.channel_messages.entry(channel.clone()).or_default();
@@ -495,7 +532,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_mut()
             .unwrap()
             .insert(channel.clone());
-        chat_context.as_mut().unwrap().add_channel(&channel);
+        chat_context.as_mut().unwrap().add_channel(channel);
+
+        if nostr_geo::is_geohash_channel(channel) {
+            if let Err(e) = nostr_geo_client.join_channel(channel, &nickname).await {
+                app.add_log_message(format!(
+                    "system: Failed to auto-join saved geohash channel {}: {}",
+                    channel, e
+                ));
+            }
+        }
     }
 
     let mut last_tick = std::time::Instant::now();
@@ -1120,22 +1166,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app_state.as_ref(),
                 create_app_state.as_ref(),
             ) {
-                let channels_vec: Vec<String> = chat_context
-                    .active_channels
-                    .iter()
-                    .filter(|channel| !nostr_geo::is_geohash_channel(channel))
-                    .cloned()
-                    .collect();
-                let state_to_save = create_app_state(
+                if let Err(e) = persist_runtime_state(
+                    chat_context,
                     blocked_peers,
                     channel_creators,
-                    &channels_vec,
                     password_protected_channels,
                     channel_key_commitments,
-                    &app_state.encrypted_channel_passwords,
+                    app_state,
+                    create_app_state,
                     &new_nickname,
-                );
-                if let Err(e) = save_state(&state_to_save) {
+                ) {
                     let error_msg = format!("Warning: Could not save nickname: {}", e);
                     app.add_log_message(format!("system: {}", error_msg));
                 }
@@ -1213,22 +1253,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app_state.as_ref(),
                     create_app_state.as_ref(),
                 ) {
-                    let channels_vec: Vec<String> = chat_context
-                        .active_channels
-                        .iter()
-                        .filter(|channel| !nostr_geo::is_geohash_channel(channel))
-                        .cloned()
-                        .collect();
-                    let state_to_save = create_app_state(
+                    if let Err(e) = persist_runtime_state(
+                        chat_context,
                         blocked_peers,
                         channel_creators,
-                        &channels_vec,
                         password_protected_channels,
                         channel_key_commitments,
-                        &app_state.encrypted_channel_passwords,
+                        app_state,
+                        create_app_state,
                         &nickname,
-                    );
-                    if let Err(e) = save_state(&state_to_save) {
+                    ) {
                         app.add_log_message(format!(
                             "system: Warning: Could not save state: {}",
                             e
@@ -1285,6 +1319,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ));
                         }
                         app.switch_to_channel(channel_name.clone());
+                        if let Err(e) = persist_runtime_state(
+                            chat_context.as_ref().unwrap(),
+                            blocked_peers.as_ref().unwrap(),
+                            channel_creators.as_ref().unwrap(),
+                            password_protected_channels.as_ref().unwrap(),
+                            channel_key_commitments.as_ref().unwrap(),
+                            app_state.as_ref().unwrap(),
+                            create_app_state.as_ref().unwrap(),
+                            &nickname,
+                        ) {
+                            app.add_log_message(format!(
+                                "system: Warning: Could not save state: {}",
+                                e
+                            ));
+                        }
                         continue;
                     }
 
@@ -1338,6 +1387,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         // Explicitly switch UI to the joined channel after successful join
                         app.switch_to_channel(channel_name.clone());
+                        if let Err(e) = persist_runtime_state(
+                            chat_context.as_ref().unwrap(),
+                            blocked_peers.as_ref().unwrap(),
+                            channel_creators.as_ref().unwrap(),
+                            password_protected_channels.as_ref().unwrap(),
+                            channel_key_commitments.as_ref().unwrap(),
+                            app_state.as_ref().unwrap(),
+                            create_app_state.as_ref().unwrap(),
+                            &nickname,
+                        ) {
+                            app.add_log_message(format!(
+                                "system: Warning: Could not save state: {}",
+                                e
+                            ));
+                        }
                         continue;
                     }
                 } else {
@@ -1417,6 +1481,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "system: Left geohash channel {}",
                             selected_channel
                         ));
+                        if let Err(e) = persist_runtime_state(
+                            chat_context.as_ref().unwrap(),
+                            blocked_peers.as_ref().unwrap(),
+                            channel_creators.as_ref().unwrap(),
+                            password_protected_channels.as_ref().unwrap(),
+                            channel_key_commitments.as_ref().unwrap(),
+                            app_state.as_ref().unwrap(),
+                            create_app_state.as_ref().unwrap(),
+                            &nickname,
+                        ) {
+                            app.add_log_message(format!(
+                                "system: Warning: Could not save state: {}",
+                                e
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -1978,6 +2057,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 // Update TUI to reflect public chat mode (since leaving a channel switches to public)
                 app.switch_to_public();
+                if let Err(e) = persist_runtime_state(
+                    chat_context.as_ref().unwrap(),
+                    blocked_peers.as_ref().unwrap(),
+                    channel_creators.as_ref().unwrap(),
+                    password_protected_channels.as_ref().unwrap(),
+                    channel_key_commitments.as_ref().unwrap(),
+                    app_state.as_ref().unwrap(),
+                    create_app_state.as_ref().unwrap(),
+                    &nickname,
+                ) {
+                    app.add_log_message(format!("system: Warning: Could not save state: {}", e));
+                }
                 continue;
             }
             if handle_fingerprint_command(
@@ -2160,22 +2251,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_state.as_ref(),
         create_app_state.as_ref(),
     ) {
-        let channels_vec: Vec<String> = chat_context
-            .active_channels
-            .iter()
-            .filter(|channel| !nostr_geo::is_geohash_channel(channel))
-            .cloned()
-            .collect();
-        let state_to_save = create_app_state(
+        let _ = persist_runtime_state(
+            chat_context,
             blocked_peers,
             channel_creators,
-            &channels_vec,
             password_protected_channels,
             channel_key_commitments,
-            &app_state.encrypted_channel_passwords,
+            app_state,
+            create_app_state,
             &nickname,
         );
-        let _ = save_state(&state_to_save);
     }
 
     // Restore the terminal
