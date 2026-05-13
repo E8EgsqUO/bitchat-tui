@@ -96,6 +96,7 @@ use x25519_dalek::StaticSecret;
 type AppStateFactory = Box<
     dyn Fn(
             &HashSet<String>,
+            &[String],
             &HashMap<String, String>,
             &Vec<String>,
             &HashSet<String>,
@@ -114,6 +115,7 @@ fn build_app_state_factory(
 ) -> AppStateFactory {
     Box::new(
         move |blocked,
+              blocked_names,
               creators,
               channels,
               protected,
@@ -123,6 +125,7 @@ fn build_app_state_factory(
             AppState {
                 nickname: Some(current_nickname.to_string()),
                 blocked_peers: blocked.clone(),
+                blocked_names: blocked_names.to_vec(),
                 channel_creators: creators.clone(),
                 joined_channels: channels.clone(),
                 password_protected_channels: protected.clone(),
@@ -157,9 +160,33 @@ fn collect_persisted_joined_channels(chat_context: &ChatContext) -> Vec<String> 
     channels
 }
 
+fn collect_manual_blocked_names(entries: &[String]) -> Vec<String> {
+    let mut manual: Vec<String> = Vec::new();
+    for entry in entries {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() || trimmed.starts_with("fingerprint:") {
+            continue;
+        }
+        if let Some((name, suffix_with_paren)) = trimmed.rsplit_once(" (") {
+            if !name.trim().is_empty() && suffix_with_paren.ends_with(')') {
+                let suffix = &suffix_with_paren[..suffix_with_paren.len() - 1];
+                if suffix.len() == 10 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    continue;
+                }
+            }
+        }
+        if !manual.iter().any(|existing| existing.eq_ignore_ascii_case(trimmed)) {
+            manual.push(trimmed.to_string());
+        }
+    }
+    manual.sort();
+    manual
+}
+
 fn persist_runtime_state(
     chat_context: &ChatContext,
     blocked_peers: &HashSet<String>,
+    blocked_entries: &[String],
     channel_creators: &HashMap<String, String>,
     password_protected_channels: &HashSet<String>,
     channel_key_commitments: &HashMap<String, String>,
@@ -168,8 +195,10 @@ fn persist_runtime_state(
     nickname: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let channels_vec = collect_persisted_joined_channels(chat_context);
+    let blocked_names = collect_manual_blocked_names(blocked_entries);
     let state_to_save = create_app_state(
         blocked_peers,
+        &blocked_names,
         channel_creators,
         &channels_vec,
         password_protected_channels,
@@ -296,6 +325,48 @@ fn parse_dm_command(line: &str) -> Option<(String, Option<String>)> {
     Some((target.to_string(), message))
 }
 
+fn parse_go_command_target(line: &str) -> Result<Option<String>, &'static str> {
+    let Some(rest) = line.strip_prefix("/g") else {
+        return Err("not-g");
+    };
+    if !rest.is_empty() && !rest.chars().next().unwrap_or(' ').is_whitespace() {
+        return Err("not-g");
+    }
+    let arg = rest.trim();
+    if arg.is_empty() {
+        return Ok(None);
+    }
+    if arg.split_whitespace().count() > 1 {
+        return Err("usage");
+    }
+    let geohash = nostr_geo::normalize_geohash(arg).ok_or("usage")?;
+    Ok(Some(format!("#{}", geohash)))
+}
+
+fn find_latest_geohash_with_messages(app: &App) -> Option<String> {
+    app.channels
+        .iter()
+        .filter(|channel| nostr_geo::is_geohash_channel(channel))
+        .filter_map(|channel| {
+            let messages = app.channel_messages.get(channel)?;
+            if messages.is_empty() {
+                return None;
+            }
+            let last_epoch = messages
+                .iter()
+                .rev()
+                .find_map(|message| message.timestamp_epoch)
+                .unwrap_or(i64::MIN);
+            Some((last_epoch, messages.len(), channel.clone()))
+        })
+        .max_by(|(epoch_a, len_a, _), (epoch_b, len_b, _)| {
+            epoch_a
+                .cmp(epoch_b)
+                .then_with(|| len_a.cmp(len_b))
+        })
+        .map(|(_, _, channel)| channel)
+}
+
 fn strip_display_suffix(target: &str) -> &str {
     let trimmed = target.trim();
     let Some((base, suffix)) = trimmed.rsplit_once('#') else {
@@ -415,8 +486,6 @@ fn mesh_only_command_in_geohash(line: &str) -> Option<&'static str> {
     let command = line.split_whitespace().next().unwrap_or("");
     match command {
         "/reply" => Some("/reply"),
-        "/block" => Some("/block"),
-        "/unblock" => Some("/unblock"),
         _ => None,
     }
 }
@@ -444,6 +513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the TUI with the saved nickname
     let mut terminal = tui_mod::init().expect("Failed to initialize TUI");
     let mut app = App::new_with_nickname(saved_nickname);
+    app.update_blocked_list(saved_state.blocked_names.clone());
     let nostr_geo_client = nostr_geo::NostrGeoClient::new(ui_tx.clone(), nostr_identity_seed);
 
     // Spawn Bluetooth connection setup in the background
@@ -723,7 +793,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     peers.as_ref(),
                     encryption_service.as_ref(),
                 ) {
-                    let blocked_nicknames: Vec<String> = peers
+                    let mut blocked_nicknames: Vec<String> = peers
                         .lock()
                         .await
                         .iter()
@@ -739,6 +809,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         })
                         .collect();
+                    blocked_nicknames.extend(app.blocked.iter().cloned());
+                    blocked_nicknames.sort();
+                    blocked_nicknames.dedup();
                     app.update_blocked_list(blocked_nicknames);
                 }
                 // Initialize Noise session manager
@@ -927,6 +1000,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     channel_key_commitments.as_mut().unwrap(),
                                     chat_context.as_mut().unwrap(),
                                     blocked_peers.as_ref().unwrap(),
+                                    &collect_manual_blocked_names(&app.blocked),
                                     &app_state.as_ref().unwrap().encrypted_channel_passwords,
                                     &nickname,
                                     create_app_state.as_ref().unwrap().as_ref(),
@@ -1190,6 +1264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = persist_runtime_state(
                     chat_context,
                     blocked_peers,
+                    &app.blocked,
                     channel_creators,
                     password_protected_channels,
                     channel_key_commitments,
@@ -1277,6 +1352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(e) = persist_runtime_state(
                         chat_context,
                         blocked_peers,
+                        &app.blocked,
                         channel_creators,
                         password_protected_channels,
                         channel_key_commitments,
@@ -1305,6 +1381,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // `/help` is a local self command output; don't mark it as unseen/new messages.
                 app.unseen_divider_message_index = None;
                 app.unseen_divider_line_index = None;
+                continue;
+            }
+
+            if line == "/g" || line.starts_with("/g ") {
+                let target_channel = match parse_go_command_target(&line) {
+                    Ok(Some(channel)) => channel,
+                    Ok(None) => match find_latest_geohash_with_messages(&app) {
+                        Some(channel) => channel,
+                        None => {
+                            app.add_log_message(
+                                "system: No geohash channel has messages yet. Use /g <area> (e.g. /g ws)."
+                                    .to_string(),
+                            );
+                            continue;
+                        }
+                    },
+                    Err("usage") => {
+                        app.add_log_message(
+                            "system: Usage: /g <area>. Examples: /g ws, /g dh. Use /g with no args to jump to a geohash channel that already has messages."
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+
+                if !app.channels.contains(&target_channel) {
+                    app.join_channel(target_channel.clone());
+                    discovered_channels
+                        .as_mut()
+                        .unwrap()
+                        .insert(target_channel.clone());
+                }
+                chat_context
+                    .as_mut()
+                    .unwrap()
+                    .switch_to_channel(&target_channel);
+
+                if let Err(e) = nostr_geo_client.join_channel(&target_channel, &nickname).await {
+                    app.add_log_message(format!(
+                        "system: Failed to join Nostr geohash channel {}: {}",
+                        target_channel, e
+                    ));
+                }
+                app.switch_to_channel(target_channel.clone());
+
+                if let Err(e) = persist_runtime_state(
+                    chat_context.as_ref().unwrap(),
+                    blocked_peers.as_ref().unwrap(),
+                    &app.blocked,
+                    channel_creators.as_ref().unwrap(),
+                    password_protected_channels.as_ref().unwrap(),
+                    channel_key_commitments.as_ref().unwrap(),
+                    app_state.as_ref().unwrap(),
+                    create_app_state.as_ref().unwrap(),
+                    &nickname,
+                ) {
+                    app.add_log_message(format!("system: Warning: Could not save state: {}", e));
+                }
                 continue;
             }
 
@@ -1346,6 +1481,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(e) = persist_runtime_state(
                             chat_context.as_ref().unwrap(),
                             blocked_peers.as_ref().unwrap(),
+                            &app.blocked,
                             channel_creators.as_ref().unwrap(),
                             password_protected_channels.as_ref().unwrap(),
                             channel_key_commitments.as_ref().unwrap(),
@@ -1414,6 +1550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(e) = persist_runtime_state(
                             chat_context.as_ref().unwrap(),
                             blocked_peers.as_ref().unwrap(),
+                            &app.blocked,
                             channel_creators.as_ref().unwrap(),
                             password_protected_channels.as_ref().unwrap(),
                             channel_key_commitments.as_ref().unwrap(),
@@ -1508,6 +1645,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Err(e) = persist_runtime_state(
                             chat_context.as_ref().unwrap(),
                             blocked_peers.as_ref().unwrap(),
+                            &app.blocked,
                             channel_creators.as_ref().unwrap(),
                             password_protected_channels.as_ref().unwrap(),
                             channel_key_commitments.as_ref().unwrap(),
@@ -1528,6 +1666,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if handle_name_command(
                 &line,
                 &mut nickname,
+                &app,
                 blocked_peers.as_ref().unwrap(),
                 channel_creators.as_ref().unwrap(),
                 chat_context.as_mut().unwrap(),
@@ -1908,7 +2047,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Check if we're connected before handling commands that require connection
-            if !app.connected && !line.starts_with("/help") && !line.starts_with("/j ") {
+            if !app.connected
+                && !line.starts_with("/help")
+                && !line.starts_with("/j ")
+                && !line.starts_with("/block")
+                && !line.starts_with("/unblock")
+            {
                 app.add_log_message("system: Bluetooth mesh is still offline. Nostr geohash channels are available with /j #ws.".to_string());
                 continue;
             }
@@ -2084,6 +2228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = persist_runtime_state(
                     chat_context.as_ref().unwrap(),
                     blocked_peers.as_ref().unwrap(),
+                    &app.blocked,
                     channel_creators.as_ref().unwrap(),
                     password_protected_channels.as_ref().unwrap(),
                     channel_key_commitments.as_ref().unwrap(),
@@ -2278,6 +2423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = persist_runtime_state(
             chat_context,
             blocked_peers,
+            &app.blocked,
             channel_creators,
             password_protected_channels,
             channel_key_commitments,
@@ -2350,15 +2496,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_go_command_target() {
+        assert_eq!(parse_go_command_target("/g"), Ok(None));
+        assert_eq!(parse_go_command_target("/g ws"), Ok(Some("#ws".to_string())));
+        assert_eq!(parse_go_command_target("/g #dh"), Ok(Some("#dh".to_string())));
+        assert_eq!(parse_go_command_target("/g   bad!"), Err("usage"));
+    }
+
+    #[test]
+    fn picks_latest_geohash_with_messages() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.join_channel("#ws".to_string());
+        app.join_channel("#dh".to_string());
+
+        app.add_log_message("__CHANNEL__:#ws:alice:1200:first".to_string());
+        app.add_log_message("__CHANNEL__:#dh:bob:1201:second".to_string());
+
+        assert_eq!(
+            find_latest_geohash_with_messages(&app),
+            Some("#dh".to_string())
+        );
+    }
+
+    #[test]
     fn detects_mesh_only_commands_inside_geohash() {
         assert_eq!(
             mesh_only_command_in_geohash("/file @alice ./photo.png"),
             None
         );
-        assert_eq!(
-            mesh_only_command_in_geohash("/block @alice"),
-            Some("/block")
-        );
+        assert_eq!(mesh_only_command_in_geohash("/block @alice"), None);
         assert_eq!(mesh_only_command_in_geohash("/online"), None);
     }
 

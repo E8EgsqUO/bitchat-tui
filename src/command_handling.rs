@@ -14,7 +14,7 @@ use btleplug::api::{Peripheral as _, WriteType};
 use btleplug::platform::Peripheral;
 use chrono;
 use regex::Regex;
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -63,6 +63,132 @@ fn short_fingerprint(value: &str) -> String {
 
 fn short_peer_id(value: &str) -> String {
     value.chars().take(8).collect()
+}
+
+fn normalize_block_target(value: &str) -> String {
+    let mut trimmed = value
+        .trim()
+        .trim_start_matches('@')
+        .trim_end_matches(':')
+        .to_ascii_lowercase();
+    if let Some((base, _)) = trimmed.split_once(" (") {
+        trimmed = base.to_string();
+    }
+    if let Some((base, suffix)) = trimmed.rsplit_once('#') {
+        if !base.is_empty() && suffix.len() == 4 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            trimmed = base.to_string();
+        }
+    }
+    trimmed
+}
+
+fn parse_name_with_optional_suffix(value: &str) -> (String, Option<String>) {
+    let normalized = value
+        .trim()
+        .trim_start_matches('@')
+        .trim_end_matches(':')
+        .to_ascii_lowercase();
+    if let Some((base, suffix)) = normalized.rsplit_once('#') {
+        if !base.is_empty() && suffix.len() == 4 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return (normalize_block_target(base), Some(suffix.to_string()));
+        }
+    }
+    (normalize_block_target(&normalized), None)
+}
+
+fn peer_suffix(peer_id: &str) -> String {
+    let digest = Sha256::digest(peer_id.as_bytes());
+    hex::encode(digest)[..4].to_string()
+}
+
+fn peer_display_token(nickname: &str, peer_id: &str) -> String {
+    format!("{}#{}", nickname, peer_suffix(peer_id))
+}
+
+fn resolve_named_peers(
+    peers: &HashMap<String, Peer>,
+    target_name: &str,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let (target_base, target_suffix) = parse_name_with_optional_suffix(target_name);
+    let mut matches: Vec<(String, String)> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+
+    for (peer_id, peer) in peers.iter() {
+        let Some(nickname) = peer.nickname.as_ref() else {
+            continue;
+        };
+        if normalize_block_target(nickname) != target_base {
+            continue;
+        }
+        let suffix = peer_suffix(peer_id);
+        if let Some(target_suffix) = target_suffix.as_ref() {
+            if &suffix != target_suffix {
+                continue;
+            }
+        }
+        matches.push((peer_id.clone(), nickname.clone()));
+        labels.push(peer_display_token(nickname, peer_id));
+    }
+
+    labels.sort();
+    labels.dedup();
+    (matches, labels)
+}
+
+fn names_match(lhs: &str, rhs: &str) -> bool {
+    let left = normalize_block_target(lhs);
+    let right = normalize_block_target(rhs);
+    !left.is_empty() && left == right
+}
+
+fn merge_manual_blocked_entries(blocked_entries: &mut Vec<String>, manual_entries: &[String]) {
+    for entry in manual_entries {
+        if blocked_entries.iter().any(|existing| names_match(existing, entry)) {
+            continue;
+        }
+        if !entry.trim().is_empty() {
+            blocked_entries.push(entry.trim().to_string());
+        }
+    }
+    blocked_entries.sort();
+}
+
+fn add_manual_block_entry(app: &mut crate::tui::app::App, target_name: &str) {
+    if app.blocked.iter().any(|entry| names_match(entry, target_name)) {
+        return;
+    }
+    app.blocked.push(target_name.trim().trim_start_matches('@').to_string());
+    app.blocked.sort();
+}
+
+fn remove_manual_block_entry(app: &mut crate::tui::app::App, target_name: &str) -> bool {
+    let before = app.blocked.len();
+    app.blocked.retain(|entry| !names_match(entry, target_name));
+    before != app.blocked.len()
+}
+
+fn manual_block_entries(entries: &[String]) -> Vec<String> {
+    let mut manual: Vec<String> = Vec::new();
+    for entry in entries {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() || trimmed.starts_with("fingerprint:") {
+            continue;
+        }
+        if let Some((name, suffix_with_paren)) = trimmed.rsplit_once(" (") {
+            if !name.trim().is_empty() && suffix_with_paren.ends_with(')') {
+                let suffix = &suffix_with_paren[..suffix_with_paren.len() - 1];
+                if suffix.len() == 10 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    continue;
+                }
+            }
+        }
+        if manual.iter().any(|existing| names_match(existing, trimmed)) {
+            continue;
+        }
+        manual.push(trimmed.to_string());
+    }
+    manual.sort();
+    manual
 }
 
 async fn collect_blocked_display_entries(
@@ -327,6 +453,7 @@ pub(crate) fn format_file_size(bytes: u64) -> String {
 pub async fn handle_name_command(
     line: &str,
     nickname: &mut String,
+    app: &crate::tui::app::App,
     blocked_peers: &HashSet<String>,
     channel_creators: &HashMap<String, String>,
     chat_context: &ChatContext,
@@ -335,6 +462,7 @@ pub async fn handle_name_command(
     app_state: &AppState,
     create_app_state: &dyn Fn(
         &HashSet<String>,
+        &[String],
         &HashMap<String, String>,
         &Vec<String>,
         &HashSet<String>,
@@ -358,8 +486,10 @@ pub async fn handle_name_command(
             *nickname = new_name.to_string();
             // Don't send announcement or message here - let the main loop handle everything via the pending_nickname_update signal
             let channels_vec = persistent_channels(chat_context);
+            let blocked_names = manual_block_entries(&app.blocked);
             let state_to_save = create_app_state(
                 blocked_peers,
+                &blocked_names,
                 channel_creators,
                 &channels_vec,
                 password_protected_channels,
@@ -388,6 +518,7 @@ pub async fn handle_join_command(
     app_state: &mut AppState,
     create_app_state: &dyn Fn(
         &HashSet<String>,
+        &[String],
         &HashMap<String, String>,
         &Vec<String>,
         &HashSet<String>,
@@ -440,8 +571,10 @@ pub async fn handle_join_command(
                             .insert(channel_name.clone(), encrypted);
                         // FIX: Convert HashSet to Vec before saving state
                         let channels_vec = persistent_channels(chat_context);
+                        let blocked_names = manual_block_entries(&app.blocked);
                         let state_to_save = create_app_state(
                             blocked_peers,
+                            &blocked_names,
                             channel_creators,
                             &channels_vec,
                             password_protected_channels,
@@ -526,6 +659,7 @@ pub async fn handle_exit_command(
     app_state: &AppState,
     create_app_state: &dyn Fn(
         &HashSet<String>,
+        &[String],
         &HashMap<String, String>,
         &Vec<String>,
         &HashSet<String>,
@@ -539,8 +673,10 @@ pub async fn handle_exit_command(
 ) -> bool {
     if line == "/exit" {
         let channels_vec = persistent_channels(chat_context);
+        let blocked_names = manual_block_entries(&app.blocked);
         let state_to_save = create_app_state(
             blocked_peers,
+            &blocked_names,
             channel_creators,
             &channels_vec,
             password_protected_channels,
@@ -1100,6 +1236,7 @@ pub async fn handle_block_command(
     app_state: &AppState,
     create_app_state: &dyn Fn(
         &HashSet<String>,
+        &[String],
         &HashMap<String, String>,
         &Vec<String>,
         &HashSet<String>,
@@ -1116,8 +1253,9 @@ pub async fn handle_block_command(
 
         // Handle /block without arguments - show list of blocked users
         if parts.len() == 1 {
-            let blocked_entries =
+            let mut blocked_entries =
                 collect_blocked_display_entries(blocked_peers, peers, encryption_service).await;
+            merge_manual_blocked_entries(&mut blocked_entries, &app.blocked);
 
             if blocked_entries.is_empty() {
                 let _ = ui_tx
@@ -1139,12 +1277,22 @@ pub async fn handle_block_command(
         // Handle /block with username argument
         if parts.len() == 2 {
             let target_name = parts[1].trim_start_matches('@');
-            let peer_id_to_block = peers
-                .lock()
-                .await
-                .iter()
-                .find(|(_, peer)| peer.nickname.as_deref() == Some(target_name))
-                .map(|(id, _)| id.clone());
+            let peers_guard = peers.lock().await;
+            let (peer_matches, labels) = resolve_named_peers(&peers_guard, target_name);
+            drop(peers_guard);
+
+            if peer_matches.len() > 1 {
+                let _ = ui_tx
+                    .send(format!(
+                        "system: Multiple users match '{}': {}. Use /block name#xxxx for exact match.",
+                        target_name,
+                        labels.join(", ")
+                    ))
+                    .await;
+                return true;
+            }
+
+            let peer_id_to_block = peer_matches.first().map(|(id, _)| id.clone());
 
             if let Some(peer_id) = peer_id_to_block {
                 if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&peer_id) {
@@ -1155,8 +1303,10 @@ pub async fn handle_block_command(
                         return true;
                     }
                     let channels_vec = persistent_channels(chat_context);
+                    let blocked_names = manual_block_entries(&app.blocked);
                     let state_to_save = create_app_state(
                         blocked_peers,
+                        &blocked_names,
                         channel_creators,
                         &channels_vec,
                         password_protected_channels,
@@ -1170,33 +1320,64 @@ pub async fn handle_block_command(
                             .await;
                     }
 
-                    // Update TUI blocked list
-                    let blocked_nicknames: Vec<String> = peers
-                        .lock()
-                        .await
-                        .iter()
-                        .filter_map(|(peer_id, peer)| {
-                            if let Some(fp) = encryption_service.get_peer_fingerprint(peer_id) {
-                                if blocked_peers.contains(&fp) {
-                                    peer.nickname.clone()
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    app.update_blocked_list(blocked_nicknames);
+                    // Update TUI blocked list (fingerprint-backed + manual name entries)
+                    let mut blocked_entries =
+                        collect_blocked_display_entries(blocked_peers, peers, encryption_service)
+                            .await;
+                    merge_manual_blocked_entries(&mut blocked_entries, &app.blocked);
+                    app.update_blocked_list(blocked_entries);
 
                     let _ = ui_tx
                         .send(format!("\n\x1b[92m✓ Blocked {}\x1b[0m\n", target_name))
                         .await;
+                } else {
+                    add_manual_block_entry(app, target_name);
+                    let channels_vec = persistent_channels(chat_context);
+                    let blocked_names = manual_block_entries(&app.blocked);
+                    let state_to_save = create_app_state(
+                        blocked_peers,
+                        &blocked_names,
+                        channel_creators,
+                        &channels_vec,
+                        password_protected_channels,
+                        channel_key_commitments,
+                        &app_state.encrypted_channel_passwords,
+                        nickname,
+                    );
+                    if let Err(e) = save_state(&state_to_save) {
+                        let _ = ui_tx
+                            .send(format!("Warning: Could not save state: {}\n", e))
+                            .await;
+                    }
+                    let _ = ui_tx
+                        .send(format!(
+                            "system: Blocked '{}' by name (no mesh fingerprint yet).",
+                            target_name
+                        ))
+                        .await;
                 }
             } else {
+                add_manual_block_entry(app, target_name);
+                let channels_vec = persistent_channels(chat_context);
+                let blocked_names = manual_block_entries(&app.blocked);
+                let state_to_save = create_app_state(
+                    blocked_peers,
+                    &blocked_names,
+                    channel_creators,
+                    &channels_vec,
+                    password_protected_channels,
+                    channel_key_commitments,
+                    &app_state.encrypted_channel_passwords,
+                    nickname,
+                );
+                if let Err(e) = save_state(&state_to_save) {
+                    let _ = ui_tx
+                        .send(format!("Warning: Could not save state: {}\n", e))
+                        .await;
+                }
                 let _ = ui_tx
                     .send(format!(
-                        "\x1b[93m⚠ User '{}' not found\x1b[0m\n",
+                        "system: User '{}' not found in mesh peers; blocked by name.",
                         target_name
                     ))
                     .await;
@@ -1219,6 +1400,7 @@ pub async fn handle_unblock_command(
     app_state: &AppState,
     create_app_state: &dyn Fn(
         &HashSet<String>,
+        &[String],
         &HashMap<String, String>,
         &Vec<String>,
         &HashSet<String>,
@@ -1231,75 +1413,62 @@ pub async fn handle_unblock_command(
     app: &mut crate::tui::app::App,
 ) -> bool {
     if line.starts_with("/unblock ") {
-        // If there are no blocked users, show a system message
-        if blocked_peers.is_empty() {
-            app.add_log_message("system: No users are currently blocked.".to_string());
-            return true;
-        }
         let target_name = line
             .trim_start_matches("/unblock ")
             .trim()
             .trim_start_matches('@');
-        let peer_id_to_unblock = peers
-            .lock()
-            .await
-            .iter()
-            .find(|(_, peer)| peer.nickname.as_deref() == Some(target_name))
-            .map(|(id, _)| id.clone());
+        let removed_manual = remove_manual_block_entry(app, target_name);
+        let peers_guard = peers.lock().await;
+        let (peer_matches, labels) = resolve_named_peers(&peers_guard, target_name);
+        drop(peers_guard);
+        if peer_matches.len() > 1 {
+            let _ = ui_tx
+                .send(format!(
+                    "system: Multiple users match '{}': {}. Use /unblock name#xxxx for exact match.",
+                    target_name,
+                    labels.join(", ")
+                ))
+                .await;
+            return true;
+        }
+        let peer_id_to_unblock = peer_matches.first().map(|(id, _)| id.clone());
+        let mut removed_fingerprint = false;
 
         if let Some(peer_id) = peer_id_to_unblock {
             if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&peer_id) {
                 if blocked_peers.remove(&fingerprint) {
-                    let channels_vec = persistent_channels(chat_context);
-                    let state_to_save = create_app_state(
-                        blocked_peers,
-                        channel_creators,
-                        &channels_vec,
-                        password_protected_channels,
-                        channel_key_commitments,
-                        &app_state.encrypted_channel_passwords,
-                        nickname,
-                    );
-                    if let Err(e) = save_state(&state_to_save) {
-                        let _ = ui_tx
-                            .send(format!("Warning: Could not save state: {}\n", e))
-                            .await;
-                    }
-                    // Update TUI blocked list
-                    let blocked_nicknames: Vec<String> = peers
-                        .lock()
-                        .await
-                        .iter()
-                        .filter_map(|(peer_id, peer)| {
-                            if let Some(fp) = encryption_service.get_peer_fingerprint(peer_id) {
-                                if blocked_peers.contains(&fp) {
-                                    peer.nickname.clone()
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    app.update_blocked_list(blocked_nicknames);
-                    let _ = ui_tx
-                        .send(format!("\n\x1b[92m✓ Unblocked {}\x1b[0m\n", target_name))
-                        .await;
-                } else {
-                    // User exists but is not blocked
-                    app.add_log_message(format!("system: User '{}' is not blocked.", target_name));
+                    removed_fingerprint = true;
                 }
-            } else {
-                // User exists but has no fingerprint (shouldn't happen)
-                app.add_log_message(format!(
-                    "system: Could not find fingerprint for user '{}'.",
-                    target_name
-                ));
             }
+        }
+        let mut blocked_entries =
+            collect_blocked_display_entries(blocked_peers, peers, encryption_service).await;
+        merge_manual_blocked_entries(&mut blocked_entries, &app.blocked);
+        app.update_blocked_list(blocked_entries);
+
+        if removed_fingerprint || removed_manual {
+            let channels_vec = persistent_channels(chat_context);
+            let blocked_names = manual_block_entries(&app.blocked);
+            let state_to_save = create_app_state(
+                blocked_peers,
+                &blocked_names,
+                channel_creators,
+                &channels_vec,
+                password_protected_channels,
+                channel_key_commitments,
+                &app_state.encrypted_channel_passwords,
+                nickname,
+            );
+            if let Err(e) = save_state(&state_to_save) {
+                let _ = ui_tx
+                    .send(format!("Warning: Could not save state: {}\n", e))
+                    .await;
+            }
+            let _ = ui_tx
+                .send(format!("\n\x1b[92m✓ Unblocked {}\x1b[0m\n", target_name))
+                .await;
         } else {
-            // User does not exist
-            app.add_log_message(format!("system: User '{}' not found.", target_name));
+            app.add_log_message(format!("system: User '{}' is not blocked.", target_name));
         }
         return true;
     }

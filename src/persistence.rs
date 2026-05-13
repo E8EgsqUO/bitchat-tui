@@ -22,6 +22,8 @@ pub struct AppState {
     // Match iOS UserDefaults keys exactly
     pub nickname: Option<String>,                     // bitchat.nickname
     pub blocked_peers: HashSet<String>,               // bitchat.blockedUsers (SHA256 fingerprints)
+    #[serde(default)]
+    pub blocked_names: Vec<String>,                   // Local name-based blocks for UI filtering
     pub channel_creators: HashMap<String, String>,    // bitchat.channelCreators
     pub joined_channels: Vec<String>,                 // bitchat.joinedChannels
     pub password_protected_channels: HashSet<String>, // bitchat.passwordProtectedChannels
@@ -37,6 +39,7 @@ impl AppState {
         Self {
             nickname: None,
             blocked_peers: HashSet::new(),
+            blocked_names: Vec::new(),
             channel_creators: HashMap::new(),
             joined_channels: Vec::new(),
             password_protected_channels: HashSet::new(),
