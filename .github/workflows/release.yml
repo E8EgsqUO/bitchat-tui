@@ -13,8 +13,49 @@ env:
   APP_NAME: bitchat-tui
 
 jobs:
+  create-release:
+    name: Create or Update GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release notes file
+        shell: bash
+        run: |
+          cat > RELEASE_NOTES.md <<'EOF'
+          ## Highlights
+
+          - Added command aliases for faster workflows:
+            - `/h` `/p` `/n` `/c` `/l` `/d` `/f` `/b` `/u` `/s` `/e` `/ch`
+          - Added channel quick switch shortcuts:
+            - `/1` .. `/9` (out-of-range falls back to the last channel)
+          - Added local conversation tools:
+            - `/search <text>` to search current conversation
+            - `/export [path]` to export current conversation on demand
+          - Added Nostr local aliasing:
+            - `/name @user custom_name`
+            - aliases persist in `state.json` (`nostr_aliases`)
+          - Refined block behavior to prefer identity mapping:
+            - mesh blocking relies on username -> fingerprint/hash mapping
+            - improved matching supports suffix forms like `@#e636`
+          - Improved command parsing consistency:
+            - command shortcuts require `/` at column 1 (no leading whitespace)
+
+          ## Notes
+
+          - This release includes all changes since `nostr-geohash-mesh-v5`, including the newer manual blocked-state persistence and message/TUI polish updates.
+          EOF
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build-and-upload:
     name: Build and Upload Release Assets
+    needs: create-release
     strategy:
       matrix:
         include:
