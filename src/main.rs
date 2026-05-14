@@ -2019,6 +2019,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            let nickname_before = nickname.clone();
             if handle_name_command(
                 &line,
                 &mut nickname,
@@ -2034,7 +2035,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
             {
-                app.pending_nickname_update = Some(nickname.clone());
+                if nickname != nickname_before {
+                    app.pending_nickname_update = Some(nickname.clone());
+                }
                 continue;
             }
 
