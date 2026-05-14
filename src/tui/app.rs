@@ -149,6 +149,7 @@ pub struct App {
     pub mesh_people_peer_ids: HashMap<String, String>,
     pub geohash_people: HashMap<String, Vec<String>>,
     pub geohash_people_pubkeys: HashMap<String, HashMap<String, String>>,
+    pub nostr_aliases: HashMap<String, String>,
     pub geohash_presence: HashMap<String, HashMap<String, i64>>,
     pub blocked: Vec<String>,
 
@@ -242,6 +243,7 @@ impl App {
             mesh_people_peer_ids: HashMap::new(),
             geohash_people: HashMap::new(),
             geohash_people_pubkeys: HashMap::new(),
+            nostr_aliases: HashMap::new(),
             geohash_presence: HashMap::new(),
             blocked: Vec::new(),
             channel_messages,
@@ -364,6 +366,9 @@ impl App {
     }
 
     pub fn geohash_person_name_by_pubkey(&self, channel: &str, pubkey: &str) -> Option<String> {
+        if let Some(alias) = self.nostr_aliases.get(pubkey) {
+            return Some(alias.clone());
+        }
         let mut pubkey_name = None;
         for (name, known_pubkey) in self.geohash_people_pubkeys.get(channel)? {
             if known_pubkey != pubkey {
@@ -525,9 +530,12 @@ impl App {
             .iter()
             .find_map(|(name, known_pubkey)| (known_pubkey == pubkey).then(|| name.clone()))
         {
+            let alias = self.nostr_aliases.get(pubkey).cloned();
             let existing_is_pubkey = Self::is_pubkey_placeholder(&existing_name);
             let sender_is_pubkey = Self::is_pubkey_placeholder(sender);
-            let preferred_name = if existing_is_pubkey && !sender_is_pubkey {
+            let preferred_name = if let Some(alias) = alias {
+                alias
+            } else if existing_is_pubkey && !sender_is_pubkey {
                 sender.to_string()
             } else {
                 existing_name.clone()
@@ -548,7 +556,9 @@ impl App {
             return;
         }
 
-        let target = if Self::is_pubkey_placeholder(sender) {
+        let target = if let Some(alias) = self.nostr_aliases.get(pubkey) {
+            alias.to_string()
+        } else if Self::is_pubkey_placeholder(sender) {
             pubkey.to_string()
         } else {
             sender.to_string()
@@ -1704,6 +1714,13 @@ impl App {
     pub fn update_nickname(&mut self, new_nickname: String) {
         self.nickname = new_nickname.clone();
         self.pending_nickname_update = Some(new_nickname);
+    }
+
+    pub fn set_nostr_alias(&mut self, channel: &str, target: &str, alias: &str) -> Option<String> {
+        let pubkey = self.resolve_geohash_target_pubkey(channel, target)?;
+        self.nostr_aliases.insert(pubkey.clone(), alias.to_string());
+        self.add_geohash_person(channel, alias, Some(&pubkey));
+        Some(pubkey)
     }
 
     pub fn trigger_connection_retry(&mut self) {

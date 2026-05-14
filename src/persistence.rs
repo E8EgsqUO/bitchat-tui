@@ -24,6 +24,8 @@ pub struct AppState {
     pub blocked_peers: HashSet<String>,               // bitchat.blockedUsers (SHA256 fingerprints)
     #[serde(default)]
     pub blocked_names: Vec<String>,                   // Local name-based blocks for UI filtering
+    #[serde(default)]
+    pub nostr_aliases: HashMap<String, String>,       // Nostr pubkey -> local alias
     pub channel_creators: HashMap<String, String>,    // bitchat.channelCreators
     pub joined_channels: Vec<String>,                 // bitchat.joinedChannels
     pub password_protected_channels: HashSet<String>, // bitchat.passwordProtectedChannels
@@ -40,6 +42,7 @@ impl AppState {
             nickname: None,
             blocked_peers: HashSet::new(),
             blocked_names: Vec::new(),
+            nostr_aliases: HashMap::new(),
             channel_creators: HashMap::new(),
             joined_channels: Vec::new(),
             password_protected_channels: HashSet::new(),

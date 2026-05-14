@@ -98,6 +98,7 @@ type AppStateFactory = Box<
             &HashSet<String>,
             &[String],
             &HashMap<String, String>,
+            &HashMap<String, String>,
             &Vec<String>,
             &HashSet<String>,
             &HashMap<String, String>,
@@ -116,6 +117,7 @@ fn build_app_state_factory(
     Box::new(
         move |blocked,
               blocked_names,
+              nostr_aliases,
               creators,
               channels,
               protected,
@@ -126,6 +128,7 @@ fn build_app_state_factory(
                 nickname: Some(current_nickname.to_string()),
                 blocked_peers: blocked.clone(),
                 blocked_names: blocked_names.to_vec(),
+                nostr_aliases: nostr_aliases.clone(),
                 channel_creators: creators.clone(),
                 joined_channels: channels.clone(),
                 password_protected_channels: protected.clone(),
@@ -187,6 +190,7 @@ fn persist_runtime_state(
     chat_context: &ChatContext,
     blocked_peers: &HashSet<String>,
     blocked_entries: &[String],
+    nostr_aliases: &HashMap<String, String>,
     channel_creators: &HashMap<String, String>,
     password_protected_channels: &HashSet<String>,
     channel_key_commitments: &HashMap<String, String>,
@@ -199,6 +203,7 @@ fn persist_runtime_state(
     let state_to_save = create_app_state(
         blocked_peers,
         &blocked_names,
+        nostr_aliases,
         channel_creators,
         &channels_vec,
         password_protected_channels,
@@ -341,6 +346,89 @@ fn parse_go_command_target(line: &str) -> Result<Option<String>, &'static str> {
     }
     let geohash = nostr_geo::normalize_geohash(arg).ok_or("usage")?;
     Ok(Some(format!("#{}", geohash)))
+}
+
+fn canonicalize_command_alias(raw_line: &str) -> String {
+    if !raw_line.starts_with('/') {
+        return raw_line.to_string();
+    }
+
+    let mut parts = raw_line.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("");
+
+    let canonical = match cmd {
+        "/h" => "/help",
+        "/p" => "/public",
+        "/n" => "/name",
+        "/c" => "/clear",
+        "/l" => "/leave",
+        "/d" => "/dm",
+        "/f" => "/file",
+        "/ch" => "/channels",
+        "/b" => "/block",
+        "/u" => "/unblock",
+        "/s" => "/search",
+        "/e" => "/export",
+        _ => return raw_line.to_string(),
+    };
+
+    if rest.trim().is_empty() {
+        canonical.to_string()
+    } else {
+        format!("{} {}", canonical, rest.trim_start())
+    }
+}
+
+fn parse_channel_shortcut(line: &str) -> Option<usize> {
+    let raw = line.strip_prefix('/')?;
+    if raw.len() != 1 {
+        return None;
+    }
+    let digit = raw.chars().next()?;
+    if !('1'..='9').contains(&digit) {
+        return None;
+    }
+    Some((digit as u8 - b'1') as usize)
+}
+
+fn search_query_from_line(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("/search")?;
+    if !rest.is_empty() && !rest.chars().next().unwrap_or(' ').is_whitespace() {
+        return None;
+    }
+    let query = rest.trim();
+    if query.is_empty() {
+        None
+    } else {
+        Some(query)
+    }
+}
+
+fn export_path_from_line(line: &str) -> Option<std::path::PathBuf> {
+    let rest = line.strip_prefix("/export")?;
+    if !rest.is_empty() && !rest.chars().next().unwrap_or(' ').is_whitespace() {
+        return None;
+    }
+    let arg = rest.trim();
+    if arg.is_empty() {
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        Some(std::path::PathBuf::from(format!(
+            "bitchat_export_{}.txt",
+            timestamp
+        )))
+    } else {
+        Some(std::path::PathBuf::from(arg))
+    }
+}
+
+fn truncate_for_export(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(max_chars.saturating_sub(3)).collect();
+    out.push_str("...");
+    out
 }
 
 fn find_latest_geohash_with_messages(app: &App) -> Option<String> {
@@ -514,6 +602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = tui_mod::init().expect("Failed to initialize TUI");
     let mut app = App::new_with_nickname(saved_nickname);
     app.update_blocked_list(saved_state.blocked_names.clone());
+    app.nostr_aliases = saved_state.nostr_aliases.clone();
     let nostr_geo_client = nostr_geo::NostrGeoClient::new(ui_tx.clone(), nostr_identity_seed);
 
     // Spawn Bluetooth connection setup in the background
@@ -1001,6 +1090,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     chat_context.as_mut().unwrap(),
                                     blocked_peers.as_ref().unwrap(),
                                     &collect_manual_blocked_names(&app.blocked),
+                                    &app.nostr_aliases,
                                     &app_state.as_ref().unwrap().encrypted_channel_passwords,
                                     &nickname,
                                     create_app_state.as_ref().unwrap().as_ref(),
@@ -1265,6 +1355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     chat_context,
                     blocked_peers,
                     &app.blocked,
+                    &app.nostr_aliases,
                     channel_creators,
                     password_protected_channels,
                     channel_key_commitments,
@@ -1328,10 +1419,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // 5. Handle input from the input box (from input_rx)
-        while let Ok(line) = input_rx.try_recv() {
+        while let Ok(raw_line) = input_rx.try_recv() {
             let ui_tx = ui_tx.clone();
+            let line = canonicalize_command_alias(&raw_line);
             // Handle /exit immediately to avoid panics during connecting phase
-            if line.trim() == "/exit" {
+            if line == "/exit" {
                 if let (
                     Some(chat_context),
                     Some(blocked_peers),
@@ -1353,6 +1445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         chat_context,
                         blocked_peers,
                         &app.blocked,
+                        &app.nostr_aliases,
                         channel_creators,
                         password_protected_channels,
                         channel_key_commitments,
@@ -1381,6 +1474,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // `/help` is a local self command output; don't mark it as unseen/new messages.
                 app.unseen_divider_message_index = None;
                 app.unseen_divider_line_index = None;
+                continue;
+            }
+
+            if let Some(mut channel_index) = parse_channel_shortcut(&line) {
+                if app.channels.is_empty() {
+                    app.add_log_message("system: No channels available yet.".to_string());
+                    continue;
+                }
+                if channel_index >= app.channels.len() {
+                    channel_index = app.channels.len().saturating_sub(1);
+                }
+                let target_channel = app.channels[channel_index].clone();
+                chat_context
+                    .as_mut()
+                    .unwrap()
+                    .switch_to_channel(&target_channel);
+                app.switch_to_channel(target_channel.clone());
+
+                if nostr_geo::is_geohash_channel(&target_channel) {
+                    if let Err(e) = nostr_geo_client.join_channel(&target_channel, &nickname).await {
+                        app.add_log_message(format!(
+                            "system: Failed to join Nostr geohash channel {}: {}",
+                            target_channel, e
+                        ));
+                    }
+                }
                 continue;
             }
 
@@ -1431,6 +1550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     chat_context.as_ref().unwrap(),
                     blocked_peers.as_ref().unwrap(),
                     &app.blocked,
+                    &app.nostr_aliases,
                     channel_creators.as_ref().unwrap(),
                     password_protected_channels.as_ref().unwrap(),
                     channel_key_commitments.as_ref().unwrap(),
@@ -1482,6 +1602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             chat_context.as_ref().unwrap(),
                             blocked_peers.as_ref().unwrap(),
                             &app.blocked,
+                            &app.nostr_aliases,
                             channel_creators.as_ref().unwrap(),
                             password_protected_channels.as_ref().unwrap(),
                             channel_key_commitments.as_ref().unwrap(),
@@ -1551,6 +1672,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             chat_context.as_ref().unwrap(),
                             blocked_peers.as_ref().unwrap(),
                             &app.blocked,
+                            &app.nostr_aliases,
                             channel_creators.as_ref().unwrap(),
                             password_protected_channels.as_ref().unwrap(),
                             channel_key_commitments.as_ref().unwrap(),
@@ -1615,6 +1737,115 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
+            if line == "/search" {
+                app.add_log_message("system: Usage: /search <keyword>".to_string());
+                continue;
+            }
+            if let Some(query) = search_query_from_line(&line) {
+                let (messages, dm_target, channel_name) = app.get_current_messages();
+                let query_lower = query.to_ascii_lowercase();
+                let mut hit_count = 0usize;
+                let mut preview_count = 0usize;
+                let mut previews: Vec<String> = Vec::new();
+                let conv_name = if let Some(dm) = dm_target {
+                    format!("DM {}", app.display_dm_target(&dm))
+                } else if let Some(ch) = channel_name {
+                    format!("channel {}", ch)
+                } else {
+                    "current conversation".to_string()
+                };
+
+                for msg in messages.iter() {
+                    if !msg.content.to_ascii_lowercase().contains(&query_lower)
+                        && !msg.sender.to_ascii_lowercase().contains(&query_lower)
+                    {
+                        continue;
+                    }
+                    hit_count += 1;
+                    if preview_count < 20 {
+                        preview_count += 1;
+                        previews.push(format!(
+                            "[{}] {}: {}",
+                            msg.timestamp,
+                            msg.sender,
+                            truncate_for_export(&msg.content, 120)
+                        ));
+                    }
+                }
+
+                if hit_count == 0 {
+                    app.add_log_message(format!(
+                        "system: No matches for '{}' in {}.",
+                        query, conv_name
+                    ));
+                } else {
+                    app.add_log_message(format!(
+                        "system: Found {} match(es) for '{}' in {}{}.",
+                        hit_count,
+                        query,
+                        conv_name,
+                        if hit_count > preview_count {
+                            " (showing first 20)"
+                        } else {
+                            ""
+                        }
+                    ));
+                    for line in previews {
+                        app.add_log_message(format!("system: {}", line));
+                    }
+                }
+                continue;
+            }
+
+            if line == "/export" || line.starts_with("/export ") {
+                if let Some(path) = export_path_from_line(&line) {
+                    let (messages, dm_target, channel_name) = app.get_current_messages();
+                    let conv_name = if let Some(dm) = dm_target {
+                        format!("DM {}", app.display_dm_target(&dm))
+                    } else if let Some(ch) = channel_name {
+                        format!("channel {}", ch)
+                    } else {
+                        "current conversation".to_string()
+                    };
+                    let mut content = String::new();
+                    content.push_str("# BitChat Export\n");
+                    content.push_str(&format!(
+                        "Generated: {}\n",
+                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                    ));
+                    content.push_str(&format!("Conversation: {}\n\n", conv_name));
+                    for msg in messages.iter() {
+                        content.push_str(&format!(
+                            "[{}] {}: {}\n",
+                            msg.timestamp,
+                            msg.sender,
+                            msg.content
+                        ));
+                    }
+                    if let Some(parent) = path.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                    }
+                    match std::fs::write(&path, content) {
+                        Ok(_) => {
+                            app.add_log_message(format!(
+                                "system: Exported {} message(s) to {}",
+                                messages.len(),
+                                path.display()
+                            ));
+                        }
+                        Err(e) => {
+                            app.add_log_message(format!(
+                                "system: Export failed: {}",
+                                e
+                            ));
+                        }
+                    }
+                    continue;
+                }
+            }
+
             if line == "/r" || line == "/retry" {
                 app.trigger_connection_retry();
                 app.add_log_message("system: Restarting Bluetooth mesh scan...".to_string());
@@ -1646,6 +1877,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             chat_context.as_ref().unwrap(),
                             blocked_peers.as_ref().unwrap(),
                             &app.blocked,
+                            &app.nostr_aliases,
                             channel_creators.as_ref().unwrap(),
                             password_protected_channels.as_ref().unwrap(),
                             channel_key_commitments.as_ref().unwrap(),
@@ -1666,7 +1898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if handle_name_command(
                 &line,
                 &mut nickname,
-                &app,
+                &mut app,
                 blocked_peers.as_ref().unwrap(),
                 channel_creators.as_ref().unwrap(),
                 chat_context.as_mut().unwrap(),
@@ -1987,7 +2219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            if !app.connected && !line.trim_start().starts_with('/') {
+            if !app.connected && !line.starts_with('/') {
                 if let Some((channel, target_nickname, recipient_pubkey)) = app.current_geohash_dm()
                 {
                     queue_geohash_dm_send(
@@ -2050,6 +2282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !app.connected
                 && !line.starts_with("/help")
                 && !line.starts_with("/j ")
+                && line != "/public"
                 && !line.starts_with("/block")
                 && !line.starts_with("/unblock")
             {
@@ -2229,6 +2462,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     chat_context.as_ref().unwrap(),
                     blocked_peers.as_ref().unwrap(),
                     &app.blocked,
+                    &app.nostr_aliases,
                     channel_creators.as_ref().unwrap(),
                     password_protected_channels.as_ref().unwrap(),
                     channel_key_commitments.as_ref().unwrap(),
@@ -2424,6 +2658,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             chat_context,
             blocked_peers,
             &app.blocked,
+            &app.nostr_aliases,
             channel_creators,
             password_protected_channels,
             channel_key_commitments,

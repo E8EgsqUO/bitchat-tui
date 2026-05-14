@@ -1234,11 +1234,13 @@ pub async fn handle_channel_announce_message(
     chat_context: &mut ChatContext,
     blocked_peers: &HashSet<String>,
     blocked_names: &[String],
+    nostr_aliases: &HashMap<String, String>,
     encrypted_channel_passwords: &HashMap<String, EncryptedPassword>,
     nickname: &str,
     create_app_state: &dyn Fn(
         &HashSet<String>,
         &[String],
+        &HashMap<String, String>,
         &HashMap<String, String>,
         &Vec<String>,
         &HashSet<String>,
@@ -1281,6 +1283,7 @@ pub async fn handle_channel_announce_message(
         let state_to_save = create_app_state(
             blocked_peers,
             blocked_names,
+            nostr_aliases,
             channel_creators,
             &channels_vec,
             password_protected_channels,
