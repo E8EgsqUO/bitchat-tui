@@ -1,13 +1,13 @@
 use crate::data_structures::{DebugLevel, DeliveryTracker, MessageType, Peer, DEBUG_LEVEL};
 use crate::encryption::EncryptionService;
-use crate::fragmentation::{send_packet_with_fragmentation, send_packet_with_fragmentation_as};
+use crate::fragmentation::send_packet_with_fragmentation_as;
 use crate::noise_session::NoiseSessionManager;
 use crate::packet_creation::{
-    create_bitchat_packet, create_bitchat_packet_with_recipient_and_signature,
+    create_bitchat_packet, create_bitchat_packet_with_recipient,
     create_file_transfer_packet_for_signing_at, create_file_transfer_packet_with_recipient_at,
     current_timestamp_ms,
 };
-use crate::payload_handling::create_bitchat_message_payload_full;
+use crate::payload_handling::create_private_noise_payload;
 use crate::persistence::{encrypt_password, save_state, AppState, EncryptedPassword};
 use crate::terminal_ux::{ChatContext, ChatMode};
 use btleplug::api::{Peripheral as _, WriteType};
@@ -18,8 +18,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 const MAX_FILE_TRANSFER_BYTES: u64 = 1024 * 1024;
 const TUI_FILE_TRANSFER_MIME: &str = "application/vnd.bitchat-tui.file";
@@ -900,10 +902,10 @@ pub async fn handle_dm_command(
     line: &str,
     chat_context: &mut ChatContext,
     peers: &Arc<Mutex<HashMap<String, Peer>>>,
-    nickname: &str,
+    _nickname: &str,
     my_peer_id: &str,
     delivery_tracker: &mut DeliveryTracker,
-    encryption_service: &EncryptionService,
+    _encryption_service: &EncryptionService,
     peripheral: &Peripheral,
     cmd_char: &btleplug::api::Characteristic,
     ui_tx: mpsc::Sender<String>,
@@ -911,10 +913,8 @@ pub async fn handle_dm_command(
     _noise_session_manager: &mut NoiseSessionManager,
 ) -> bool {
     if line.starts_with("/dm ") {
-        let parts: Vec<&str> = line.splitn(3, ' ').collect();
-
-        // Check if it's just "/dm nickname" (enter DM mode) or "/dm nickname message" (quick send)
-        if parts.len() < 2 {
+        let rest = line.trim_start_matches("/dm").trim_start();
+        if rest.is_empty() {
             let _ = ui_tx
                 .send("\x1b[93m⚠ Usage: /dm <nickname> [message]\x1b[0m\n".to_string())
                 .await;
@@ -924,23 +924,56 @@ pub async fn handle_dm_command(
             return true;
         }
 
-        let target_nickname = parts[1];
-        let target_lookup = strip_display_suffix(target_nickname);
+        let target_end = rest
+            .char_indices()
+            .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
+            .unwrap_or(rest.len());
+        let target_nickname = rest[..target_end].trim();
+        let maybe_private_message = rest[target_end..].trim();
+        let has_inline_message = !maybe_private_message.is_empty();
+
+        let target_lookup = strip_display_suffix(target_nickname.trim_start_matches('@'));
+        if target_lookup.is_empty() {
+            let _ = ui_tx
+                .send("\x1b[93m⚠ Usage: /dm <nickname> [message]\x1b[0m\n".to_string())
+                .await;
+            return true;
+        }
+        let normalized_target = target_lookup.to_ascii_lowercase();
 
         // Find peer ID for nickname
-        let peer_id = {
+        let peer_id = if let Some(id) = app
+            .mesh_people_peer_ids
+            .iter()
+            .find(|(name, _)| {
+                strip_display_suffix(name.trim_start_matches('@'))
+                    .eq_ignore_ascii_case(target_lookup)
+            })
+            .map(|(_, id)| id.clone())
+        {
+            Some(id)
+        } else {
             peers
                 .lock()
                 .await
                 .iter()
-                .find(|(_, peer)| peer.nickname.as_deref() == Some(target_lookup))
+                .find(|(_, peer)| {
+                    peer.nickname
+                        .as_deref()
+                        .map(|nick| {
+                            strip_display_suffix(nick.trim_start_matches('@'))
+                                .to_ascii_lowercase()
+                                == normalized_target
+                        })
+                        .unwrap_or(false)
+                })
                 .map(|(id, _)| id.clone())
         };
 
         if let Some(target_peer_id) = peer_id {
+            chat_context.enter_dm_mode(target_lookup, &target_peer_id);
             // If no message provided, enter DM mode
-            if parts.len() == 2 {
-                chat_context.enter_dm_mode(target_lookup, &target_peer_id);
+            if !has_inline_message {
                 if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
                     let _ = ui_tx
                         .send(format!("{}\n", chat_context.get_status_line()))
@@ -950,7 +983,7 @@ pub async fn handle_dm_command(
             }
 
             // Otherwise send the message directly
-            let private_message = parts[2];
+            let private_message = maybe_private_message;
             // Create private message
             if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
                 let _ = ui_tx
@@ -961,164 +994,140 @@ pub async fn handle_dm_command(
                     .await;
             }
 
-            // Create message payload with private flag
-            let (message_payload, message_id) = create_bitchat_message_payload_full(
-                nickname,
-                private_message,
-                None,
-                true,
-                my_peer_id,
-            );
-
-            // Track private message for delivery confirmation
-            delivery_tracker.track_message(message_id.clone(), private_message.to_string(), true);
-
-            // Pad the message for privacy using PKCS#7
-            let block_sizes = [256, 512, 1024, 2048];
-            let payload_size = message_payload.len();
-            let target_size = block_sizes
-                .iter()
-                .find(|&&size| payload_size + 16 <= size)
-                .copied()
-                .unwrap_or(payload_size);
-
-            let padding_needed = target_size - message_payload.len();
-            let mut padded_payload = message_payload.clone();
-
-            if padding_needed > 0 && padding_needed <= 255 {
-                // PKCS#7 padding: all padding bytes have the same value (the padding length)
-                for _ in 0..padding_needed {
-                    padded_payload.push(padding_needed as u8);
+            if !_noise_session_manager.has_established_session(&target_peer_id) {
+                if !_noise_session_manager.has_session(&target_peer_id) {
+                    let _ = _noise_session_manager.create_session(
+                        target_peer_id.clone(),
+                        crate::noise_protocol::NoiseRole::Initiator,
+                    );
                 }
-                if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
+                if let Err(e) = _noise_session_manager
+                    .store_pending_message(&target_peer_id, private_message.to_string())
+                {
                     let _ = ui_tx
                         .send(format!(
-                            "[PRIVATE] Added {} bytes of PKCS#7 padding\n",
-                            padding_needed
+                            "\n\x1b[91m❌ Failed to queue private message: {}\x1b[0m\n",
+                            e
                         ))
                         .await;
+                    return true;
                 }
-            } else if padding_needed == 0 {
-                // If already at block size, don't add more padding - Android doesn't do this
-                if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
-                    let _ = ui_tx
-                        .send(
-                            "[PRIVATE] Message already at block size, no padding needed\n"
-                                .to_string(),
-                        )
-                        .await;
-                }
-            }
+                match _noise_session_manager.initiate_handshake(&target_peer_id) {
+                    Ok(handshake_data) => {
+                        let handshake_packet = create_bitchat_packet_with_recipient(
+                            my_peer_id,
+                            Some(&target_peer_id),
+                            MessageType::NoiseHandshakeInit,
+                            handshake_data,
+                            None,
+                        );
+                        if let Err(e) = peripheral
+                            .write(cmd_char, &handshake_packet, WriteType::WithoutResponse)
+                            .await
+                        {
+                            let _ = ui_tx
+                                .send(format!(
+                                    "\n\x1b[91m❌ Failed to start DM handshake: {}\x1b[0m\n",
+                                    e
+                                ))
+                                .await;
+                            return true;
+                        }
 
-            // Try Noise encryption first (preferred for established sessions)
-            let encrypted = if _noise_session_manager.is_session_ready(&target_peer_id) {
-                match _noise_session_manager.encrypt_message(&target_peer_id, &padded_payload) {
-                    Ok(encrypted) => {
-                        if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
+                        app.add_dm_message(target_lookup.to_string(), private_message.to_string());
+                        app.add_transient_system_message(
+                            format!(
+                                "[{}|DM] <{}> {}",
+                                chrono::Local::now().format("%H:%M"),
+                                target_lookup,
+                                private_message
+                            ),
+                            Duration::from_secs(1),
+                        );
+                        if crate::tui::app::bitchat_debug_enabled() {
                             let _ = ui_tx
-                                .send(format!(
-                                    "[PRIVATE] Encrypted with Noise transport cipher: {} bytes\n",
-                                    encrypted.len()
-                                ))
-                                .await;
-                        }
-                        encrypted
-                    }
-                    Err(e) => {
-                        if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
-                            let _ = ui_tx.send(format!("[PRIVATE] Noise encryption failed: {:?}, falling back to legacy\n", e)).await;
-                        }
-                        // Fallback to legacy encryption
-                        match encryption_service.encrypt(&padded_payload, &target_peer_id) {
-                            Ok(encrypted) => {
-                                if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
-                                    let _ = ui_tx
-                                        .send(format!(
-                                            "[PRIVATE] Encrypted with legacy method: {} bytes\n",
-                                            encrypted.len()
-                                        ))
-                                        .await;
-                                }
-                                encrypted
-                            }
-                            Err(e) => {
-                                if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
-                                    let _ = ui_tx
-                                        .send(format!(
-                                            "[PRIVATE] All encryption methods failed: {:?}\n",
-                                            e
-                                        ))
-                                        .await;
-                                }
-                                return true;
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Use legacy encryption if no Noise session
-                match encryption_service.encrypt(&padded_payload, &target_peer_id) {
-                    Ok(encrypted) => {
-                        if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
-                            let _ = ui_tx
-                                .send(format!(
-                                    "[PRIVATE] Encrypted with legacy method: {} bytes\n",
-                                    encrypted.len()
-                                ))
-                                .await;
-                        }
-                        encrypted
-                    }
-                    Err(e) => {
-                        if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
-                            let _ = ui_tx
-                                .send(format!("[PRIVATE] Legacy encryption failed: {:?}\n", e))
+                                .send(
+                                    "\x1b[90mDM handshake started; message queued and will send when secure channel is ready.\x1b[0m\n"
+                                        .to_string(),
+                                )
                                 .await;
                         }
                         return true;
                     }
+                    Err(e) => {
+                        let _ = ui_tx
+                            .send(format!(
+                                "\n\x1b[91m❌ Failed to initiate DM handshake: {}\x1b[0m\n",
+                                e
+                            ))
+                            .await;
+                        return true;
+                    }
+                }
+            }
+
+            let message_id = Uuid::new_v4().to_string();
+            let noise_payload =
+                match create_private_noise_payload(&message_id, private_message) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        let _ = ui_tx
+                            .send(format!(
+                                "\n\x1b[91m❌ Failed to build DM payload: {}\x1b[0m\n",
+                                e
+                            ))
+                            .await;
+                        return true;
+                    }
+                };
+            delivery_tracker.track_message(message_id.clone(), private_message.to_string(), true);
+
+            let encrypted = match _noise_session_manager.encrypt_message(&target_peer_id, &noise_payload) {
+                Ok(encrypted) => encrypted,
+                Err(e) => {
+                    let _ = ui_tx
+                        .send(format!(
+                            "\n\x1b[91m❌ Failed to encrypt private message: {}\x1b[0m\n",
+                            e
+                        ))
+                        .await;
+                    return true;
                 }
             };
 
-            // Sign the encrypted payload
-            let signature = encryption_service.sign(&encrypted);
-
-            // Create packet with recipient ID for private routing
-            let packet = create_bitchat_packet_with_recipient_and_signature(
+            let packet = create_bitchat_packet_with_recipient(
                 my_peer_id,
-                &target_peer_id, // Specify the recipient
-                MessageType::Message,
+                Some(&target_peer_id),
+                MessageType::NoiseEncrypted,
                 encrypted,
-                Some(signature),
+                None,
             );
 
-            // Send the private message
-            if let Err(_e) =
-                send_packet_with_fragmentation(peripheral, cmd_char, packet, my_peer_id).await
+            if let Err(e) = peripheral
+                .write(cmd_char, &packet, WriteType::WithoutResponse)
+                .await
             {
                 let _ = ui_tx
-                    .send("\n\x1b[91m❌ Failed to send private message\x1b[0m\n".to_string())
+                    .send(format!(
+                        "\n\x1b[91m❌ Failed to send private message: {}\x1b[0m\n",
+                        e
+                    ))
                     .await;
-                let _ = ui_tx.send("\x1b[90mThe message could not be delivered. Connection may have been lost.\x1b[0m\n".to_string()).await;
             } else {
-                // Add the message to the TUI's DM conversation
-                app.add_dm_message(target_lookup.to_string(), private_message.to_string());
-
-                // Add a system message to the current conversation to confirm the DM was sent
-                let timestamp = chrono::Local::now();
-                let system_msg = format!(
-                    "[{}|DM] <you → {}> {}",
-                    timestamp.format("%H:%M"),
-                    target_lookup,
-                    private_message
+                app.add_pending_mesh_dm_message(
+                    target_lookup.to_string(),
+                    private_message.to_string(),
+                    message_id,
                 );
-                app.add_log_message(format!("system: {}", system_msg));
-
-                if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
-                    let _ = ui_tx
-                        .send(format!("[PRIVATE] Message sent to {}\n", target_lookup))
-                        .await;
-                }
+                app.add_transient_system_message(
+                    format!(
+                        "[{}|DM] <{}> {}",
+                        chrono::Local::now().format("%H:%M"),
+                        target_lookup,
+                        private_message
+                    ),
+                    Duration::from_secs(1),
+                );
             }
             return true;
         } else {

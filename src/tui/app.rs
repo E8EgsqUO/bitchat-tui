@@ -149,6 +149,8 @@ pub struct App {
     pub mesh_people_peer_ids: HashMap<String, String>,
     pub geohash_people: HashMap<String, Vec<String>>,
     pub geohash_people_pubkeys: HashMap<String, HashMap<String, String>>,
+    pub geohash_last_dm_sender: HashMap<String, String>,
+    pub geohash_last_mention_sender: HashMap<String, String>,
     pub nostr_aliases: HashMap<String, String>,
     pub geohash_presence: HashMap<String, HashMap<String, i64>>,
     pub blocked: Vec<String>,
@@ -189,6 +191,11 @@ pub struct App {
     pub message_line_copy_targets: Vec<Option<MessageLineCopyTarget>>,
     pub last_message_click: Option<MessageClickState>,
     pub copy_highlight: Option<CopyHighlightState>,
+    pub paste_keyburst_active: bool,
+    pub last_input_char_event_at: Option<Instant>,
+    pub input_char_burst_count: u16,
+    pub transient_message_expirations: HashMap<String, Instant>,
+    pub transient_message_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +250,8 @@ impl App {
             mesh_people_peer_ids: HashMap::new(),
             geohash_people: HashMap::new(),
             geohash_people_pubkeys: HashMap::new(),
+            geohash_last_dm_sender: HashMap::new(),
+            geohash_last_mention_sender: HashMap::new(),
             nostr_aliases: HashMap::new(),
             geohash_presence: HashMap::new(),
             blocked: Vec::new(),
@@ -267,6 +276,11 @@ impl App {
             message_line_copy_targets: Vec::new(),
             last_message_click: None,
             copy_highlight: None,
+            paste_keyburst_active: false,
+            last_input_char_event_at: None,
+            input_char_burst_count: 0,
+            transient_message_expirations: HashMap::new(),
+            transient_message_seq: 0,
         };
 
         app.update_current_conversation();
@@ -495,6 +509,25 @@ impl App {
                 (person, pubkey)
             })
             .collect()
+    }
+
+    pub fn last_geohash_dm_sender(&self, channel: &str) -> Option<(String, String)> {
+        let pubkey = self.geohash_last_dm_sender.get(channel)?.clone();
+        let label = self
+            .geohash_person_for_pubkey(channel, &pubkey)
+            .unwrap_or_else(|| pubkey.clone());
+        Some((label, pubkey))
+    }
+
+    pub fn last_geohash_mention_sender(&self, channel: &str) -> Option<String> {
+        let sender = self.geohash_last_mention_sender.get(channel)?.clone();
+        if crate::nostr_geo::looks_like_dm_pubkey(&sender) {
+            return Some(
+                self.geohash_person_for_pubkey(channel, &sender)
+                    .unwrap_or(sender),
+            );
+        }
+        Some(sender)
     }
 
     fn geohash_dm_thread_key(&self, channel: &str, target: &str) -> String {
@@ -800,6 +833,8 @@ impl App {
                 }
                 self.note_geohash_presence(&channel, &pubkey, chrono::Local::now().timestamp());
                 self.add_geohash_person(&channel, &sender, Some(&pubkey));
+                self.geohash_last_dm_sender
+                    .insert(channel.clone(), pubkey.clone());
                 return;
             }
         }
@@ -875,6 +910,8 @@ impl App {
                 }
                 self.note_geohash_presence(&channel, &pubkey, chrono::Local::now().timestamp());
                 self.add_geohash_person(&channel, &sender, Some(&pubkey));
+                self.geohash_last_dm_sender
+                    .insert(channel.clone(), pubkey.clone());
 
                 let target_key = Self::geohash_dm_pubkey_key(&channel, &pubkey);
                 if let Some((code, file_name, file_size_bytes)) =
@@ -1024,6 +1061,12 @@ impl App {
                         self.channels.push(channel.clone());
                     }
                     self.add_geohash_person(&channel, &sender, sender_pubkey.as_deref());
+                    if sender != self.nickname && self.message_mentions_self(&content) {
+                        let sender_key =
+                            sender_pubkey.clone().unwrap_or_else(|| sender.clone());
+                        self.geohash_last_mention_sender
+                            .insert(channel.clone(), sender_key);
+                    }
                 }
 
                 let msg = Message {
@@ -1220,6 +1263,41 @@ impl App {
             .any(|entry| !entry.is_empty() && entry == sender_norm)
     }
 
+    fn strip_display_suffix(value: &str) -> &str {
+        let trimmed = value.trim();
+        let Some((base, suffix)) = trimmed.rsplit_once('#') else {
+            return trimmed;
+        };
+        if base.is_empty() || suffix.len() != 4 || !suffix.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            return trimmed;
+        }
+        base
+    }
+
+    fn message_mentions_self(&self, content: &str) -> bool {
+        let my_name = Self::strip_display_suffix(self.nickname.trim().trim_start_matches('@'))
+            .to_ascii_lowercase();
+        if my_name.is_empty() {
+            return false;
+        }
+
+        content.split_whitespace().any(|token| {
+            let mention = token.trim_start_matches(|ch: char| ch != '@');
+            let Some(raw_target) = mention.strip_prefix('@') else {
+                return false;
+            };
+            let target = raw_target.trim_matches(|ch: char| {
+                !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '#')
+            });
+            if target.is_empty() {
+                return false;
+            }
+            let target_base = Self::strip_display_suffix(target).to_ascii_lowercase();
+            !target_base.is_empty() && target_base == my_name
+        })
+    }
+
     pub fn add_pending_geohash_dm_message(&mut self, text: String, local_id: String) {
         let timestamp = chrono::Local::now().format("%H:%M").to_string();
         let msg = Message {
@@ -1332,6 +1410,75 @@ impl App {
 
         self.dm_messages.entry(target).or_default().push(msg);
         self.follow_or_mark_new_message();
+    }
+
+    pub fn add_transient_system_message(&mut self, content: String, duration: Duration) {
+        let local_id = format!("transient:{}", self.transient_message_seq);
+        self.transient_message_seq = self.transient_message_seq.saturating_add(1);
+        self.transient_message_expirations
+            .insert(local_id.clone(), Instant::now() + duration);
+
+        let msg = Message {
+            sender: "system".to_string(),
+            sender_pubkey: None,
+            timestamp: chrono::Local::now().format("%H:%M").to_string(),
+            timestamp_epoch: Some(chrono::Local::now().timestamp()),
+            content,
+            is_self: false,
+            status: MessageStatus::None,
+            local_id: Some(local_id),
+        };
+
+        let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
+        if let Some(target) = dm_target {
+            self.dm_messages.entry(target).or_default().push(msg);
+        } else if let Some(channel) = channel_name {
+            self.channel_messages.entry(channel).or_default().push(msg);
+        } else {
+            let current_channel = self.get_selected_channel_name();
+            self.channel_messages.entry(current_channel).or_default().push(msg);
+        }
+        self.follow_or_mark_new_message();
+    }
+
+    pub fn prune_expired_transient_messages(&mut self) {
+        if self.transient_message_expirations.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut expired_ids: Vec<String> = self
+            .transient_message_expirations
+            .iter()
+            .filter_map(|(id, expires_at)| (now >= *expires_at).then_some(id.clone()))
+            .collect();
+        if expired_ids.is_empty() {
+            return;
+        }
+
+        expired_ids.sort();
+        expired_ids.dedup();
+        for id in &expired_ids {
+            self.transient_message_expirations.remove(id);
+        }
+
+        self.channel_messages.values_mut().for_each(|messages| {
+            messages.retain(|message| {
+                !message
+                    .local_id
+                    .as_ref()
+                    .is_some_and(|id| expired_ids.binary_search(id).is_ok())
+            });
+        });
+
+        self.dm_messages.values_mut().for_each(|messages| {
+            messages.retain(|message| {
+                !message
+                    .local_id
+                    .as_ref()
+                    .is_some_and(|id| expired_ids.binary_search(id).is_ok())
+            });
+        });
     }
 
     pub fn update_dm_message_status(&mut self, local_id: &str, status: MessageStatus) -> bool {
@@ -1610,6 +1757,8 @@ impl App {
         self.channels.retain(|c| c != channel);
         self.geohash_people.remove(channel);
         self.geohash_people_pubkeys.remove(channel);
+        self.geohash_last_dm_sender.remove(channel);
+        self.geohash_last_mention_sender.remove(channel);
         self.geohash_presence.remove(channel);
         self.channel_messages.remove(channel);
         self.dm_messages.retain(|key, _| {
@@ -2121,5 +2270,31 @@ mod tests {
         app.add_log_message("Not connected".to_string());
 
         assert!(app.people.is_empty());
+    }
+
+    #[test]
+    fn transient_system_message_expires_and_is_pruned() {
+        let mut app = App::new_with_nickname("me".to_string());
+
+        app.add_transient_system_message(
+            "[12:34|DM] <bb> hi".to_string(),
+            std::time::Duration::from_millis(0),
+        );
+        assert_eq!(
+            app.channel_messages
+                .get("#public")
+                .map(|messages| messages.len())
+                .unwrap_or(0),
+            1
+        );
+
+        app.prune_expired_transient_messages();
+        assert_eq!(
+            app.channel_messages
+                .get("#public")
+                .map(|messages| messages.len())
+                .unwrap_or(0),
+            0
+        );
     }
 }

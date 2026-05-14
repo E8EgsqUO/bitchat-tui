@@ -43,37 +43,6 @@ fn write_debug_log(message: &str) {
     }
 }
 
-fn input_event_log_enabled() -> bool {
-    let Ok(raw) = std::env::var("BITCHAT_INPUT_EVENT_LOG") else {
-        return false;
-    };
-    let normalized = raw.trim().to_ascii_lowercase();
-    !(normalized.is_empty()
-        || normalized == "0"
-        || normalized == "false"
-        || normalized == "off"
-        || normalized == "no")
-}
-
-fn write_input_event_log(message: &str) {
-    if !input_event_log_enabled() {
-        return;
-    }
-
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("input_event.log")
-    {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let log_entry = format!("[{}] {}\n", timestamp, message);
-        let _ = std::io::Write::write_all(&mut file, log_entry.as_bytes());
-    }
-}
-
 mod binary_encoding;
 mod binary_protocol_utils;
 mod command_handling;
@@ -361,6 +330,17 @@ fn parse_dm_command(line: &str) -> Option<(String, Option<String>)> {
     let message = (!message.is_empty()).then(|| message.to_owned());
 
     Some((target.to_string(), message))
+}
+
+fn parse_reply_command(line: &str) -> Option<Option<String>> {
+    let rest = line.strip_prefix("/reply")?;
+    if !rest.is_empty() && !rest.chars().next()?.is_whitespace() {
+        return None;
+    }
+
+    let message = rest.trim();
+    let message = (!message.is_empty()).then(|| message.to_owned());
+    Some(message)
 }
 
 fn parse_go_command_target(line: &str) -> Result<Option<String>, &'static str> {
@@ -717,7 +697,6 @@ fn is_pass_command(line: &str) -> bool {
 fn mesh_only_command_in_geohash(line: &str) -> Option<&'static str> {
     let command = line.split_whitespace().next().unwrap_or("");
     match command {
-        "/reply" => Some("/reply"),
         _ => None,
     }
 }
@@ -1381,24 +1360,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if crossterm_event::poll(tick_rate.saturating_sub(last_tick.elapsed())).unwrap_or(false) {
             match crossterm_event::read().unwrap() {
                 CrosstermEvent::Key(key_event) => {
-                    write_input_event_log(&format!(
-                        "KEY kind={:?} code={:?} modifiers={:?}",
-                        key_event.kind, key_event.code, key_event.modifiers
-                    ));
                     event::handle_key_event(&mut app, key_event, &input_tx);
                 }
                 CrosstermEvent::Paste(pasted) => {
-                    write_input_event_log(&format!(
-                        "PASTE len={} newline={} preview={}",
-                        pasted.chars().count(),
-                        pasted.contains('\n'),
-                        pasted
-                            .chars()
-                            .take(40)
-                            .collect::<String>()
-                            .replace('\n', "\\n")
-                            .replace('\r', "\\r")
-                    ));
                     event::handle_paste_event(&mut app, &pasted);
                 }
                 CrosstermEvent::Mouse(mouse_event) => {
@@ -2197,6 +2161,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
+                if let Some(maybe_message) = parse_reply_command(&line) {
+                    if let Some((_, target_label, recipient_pubkey)) = app.current_geohash_dm() {
+                        app.switch_to_geohash_dm(target_label.clone());
+                        if let Some(message) = maybe_message {
+                            queue_geohash_dm_send(
+                                &mut app,
+                                nostr_geo_client.clone(),
+                                ui_tx.clone(),
+                                geohash_channel.clone(),
+                                target_label,
+                                recipient_pubkey,
+                                message,
+                                my_peer_id.clone(),
+                                nickname.clone(),
+                            );
+                        }
+                        continue;
+                    }
+
+                    if let Some(message) = maybe_message {
+                        let reply_message = if message.trim_start().starts_with('@') {
+                            message
+                        } else if let Some(target) =
+                            app.last_geohash_mention_sender(&geohash_channel)
+                        {
+                            format!("@{} {}", target, message)
+                        } else {
+                            message
+                        };
+                        app.add_sent_message(reply_message.clone());
+                        let nostr_geo_client = nostr_geo_client.clone();
+                        let ui_tx = ui_tx.clone();
+                        let channel = geohash_channel.clone();
+                        let nickname = nickname.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = nostr_geo_client
+                                .send_message(&channel, &reply_message, &nickname)
+                                .await
+                            {
+                                let _ = ui_tx
+                                    .send(format!(
+                                        "system: Failed to send geohash message on {}: {}",
+                                        channel, e
+                                    ))
+                                    .await;
+                            }
+                        });
+                    } else {
+                        app.add_log_message(
+                            "system: In geohash public chat, /reply does not switch to DM. Use /dm <name> [message] for direct messages."
+                                .to_string(),
+                        );
+                    }
+                    continue;
+                }
+
                 if let Some(command) = mesh_only_command_in_geohash(&line) {
                     app.add_log_message(format!(
                         "system: {} is only available on the Bluetooth mesh. It is not supported in Nostr geohash channels.",
@@ -2816,6 +2836,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         // 6. Render the UI
+        app.prune_expired_transient_messages();
         sync_terminal_title(&mut last_terminal_title, &app);
         terminal.draw(|f| ui::render(&mut app, f)).unwrap();
         // 7. Exit if requested
