@@ -10,8 +10,10 @@ use tokio::time::{self, Duration};
 
 use bloomfilter::Bloom;
 mod tui;
+use crossterm::execute;
 use crossterm::event as crossterm_event;
 use crossterm::event::Event as CrosstermEvent;
+use crossterm::terminal::SetTitle;
 use std::time::Duration as StdDuration;
 use tui::app::App;
 use tui::event;
@@ -36,6 +38,37 @@ fn write_debug_log(message: &str) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let log_entry = format!("[{}] {}\n", timestamp, message);
+        let _ = std::io::Write::write_all(&mut file, log_entry.as_bytes());
+    }
+}
+
+fn input_event_log_enabled() -> bool {
+    let Ok(raw) = std::env::var("BITCHAT_INPUT_EVENT_LOG") else {
+        return false;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    !(normalized.is_empty()
+        || normalized == "0"
+        || normalized == "false"
+        || normalized == "off"
+        || normalized == "no")
+}
+
+fn write_input_event_log(message: &str) {
+    if !input_event_log_enabled() {
+        return;
+    }
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("input_event.log")
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
         let log_entry = format!("[{}] {}\n", timestamp, message);
         let _ = std::io::Write::write_all(&mut file, log_entry.as_bytes());
     }
@@ -566,6 +599,117 @@ fn sanitize_status_field(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
+// Keep regular messages below the BLE fragmentation path when possible.
+// This improves iOS interop for long multi-line mesh messages.
+const OUTGOING_MESSAGE_SOFT_LIMIT_BYTES: usize = 320;
+
+fn push_utf8_slices_with_limit(text: &str, limit_bytes: usize, out: &mut Vec<String>) {
+    if text.is_empty() {
+        return;
+    }
+    if text.len() <= limit_bytes {
+        out.push(text.to_string());
+        return;
+    }
+
+    let mut current = String::new();
+    let mut current_len = 0usize;
+    for ch in text.chars() {
+        let ch_len = ch.len_utf8();
+        if current_len + ch_len > limit_bytes && !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+        current.push(ch);
+        current_len += ch_len;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+}
+
+fn split_outgoing_message_chunks(message: &str) -> Vec<String> {
+    if message.is_empty() {
+        return Vec::new();
+    }
+
+    if message.len() <= OUTGOING_MESSAGE_SOFT_LIMIT_BYTES {
+        return vec![message.to_string()];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for raw_line in message.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+
+        if line.len() > OUTGOING_MESSAGE_SOFT_LIMIT_BYTES {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            push_utf8_slices_with_limit(line, OUTGOING_MESSAGE_SOFT_LIMIT_BYTES, &mut chunks);
+            continue;
+        }
+
+        if current.is_empty() {
+            current.push_str(line);
+            continue;
+        }
+
+        let candidate_len = current.len() + 1 + line.len();
+        if candidate_len <= OUTGOING_MESSAGE_SOFT_LIMIT_BYTES {
+            current.push('\n');
+            current.push_str(line);
+        } else {
+            chunks.push(std::mem::take(&mut current));
+            current.push_str(line);
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    if chunks.is_empty() {
+        vec![message.to_string()]
+    } else {
+        chunks
+    }
+}
+
+fn build_terminal_title(app: &App) -> String {
+    let unread_total: usize = app.unread_counts.values().copied().sum();
+    let current = if let Some(person_idx) = app.sidebar_state.people_selected {
+        app.visible_person_at(person_idx)
+            .map(|name| format!("DM {}", name))
+            .or_else(|| {
+                app.current_conv.as_ref().and_then(|(dm, _)| {
+                    dm.as_ref().map(|dm_target| format!("DM {}", dm_target))
+                })
+            })
+            .unwrap_or_else(|| "DM".to_string())
+    } else {
+        app.current_conv
+            .as_ref()
+            .and_then(|(_, channel)| channel.clone())
+            .unwrap_or_else(|| "#public".to_string())
+    };
+    if unread_total > 0 {
+        format!("🔔 ({}) bitchat-tui - {}", unread_total, current)
+    } else {
+        format!("bitchat-tui - {}", current)
+    }
+}
+
+fn sync_terminal_title(last_title: &mut String, app: &App) {
+    let next_title = build_terminal_title(app);
+    if *last_title == next_title {
+        return;
+    }
+    let _ = execute!(std::io::stdout(), SetTitle(next_title.clone()));
+    *last_title = next_title;
+}
+
 fn is_pass_command(line: &str) -> bool {
     line == "/pass" || line.starts_with("/pass ")
 }
@@ -601,6 +745,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the TUI with the saved nickname
     let mut terminal = tui_mod::init().expect("Failed to initialize TUI");
     let mut app = App::new_with_nickname(saved_nickname);
+    let mut last_terminal_title = String::new();
     app.update_blocked_list(saved_state.blocked_names.clone());
     app.nostr_aliases = saved_state.nostr_aliases.clone();
     let nostr_geo_client = nostr_geo::NostrGeoClient::new(ui_tx.clone(), nostr_identity_seed);
@@ -1236,9 +1381,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if crossterm_event::poll(tick_rate.saturating_sub(last_tick.elapsed())).unwrap_or(false) {
             match crossterm_event::read().unwrap() {
                 CrosstermEvent::Key(key_event) => {
+                    write_input_event_log(&format!(
+                        "KEY kind={:?} code={:?} modifiers={:?}",
+                        key_event.kind, key_event.code, key_event.modifiers
+                    ));
                     event::handle_key_event(&mut app, key_event, &input_tx);
                 }
                 CrosstermEvent::Paste(pasted) => {
+                    write_input_event_log(&format!(
+                        "PASTE len={} newline={} preview={}",
+                        pasted.chars().count(),
+                        pasted.contains('\n'),
+                        pasted
+                            .chars()
+                            .take(40)
+                            .collect::<String>()
+                            .replace('\n', "\\n")
+                            .replace('\r', "\\r")
+                    ));
                     event::handle_paste_event(&mut app, &pasted);
                 }
                 CrosstermEvent::Mouse(mouse_event) => {
@@ -2492,17 +2652,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if let Some((channel, target_nickname, recipient_pubkey)) = app.current_geohash_dm() {
-                queue_geohash_dm_send(
-                    &mut app,
-                    nostr_geo_client.clone(),
-                    ui_tx.clone(),
-                    channel,
-                    target_nickname,
-                    recipient_pubkey,
-                    line.clone(),
-                    my_peer_id.clone(),
-                    nickname.clone(),
-                );
+                let outgoing_chunks = split_outgoing_message_chunks(&line);
+                let chunk_total = outgoing_chunks.len();
+                for (idx, chunk) in outgoing_chunks.into_iter().enumerate() {
+                    queue_geohash_dm_send(
+                        &mut app,
+                        nostr_geo_client.clone(),
+                        ui_tx.clone(),
+                        channel.clone(),
+                        target_nickname.clone(),
+                        recipient_pubkey.clone(),
+                        chunk,
+                        my_peer_id.clone(),
+                        nickname.clone(),
+                    );
+                    if chunk_total > 1 && idx + 1 < chunk_total {
+                        time::sleep(Duration::from_millis(40)).await;
+                    }
+                }
                 continue;
             }
 
@@ -2525,19 +2692,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let nostr_geo_client = nostr_geo_client.clone();
                     let ui_tx = ui_tx.clone();
                     let channel = channel.clone();
-                    let message = line.clone();
+                    let messages = split_outgoing_message_chunks(&line);
                     let nickname = nickname.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = nostr_geo_client
-                            .send_message(&channel, &message, &nickname)
-                            .await
-                        {
-                            let _ = ui_tx
-                                .send(format!(
-                                    "system: Failed to send geohash message on {}: {}",
-                                    channel, e
-                                ))
-                                .await;
+                        let chunk_total = messages.len();
+                        for (idx, message) in messages.into_iter().enumerate() {
+                            if let Err(e) = nostr_geo_client
+                                .send_message(&channel, &message, &nickname)
+                                .await
+                            {
+                                let _ = ui_tx
+                                    .send(format!(
+                                        "system: Failed to send geohash message on {}: {}",
+                                        channel, e
+                                    ))
+                                    .await;
+                            }
+                            if chunk_total > 1 && idx + 1 < chunk_total {
+                                time::sleep(Duration::from_millis(40)).await;
+                            }
                         }
                     });
                     continue;
@@ -2554,19 +2727,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let nostr_geo_client = nostr_geo_client.clone();
                     let ui_tx = ui_tx.clone();
                     let channel = channel.clone();
-                    let message = line.clone();
+                    let messages = split_outgoing_message_chunks(&line);
                     let nickname = nickname.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = nostr_geo_client
-                            .send_message(&channel, &message, &nickname)
-                            .await
-                        {
-                            let _ = ui_tx
-                                .send(format!(
-                                    "system: Failed to send geohash message on {}: {}",
-                                    channel, e
-                                ))
-                                .await;
+                        let chunk_total = messages.len();
+                        for (idx, message) in messages.into_iter().enumerate() {
+                            if let Err(e) = nostr_geo_client
+                                .send_message(&channel, &message, &nickname)
+                                .await
+                            {
+                                let _ = ui_tx
+                                    .send(format!(
+                                        "system: Failed to send geohash message on {}: {}",
+                                        channel, e
+                                    ))
+                                    .await;
+                            }
+                            if chunk_total > 1 && idx + 1 < chunk_total {
+                                time::sleep(Duration::from_millis(40)).await;
+                            }
                         }
                     });
                     continue;
@@ -2611,23 +2790,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 continue;
             }
-            handle_regular_message(
-                &line,
-                &nickname,
-                &my_peer_id,
-                chat_context.as_ref().unwrap(),
-                password_protected_channels.as_ref().unwrap(),
-                channel_keys.as_mut().unwrap(),
-                encryption_service.as_ref().unwrap(),
-                delivery_tracker.as_mut().unwrap(),
-                peripheral.as_ref().unwrap(),
-                cmd_char.as_ref().unwrap(),
-                ui_tx.clone(),
-                &mut app,
-            )
-            .await;
+            let outgoing_chunks = split_outgoing_message_chunks(&line);
+
+            let chunk_total = outgoing_chunks.len();
+            for (idx, chunk) in outgoing_chunks.into_iter().enumerate() {
+                handle_regular_message(
+                    &chunk,
+                    &nickname,
+                    &my_peer_id,
+                    chat_context.as_ref().unwrap(),
+                    password_protected_channels.as_ref().unwrap(),
+                    channel_keys.as_mut().unwrap(),
+                    encryption_service.as_ref().unwrap(),
+                    delivery_tracker.as_mut().unwrap(),
+                    peripheral.as_ref().unwrap(),
+                    cmd_char.as_ref().unwrap(),
+                    ui_tx.clone(),
+                    &mut app,
+                )
+                .await;
+
+                if chunk_total > 1 && idx + 1 < chunk_total {
+                    time::sleep(Duration::from_millis(40)).await;
+                }
+            }
         }
         // 6. Render the UI
+        sync_terminal_title(&mut last_terminal_title, &app);
         terminal.draw(|f| ui::render(&mut app, f)).unwrap();
         // 7. Exit if requested
         if app.should_quit {
@@ -2635,6 +2824,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         last_tick = std::time::Instant::now();
     }
+
+    let _ = execute!(std::io::stdout(), SetTitle("bitchat-tui"));
 
     // Always persist state on shutdown so state.json mtime reflects the latest exit.
     if let (

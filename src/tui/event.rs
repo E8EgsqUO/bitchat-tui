@@ -11,12 +11,16 @@ use tokio::sync::mpsc;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::InputRequest;
 
-use crate::tui::app::{App, FocusArea, MessageLineCopyTarget};
+use crate::tui::app::{App, FocusArea};
 use crate::tui::widgets::sidebar::sidebar_visible_items;
 
 const MAX_GLOBAL_HISTORY_SCROLL_STEP: usize = 8;
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(1000);
+const PASTE_BURST_CHAR_WINDOW: Duration = Duration::from_millis(45);
+const PASTE_BURST_ENTER_WINDOW: Duration = Duration::from_millis(120);
+const PASTE_FAST_ENTER_WINDOW: Duration = Duration::from_millis(45);
+const PASTE_BURST_MIN_CHARS: u16 = 5;
 
 pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sender<String>) {
     if key_event.kind != KeyEventKind::Press {
@@ -60,7 +64,10 @@ pub fn handle_paste_event(app: &mut App, pasted: &str) {
     }
 
     app.focus_area = FocusArea::InputBox;
-    insert_text_into_input(&mut app.input, pasted);
+    let _ = insert_text_into_input(&mut app.input, pasted);
+    app.paste_keyburst_active = false;
+    app.last_input_char_event_at = None;
+    app.input_char_burst_count = 0;
 }
 
 pub fn handle_mouse_event(app: &mut App, mouse_event: MouseEvent) {
@@ -146,15 +153,18 @@ fn copy_via_osc52(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn insert_text_into_input(input: &mut tui_input::Input, text: &str) {
+fn insert_text_into_input(input: &mut tui_input::Input, text: &str) -> bool {
+    let mut changed = false;
     for ch in text.chars() {
         match ch {
             '\r' => {}
             _ => {
                 let _ = input.handle(InputRequest::InsertChar(ch));
+                changed = true;
             }
         }
     }
+    changed
 }
 
 fn handle_global_message_scroll(app: &mut App, key_event: KeyEvent) -> bool {
@@ -301,7 +311,75 @@ fn handle_popup_events(app: &mut App, key_event: KeyEvent, _input_tx: &mpsc::Sen
 
 fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sender<String>) {
     match key_event.code {
+        KeyCode::Char(ch)
+            if ch.eq_ignore_ascii_case(&'a') && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            let _ = app.input.handle(InputRequest::GoToStart);
+        }
+        KeyCode::Char(ch)
+            if ch.eq_ignore_ascii_case(&'e') && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            let _ = app.input.handle(InputRequest::GoToEnd);
+        }
+        KeyCode::Char(ch)
+            if ch.eq_ignore_ascii_case(&'u')
+                && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.input.reset();
+            app.paste_keyburst_active = false;
+            app.last_input_char_event_at = None;
+            app.input_char_burst_count = 0;
+        }
+        KeyCode::Char(ch)
+            if ch.eq_ignore_ascii_case(&'v')
+                && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                Ok(text) => {
+                    let _ = insert_text_into_input(&mut app.input, &text);
+                }
+                Err(err) => {
+                    app.add_log_message(format!("system: Clipboard paste failed: {}", err));
+                }
+            }
+            app.paste_keyburst_active = false;
+            app.last_input_char_event_at = None;
+            app.input_char_burst_count = 0;
+        }
+        KeyCode::Insert if key_event.modifiers.contains(KeyModifiers::SHIFT) => {
+            match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                Ok(text) => {
+                    let _ = insert_text_into_input(&mut app.input, &text);
+                }
+                Err(err) => {
+                    app.add_log_message(format!("system: Clipboard paste failed: {}", err));
+                }
+            }
+            app.paste_keyburst_active = false;
+            app.last_input_char_event_at = None;
+            app.input_char_burst_count = 0;
+        }
         KeyCode::Enter => {
+            let now = Instant::now();
+            let burst_enter = app.paste_keyburst_active
+                && app
+                    .last_input_char_event_at
+                    .map(|last| now.duration_since(last) <= PASTE_BURST_ENTER_WINDOW)
+                    .unwrap_or(false);
+            let fast_enter_after_char = app
+                .last_input_char_event_at
+                .map(|last| now.duration_since(last) <= PASTE_FAST_ENTER_WINDOW)
+                .unwrap_or(false);
+            if burst_enter || fast_enter_after_char {
+                let _ = app.input.handle(InputRequest::InsertChar('\n'));
+                return;
+            }
+
+            if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+                let _ = app.input.handle(InputRequest::InsertChar('\n'));
+                return;
+            }
+
             let input_str = app.input.value().to_string();
             if !input_str.is_empty() {
                 if input_tx.try_send(input_str.clone()).is_ok() {
@@ -318,13 +396,39 @@ fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Send
                         app.add_sent_message(input_str);
                     }
                     app.input.reset();
+                    app.paste_keyburst_active = false;
+                    app.last_input_char_event_at = None;
+                    app.input_char_burst_count = 0;
                 }
             }
         }
         KeyCode::Esc => {}
         _ => {
-            // FIX: Ignore the return value of handle_event
+            let before = app.input.value().to_string();
             let _ = app.input.handle_event(&CrosstermEvent::Key(key_event));
+            let changed = app.input.value() != before;
+            let plain_char = matches!(key_event.code, KeyCode::Char(_))
+                && !key_event.modifiers.contains(KeyModifiers::CONTROL)
+                && !key_event.modifiers.contains(KeyModifiers::ALT);
+
+            if changed && plain_char {
+                let now = Instant::now();
+                let in_burst = app
+                    .last_input_char_event_at
+                    .map(|last| now.duration_since(last) <= PASTE_BURST_CHAR_WINDOW)
+                    .unwrap_or(false);
+                app.input_char_burst_count = if in_burst {
+                    app.input_char_burst_count.saturating_add(1)
+                } else {
+                    1
+                };
+                app.last_input_char_event_at = Some(now);
+                app.paste_keyburst_active = app.input_char_burst_count >= PASTE_BURST_MIN_CHARS;
+            } else if changed {
+                app.paste_keyburst_active = false;
+                app.last_input_char_event_at = None;
+                app.input_char_burst_count = 0;
+            }
         }
     }
 }
@@ -332,6 +436,7 @@ fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Send
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::MessageLineCopyTarget;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -395,6 +500,55 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_inserts_newline_and_enter_sends() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        app.focus_area = FocusArea::InputBox;
+
+        handle_paste_event(&mut app, "line1\nline2");
+        assert_eq!(app.input.value(), "line1\nline2");
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &input_tx,
+        );
+        assert_eq!(app.input.value(), "line1\nline2\n");
+        assert!(input_rx.try_recv().is_err());
+
+        handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(input_rx.try_recv().unwrap(), "line1\nline2\n");
+        assert_eq!(app.input.value(), "");
+    }
+
+    #[test]
+    fn single_line_paste_still_sends_with_single_enter() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        app.focus_area = FocusArea::InputBox;
+
+        handle_paste_event(&mut app, "line1 line2");
+        assert_eq!(app.input.value(), "line1 line2");
+
+        handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
+        assert_eq!(input_rx.try_recv().unwrap(), "line1 line2");
+        assert_eq!(app.input.value(), "");
+    }
+
+    #[test]
+    fn enter_sends_immediately() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        app.focus_area = FocusArea::InputBox;
+        handle_paste_event(&mut app, "hello");
+
+        handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
+        assert_eq!(input_rx.try_recv().unwrap(), "hello");
+        assert_eq!(app.input.value(), "");
+    }
+
+    #[test]
     fn geohash_dm_input_is_not_echoed_by_event_layer() {
         let (input_tx, mut input_rx) = mpsc::channel(1);
         let mut app = App::new_with_nickname("me".to_string());
@@ -415,6 +569,46 @@ mod tests {
             .get(&dm_key)
             .map(Vec::is_empty)
             .unwrap_or(true));
+    }
+
+    #[test]
+    fn ctrl_u_clears_input_for_fast_reset() {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        app.focus_area = FocusArea::InputBox;
+        handle_paste_event(&mut app, "to be cleared");
+        assert_eq!(app.input.value(), "to be cleared");
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &input_tx,
+        );
+        assert_eq!(app.input.value(), "");
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_move_cursor_start_and_end() {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        app.focus_area = FocusArea::InputBox;
+        handle_paste_event(&mut app, "abc");
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &input_tx,
+        );
+        handle_key_event(&mut app, key(KeyCode::Char('X')), &input_tx);
+        assert_eq!(app.input.value(), "Xabc");
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &input_tx,
+        );
+        handle_key_event(&mut app, key(KeyCode::Char('Y')), &input_tx);
+        assert_eq!(app.input.value(), "XabcY");
     }
 
     #[test]
