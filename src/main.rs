@@ -494,11 +494,28 @@ fn resolve_geohash_dm_target(
         return Ok((target.to_string(), pubkey));
     }
 
+    let mut alias_matches: Vec<(String, String)> = app
+        .nostr_aliases
+        .iter()
+        .filter_map(|(pubkey, alias)| {
+            alias
+                .eq_ignore_ascii_case(target)
+                .then(|| (alias.clone(), pubkey.clone()))
+        })
+        .collect();
+    if !alias_matches.is_empty() {
+        alias_matches.sort_by(|a, b| a.1.cmp(&b.1));
+        return Ok(alias_matches.remove(0));
+    }
+
     if let Some(pubkey) = nostr_geo::normalize_dm_pubkey(target) {
-        let Some(label) = app.geohash_person_for_pubkey(channel, &pubkey) else {
-            return Err(GeohashDmTargetError::UnknownPubkey);
-        };
-        return Ok((label, pubkey));
+        if let Some(label) = app.geohash_person_for_pubkey(channel, &pubkey) {
+            return Ok((label, pubkey));
+        }
+        if let Some(alias) = app.nostr_aliases.get(&pubkey) {
+            return Ok((alias.clone(), pubkey));
+        }
+        return Err(GeohashDmTargetError::UnknownPubkey);
     }
 
     Err(GeohashDmTargetError::UnknownName)
@@ -2146,6 +2163,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
 
+                    app.add_geohash_person(
+                        &geohash_channel,
+                        &target_label,
+                        Some(&recipient_pubkey),
+                    );
                     app.switch_to_geohash_dm(target_label.clone());
 
                     if let Some(message) = maybe_message {
@@ -2999,6 +3021,20 @@ mod tests {
             resolve_geohash_dm_target(&app, "#ws", unknown_pubkey),
             Err(GeohashDmTargetError::UnknownPubkey)
         ));
+    }
+
+    #[test]
+    fn geohash_dm_alias_can_resolve_offline_user_from_saved_aliases() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let offline_pubkey = "f5688e82b33eae5112cd6ec58eca77da3091974f84579129e0d13141e4403c9e";
+        app.join_channel("#ws".to_string());
+        app.nostr_aliases
+            .insert(offline_pubkey.to_string(), "xiaojie".to_string());
+
+        assert_eq!(
+            resolve_geohash_dm_target(&app, "#ws", "xiaojie").ok(),
+            Some(("xiaojie".to_string(), offline_pubkey.to_string()))
+        );
     }
 
     #[test]
