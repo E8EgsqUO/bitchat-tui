@@ -137,6 +137,8 @@ fn get_help_text(app: &App) -> Vec<Span> {
                     Span::raw(": Direct message • "),
                     Span::styled("/file", Style::default().fg(Color::Green)),
                     Span::raw(": Mesh file • "),
+                    Span::styled("/upload", Style::default().fg(Color::Green)),
+                    Span::raw(": Share link • "),
                     Span::styled("/receive", Style::default().fg(Color::Green)),
                     Span::raw(": Accept offer • "),
                     Span::styled(

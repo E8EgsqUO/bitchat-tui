@@ -6,6 +6,7 @@ use crossterm::event::{
     MouseEvent, MouseEventKind,
 };
 use std::io::Write;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tui_input::backend::crossterm::EventHandler;
@@ -63,11 +64,131 @@ pub fn handle_paste_event(app: &mut App, pasted: &str) {
         return;
     }
 
+    if app.input.value().trim().is_empty() {
+        if let Some(paths) = detect_dragged_file_paths(pasted) {
+            let command = build_upload_command_from_paths(&paths);
+            app.focus_area = FocusArea::InputBox;
+            app.input.reset();
+            let _ = insert_text_into_input(&mut app.input, &command);
+            if paths.len() > 1 {
+                app.add_log_message(format!(
+                    "system: Detected {} files from drag-and-drop. Prepared upload for the first one. Send it, then drag the next file.",
+                    paths.len()
+                ));
+            }
+            app.paste_keyburst_active = false;
+            app.last_input_char_event_at = None;
+            app.input_char_burst_count = 0;
+            return;
+        }
+    }
+
     app.focus_area = FocusArea::InputBox;
     let _ = insert_text_into_input(&mut app.input, pasted);
     app.paste_keyburst_active = false;
     app.last_input_char_event_at = None;
     app.input_char_burst_count = 0;
+}
+
+fn detect_dragged_file_paths(pasted: &str) -> Option<Vec<String>> {
+    let trimmed = pasted.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut paths: Vec<String> = Vec::new();
+    for raw in trimmed.lines() {
+        let candidate = raw.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        let unquoted = strip_wrapping_quotes(candidate);
+        if looks_like_upload_file_reference(unquoted) {
+            paths.push(unquoted.to_string());
+        } else {
+            return None;
+        }
+    }
+
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths)
+    }
+}
+
+fn looks_like_windows_file_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    value.starts_with("\\\\")
+}
+
+fn looks_like_filename_token(value: &str) -> bool {
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let has_ext = value
+        .rsplit_once('.')
+        .map(|(base, ext)| !base.is_empty() && ext.chars().all(|ch| ch.is_ascii_alphanumeric()) && !ext.is_empty())
+        .unwrap_or(false);
+    has_ext
+}
+
+fn looks_like_upload_file_reference(value: &str) -> bool {
+    if Path::new(value).is_file() {
+        return true;
+    }
+
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    looks_like_windows_file_path(value)
+        || value.contains('/')
+        || value.contains('\\')
+        || looks_like_filename_token(value)
+}
+
+fn strip_wrapping_quotes(value: &str) -> &str {
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn quote_for_upload_command(path: &str) -> String {
+    if path.chars().any(char::is_whitespace) {
+        format!("\"{}\"", path.replace('"', "\\\""))
+    } else {
+        path.to_string()
+    }
+}
+
+fn build_upload_command_from_paths(paths: &[String]) -> String {
+    let first = paths.first().map(String::as_str).unwrap_or("");
+    format!("/upload {}", quote_for_upload_command(first))
+}
+
+fn upload_command_from_freeform_input(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.contains('\n') {
+        return None;
+    }
+    let unquoted = strip_wrapping_quotes(trimmed);
+    if !looks_like_upload_file_reference(unquoted) {
+        return None;
+    }
+    Some(format!("/upload {}", quote_for_upload_command(unquoted)))
 }
 
 pub fn handle_mouse_event(app: &mut App, mouse_event: MouseEvent) {
@@ -312,12 +433,14 @@ fn handle_popup_events(app: &mut App, key_event: KeyEvent, _input_tx: &mpsc::Sen
 fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sender<String>) {
     match key_event.code {
         KeyCode::Char(ch)
-            if ch.eq_ignore_ascii_case(&'a') && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+            if ch.eq_ignore_ascii_case(&'a')
+                && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             let _ = app.input.handle(InputRequest::GoToStart);
         }
         KeyCode::Char(ch)
-            if ch.eq_ignore_ascii_case(&'e') && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+            if ch.eq_ignore_ascii_case(&'e')
+                && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             let _ = app.input.handle(InputRequest::GoToEnd);
         }
@@ -381,19 +504,20 @@ fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Send
             }
 
             let input_str = app.input.value().to_string();
+            let outgoing = upload_command_from_freeform_input(&input_str).unwrap_or(input_str.clone());
             if !input_str.is_empty() {
-                if input_tx.try_send(input_str.clone()).is_ok() {
+                if input_tx.try_send(outgoing.clone()).is_ok() {
                     let is_mesh_dm = app.current_geohash_dm().is_none()
                         && app
                             .current_conv
                             .as_ref()
                             .and_then(|(dm, _)| dm.as_ref())
                             .is_some();
-                    if !input_str.starts_with('/')
+                    if !outgoing.starts_with('/')
                         && app.current_geohash_dm().is_none()
                         && !is_mesh_dm
                     {
-                        app.add_sent_message(input_str);
+                        app.add_sent_message(outgoing);
                     }
                     app.input.reset();
                     app.paste_keyburst_active = false;
@@ -537,6 +661,42 @@ mod tests {
     }
 
     #[test]
+    fn enter_converts_windows_path_like_input_to_upload_command() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        app.focus_area = FocusArea::InputBox;
+        handle_paste_event(&mut app, "D:\\test.png");
+
+        handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(input_rx.try_recv().unwrap(), "/upload D:\\test.png");
+    }
+
+    #[test]
+    fn enter_converts_filename_token_to_upload_command() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        app.focus_area = FocusArea::InputBox;
+        handle_paste_event(&mut app, "photo.jpg");
+
+        handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(input_rx.try_recv().unwrap(), "/upload photo.jpg");
+    }
+
+    #[test]
+    fn mixed_text_with_path_fragment_is_not_converted_to_upload() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        app.focus_area = FocusArea::InputBox;
+        handle_paste_event(&mut app, "test D:\\t.png");
+
+        handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(input_rx.try_recv().unwrap(), "test D:\\t.png");
+    }
+
+    #[test]
     fn enter_sends_immediately() {
         let (input_tx, mut input_rx) = mpsc::channel(1);
         let mut app = App::new_with_nickname("me".to_string());
@@ -644,6 +804,23 @@ mod tests {
 
         assert!(app.pending_connection_retry);
         assert_eq!(app.input.value(), "");
+    }
+
+    #[test]
+    fn drag_and_drop_file_path_prefills_upload_command() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join(format!("bitchat_upload_{}.txt", std::process::id()));
+        std::fs::write(&path, "ok").expect("write temp file");
+        let pasted = path.to_string_lossy().to_string();
+
+        handle_paste_event(&mut app, &pasted);
+
+        assert_eq!(
+            app.input.value(),
+            format!("/upload {}", quote_for_upload_command(&pasted))
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

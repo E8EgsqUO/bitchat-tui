@@ -10,9 +10,9 @@ use tokio::time::{self, Duration};
 
 use bloomfilter::Bloom;
 mod tui;
-use crossterm::execute;
 use crossterm::event as crossterm_event;
 use crossterm::event::Event as CrosstermEvent;
+use crossterm::execute;
 use crossterm::terminal::SetTitle;
 use std::time::Duration as StdDuration;
 use tui::app::App;
@@ -61,6 +61,7 @@ mod packet_parser;
 mod payload_handling;
 mod persistence;
 mod terminal_ux;
+mod upload_share;
 mod wormhole_transfer;
 
 use crate::data_structures::{
@@ -180,7 +181,10 @@ fn collect_manual_blocked_names(entries: &[String]) -> Vec<String> {
                 }
             }
         }
-        if !manual.iter().any(|existing| existing.eq_ignore_ascii_case(trimmed)) {
+        if !manual
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+        {
             manual.push(trimmed.to_string());
         }
     }
@@ -383,6 +387,7 @@ fn canonicalize_command_alias(raw_line: &str) -> String {
         "/u" => "/unblock",
         "/s" => "/search",
         "/e" => "/export",
+        "/up" => "/upload",
         _ => return raw_line.to_string(),
     };
 
@@ -391,6 +396,33 @@ fn canonicalize_command_alias(raw_line: &str) -> String {
     } else {
         format!("{} {}", canonical, rest.trim_start())
     }
+}
+
+fn trim_wrapping_quotes(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
+fn parse_upload_path(line: &str) -> Result<Option<String>, &'static str> {
+    let Some(rest) = line.strip_prefix("/upload") else {
+        return Ok(None);
+    };
+    if !rest.is_empty() && !rest.chars().next().unwrap_or(' ').is_whitespace() {
+        return Ok(None);
+    }
+
+    let arg = trim_wrapping_quotes(rest);
+    if arg.is_empty() {
+        return Err("Usage: /upload <path>");
+    }
+    Ok(Some(arg.to_string()))
 }
 
 fn parse_channel_shortcut(line: &str) -> Option<usize> {
@@ -461,9 +493,7 @@ fn find_latest_geohash_with_messages(app: &App) -> Option<String> {
             Some((last_epoch, messages.len(), channel.clone()))
         })
         .max_by(|(epoch_a, len_a, _), (epoch_b, len_b, _)| {
-            epoch_a
-                .cmp(epoch_b)
-                .then_with(|| len_a.cmp(len_b))
+            epoch_a.cmp(epoch_b).then_with(|| len_a.cmp(len_b))
         })
         .map(|(_, _, channel)| channel)
 }
@@ -680,9 +710,9 @@ fn build_terminal_title(app: &App) -> String {
         app.visible_person_at(person_idx)
             .map(|name| format!("DM {}", name))
             .or_else(|| {
-                app.current_conv.as_ref().and_then(|(dm, _)| {
-                    dm.as_ref().map(|dm_target| format!("DM {}", dm_target))
-                })
+                app.current_conv
+                    .as_ref()
+                    .and_then(|(dm, _)| dm.as_ref().map(|dm_target| format!("DM {}", dm_target)))
             })
             .unwrap_or_else(|| "DM".to_string())
     } else {
@@ -744,7 +774,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_terminal_title = String::new();
     app.update_blocked_list(saved_state.blocked_names.clone());
     app.nostr_aliases = saved_state.nostr_aliases.clone();
-    let nostr_geo_client = nostr_geo::NostrGeoClient::new(ui_tx.clone(), nostr_identity_seed);
+    let nostr_geo_client =
+        nostr_geo::NostrGeoClient::new(ui_tx.clone(), nostr_identity_seed.clone());
 
     // Spawn Bluetooth connection setup in the background
     let ui_tx_clone = ui_tx.clone();
@@ -1562,7 +1593,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 5. Handle input from the input box (from input_rx)
         while let Ok(raw_line) = input_rx.try_recv() {
             let ui_tx = ui_tx.clone();
-            let line = canonicalize_command_alias(&raw_line);
+            let mut line = canonicalize_command_alias(&raw_line);
+
+            match parse_upload_path(&line) {
+                Ok(Some(path)) => {
+                    app.add_log_message(format!(
+                        "system: Uploading {} ...",
+                        crate::tui::app::compact_file_message(&path)
+                    ));
+                    let upload_path = std::path::Path::new(&path);
+                    match upload_share::upload_file(upload_path, &nostr_identity_seed).await {
+                        Ok(result) => {
+                            app.add_log_message(format!(
+                                "system: Uploaded {} ({} bytes)",
+                                crate::tui::app::compact_file_message(&result.file_name),
+                                result.file_size
+                            ));
+                            line = format!("{} {}", result.file_name, result.url);
+                            let is_mesh_dm = app.current_geohash_dm().is_none()
+                                && app
+                                    .current_conv
+                                    .as_ref()
+                                    .and_then(|(dm, _)| dm.as_ref())
+                                    .is_some();
+                            if app.current_geohash_dm().is_none() && !is_mesh_dm {
+                                app.add_sent_message(line.clone());
+                            }
+                        }
+                        Err(e) => {
+                            app.add_log_message(format!("system: Upload failed: {}", e));
+                            continue;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(usage) => {
+                    app.add_log_message(format!("system: {}", usage));
+                    continue;
+                }
+            }
             // Handle /exit immediately to avoid panics during connecting phase
             if line == "/exit" {
                 if let (
@@ -1634,7 +1703,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.switch_to_channel(target_channel.clone());
 
                 if nostr_geo::is_geohash_channel(&target_channel) {
-                    if let Err(e) = nostr_geo_client.join_channel(&target_channel, &nickname).await {
+                    if let Err(e) = nostr_geo_client
+                        .join_channel(&target_channel, &nickname)
+                        .await
+                    {
                         app.add_log_message(format!(
                             "system: Failed to join Nostr geohash channel {}: {}",
                             target_channel, e
@@ -1679,7 +1751,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap()
                     .switch_to_channel(&target_channel);
 
-                if let Err(e) = nostr_geo_client.join_channel(&target_channel, &nickname).await {
+                if let Err(e) = nostr_geo_client
+                    .join_channel(&target_channel, &nickname)
+                    .await
+                {
                     app.add_log_message(format!(
                         "system: Failed to join Nostr geohash channel {}: {}",
                         target_channel, e
@@ -1958,9 +2033,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for msg in messages.iter() {
                         content.push_str(&format!(
                             "[{}] {}: {}\n",
-                            msg.timestamp,
-                            msg.sender,
-                            msg.content
+                            msg.timestamp, msg.sender, msg.content
                         ));
                     }
                     if let Some(parent) = path.parent() {
@@ -1977,10 +2050,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ));
                         }
                         Err(e) => {
-                            app.add_log_message(format!(
-                                "system: Export failed: {}",
-                                e
-                            ));
+                            app.add_log_message(format!("system: Export failed: {}", e));
                         }
                     }
                     continue;
@@ -2542,6 +2612,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 continue;
             }
+            if handle_block_command(
+                &line,
+                blocked_peers.as_mut().unwrap(),
+                peers.as_ref().unwrap(),
+                encryption_service.as_ref().unwrap(),
+                channel_creators.as_ref().unwrap(),
+                chat_context.as_mut().unwrap(),
+                password_protected_channels.as_ref().unwrap(),
+                channel_key_commitments.as_ref().unwrap(),
+                app_state.as_ref().unwrap(),
+                create_app_state.as_ref().unwrap().as_ref(),
+                &nickname,
+                ui_tx.clone(),
+                &mut app,
+            )
+            .await
+            {
+                continue;
+            }
+            if handle_unblock_command(
+                &line,
+                blocked_peers.as_mut().unwrap(),
+                peers.as_ref().unwrap(),
+                encryption_service.as_ref().unwrap(),
+                channel_creators.as_ref().unwrap(),
+                chat_context.as_mut().unwrap(),
+                password_protected_channels.as_ref().unwrap(),
+                channel_key_commitments.as_ref().unwrap(),
+                app_state.as_ref().unwrap(),
+                create_app_state.as_ref().unwrap().as_ref(),
+                &nickname,
+                ui_tx.clone(),
+                &mut app,
+            )
+            .await
+            {
+                continue;
+            }
             if handle_dm_command(
                 &line,
                 chat_context.as_mut().unwrap(),
@@ -2577,44 +2685,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &my_peer_id,
                 peripheral.as_ref().unwrap(),
                 cmd_char.as_ref().unwrap(),
-                ui_tx.clone(),
-                &mut app,
-            )
-            .await
-            {
-                continue;
-            }
-            if handle_block_command(
-                &line,
-                blocked_peers.as_mut().unwrap(),
-                peers.as_ref().unwrap(),
-                encryption_service.as_ref().unwrap(),
-                channel_creators.as_ref().unwrap(),
-                chat_context.as_mut().unwrap(),
-                password_protected_channels.as_ref().unwrap(),
-                channel_key_commitments.as_ref().unwrap(),
-                app_state.as_ref().unwrap(),
-                create_app_state.as_ref().unwrap().as_ref(),
-                &nickname,
-                ui_tx.clone(),
-                &mut app,
-            )
-            .await
-            {
-                continue;
-            }
-            if handle_unblock_command(
-                &line,
-                blocked_peers.as_mut().unwrap(),
-                peers.as_ref().unwrap(),
-                encryption_service.as_ref().unwrap(),
-                channel_creators.as_ref().unwrap(),
-                chat_context.as_mut().unwrap(),
-                password_protected_channels.as_ref().unwrap(),
-                channel_key_commitments.as_ref().unwrap(),
-                app_state.as_ref().unwrap(),
-                create_app_state.as_ref().unwrap().as_ref(),
-                &nickname,
                 ui_tx.clone(),
                 &mut app,
             )
@@ -2970,8 +3040,14 @@ mod tests {
     #[test]
     fn parses_go_command_target() {
         assert_eq!(parse_go_command_target("/g"), Ok(None));
-        assert_eq!(parse_go_command_target("/g ws"), Ok(Some("#ws".to_string())));
-        assert_eq!(parse_go_command_target("/g #dh"), Ok(Some("#dh".to_string())));
+        assert_eq!(
+            parse_go_command_target("/g ws"),
+            Ok(Some("#ws".to_string()))
+        );
+        assert_eq!(
+            parse_go_command_target("/g #dh"),
+            Ok(Some("#dh".to_string()))
+        );
         assert_eq!(parse_go_command_target("/g   bad!"), Err("usage"));
     }
 
@@ -3045,5 +3121,19 @@ mod tests {
             parse_receive_command("/receive wormhole-code"),
             Some("wormhole-code")
         );
+    }
+
+    #[test]
+    fn parses_upload_path_with_optional_quotes() {
+        assert_eq!(
+            parse_upload_path("/upload ./test.png"),
+            Ok(Some("./test.png".to_string()))
+        );
+        assert_eq!(
+            parse_upload_path("/upload \"./folder/my pic.png\""),
+            Ok(Some("./folder/my pic.png".to_string()))
+        );
+        assert_eq!(parse_upload_path("/upload"), Err("Usage: /upload <path>"));
+        assert_eq!(parse_upload_path("/upload-now"), Ok(None));
     }
 }

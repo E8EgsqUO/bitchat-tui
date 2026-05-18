@@ -81,7 +81,7 @@ If the Bluetooth mesh connection stalls or drops, press `r` on the error screen 
 - Use `/leave` to leave the geohash channel and return to public chat.
 - `/w`, `/online`, `/channels`, `/name`, and `/public` work in geohash mode.
 - The active count follows the BitChat geohash presence heartbeat (`kind 20001`) and counts unique pubkeys seen in the last five minutes. Presence-only users are not added to the DM People list until they send a chat message or DM.
-- `/reply`, `/block`, and `/unblock` are mesh-only commands.
+- `/reply` is mesh-only. `/block` and `/unblock` are only available in Nostr geohash channels.
 
 ### Direct Messages
 
@@ -100,6 +100,8 @@ If the Bluetooth mesh connection stalls or drops, press `r` on the error screen 
 - The receiver opens the same geohash DM and types `/receive` to accept the transfer.
 - The sender does not enter the Wormhole code manually.
 - Files are limited to 1 MiB on mesh transfer and are saved under `received_files/` on the receiving side.
+- `/upload <path>` uploads media files (image/audio/video) to a configurable endpoint and sends the returned URL as a normal chat message.
+- Dragging a local file into the terminal input box auto-fills `/upload <path>` for the first detected file.
 - This is a TUI-only extension. iOS mesh clients still use their native image and voice-note transfers.
 - `/pass` has been removed from this fork.
 
@@ -136,6 +138,7 @@ Supported proxy formats:
 - `/public` switch to public chat
 - `/dm <name> [msg]` open a DM or send an initial message
 - `/file [@user] <path>` send a file over Bluetooth mesh, or create a Wormhole offer in a geohash DM
+- `/upload <path>` upload a media file (image/audio/video) and share the URL in the current conversation
 - `/receive` accept the pending geohash DM file offer
 - `/reply` reply to the last private sender
 - `/j #channel` join a channel
@@ -186,4 +189,18 @@ BITCHAT_DEBUG=1
 - If Bluetooth mesh is unavailable, geohash channels remain usable.
 - `r` is still useful as a recovery action when the Bluetooth scan needs to be restarted.
 - Proxy settings apply to Nostr relay traffic, not Bluetooth mesh traffic.
-- `/reply`, `/block`, and `/unblock` are Bluetooth mesh commands. In geohash channels, use the `People` list or `/dm <name>` for direct messages.
+- `/upload` also uses proxy env vars (`BITCHAT_TUI_NOSTR_PROXY`, `HTTP(S)_PROXY`, `ALL_PROXY`) when set.
+- `/reply` is a Bluetooth mesh command. `/block` and `/unblock` are Nostr geohash commands for local message filtering by user name.
+- Upload now defaults to Blossom on `blossom.nostr.build` (Nostr-signed auth).
+- To force provider selection, use `BITCHAT_UPLOAD_PROVIDER`:
+  - `blossom` (default)
+  - `nostrmedia`
+  - `catbox`
+  - `0x0`
+  - `auto` (try blossom.nostr.build -> nostrmedia -> catbox -> 0x0.st)
+- Override full endpoint with `BITCHAT_UPLOAD_ENDPOINT`.
+- Optional upload tuning:
+  - `BITCHAT_UPLOAD_FIELD` (only used with custom `BITCHAT_UPLOAD_ENDPOINT`)
+  - `BITCHAT_UPLOAD_USERHASH` (optional Catbox account hash)
+  - `BITCHAT_UPLOAD_TIMEOUT_SECS` (default `45`)
+  - `BITCHAT_UPLOAD_MAX_BYTES` (default `536870912`)

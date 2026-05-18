@@ -1325,8 +1325,8 @@ pub async fn handle_file_command(
 pub async fn handle_block_command(
     line: &str,
     blocked_peers: &mut HashSet<String>,
-    peers: &Arc<Mutex<HashMap<String, Peer>>>,
-    encryption_service: &EncryptionService,
+    _peers: &Arc<Mutex<HashMap<String, Peer>>>,
+    _encryption_service: &EncryptionService,
     channel_creators: &HashMap<String, String>,
     chat_context: &ChatContext,
     password_protected_channels: &HashSet<String>,
@@ -1348,12 +1348,18 @@ pub async fn handle_block_command(
     app: &mut crate::tui::app::App,
 ) -> bool {
     if line.starts_with("/block") {
+        if app.current_geohash_context_channel().is_none() {
+            let _ = ui_tx
+                .send("system: /block is only available in Nostr geohash channels.".to_string())
+                .await;
+            return true;
+        }
+
         let parts: Vec<&str> = line.split_whitespace().collect();
 
         // Handle /block without arguments - show list of blocked users
         if parts.len() == 1 {
-            let blocked_entries =
-                collect_blocked_display_entries(blocked_peers, peers, encryption_service).await;
+            let blocked_entries = manual_block_entries(&app.blocked);
 
             if blocked_entries.is_empty() {
                 let _ = ui_tx
@@ -1364,7 +1370,7 @@ pub async fn handle_block_command(
                 let _ = ui_tx
                     .send(format!(
                         "system: Blocked users ({}): {}",
-                        blocked_peers.len(),
+                        blocked_entries.len(),
                         blocked_list
                     ))
                     .await;
@@ -1375,74 +1381,37 @@ pub async fn handle_block_command(
         // Handle /block with username argument
         if parts.len() == 2 {
             let target_name = parts[1].trim_start_matches('@');
-            let peers_guard = peers.lock().await;
-            let (peer_matches, labels) = resolve_named_peers(&peers_guard, target_name);
-            drop(peers_guard);
+            let before_len = app.blocked.len();
+            add_manual_block_entry(app, target_name);
+            let added = app.blocked.len() > before_len;
 
-            if peer_matches.len() > 1 {
+            let channels_vec = persistent_channels(chat_context);
+            let blocked_names = manual_block_entries(&app.blocked);
+            let state_to_save = create_app_state(
+                blocked_peers,
+                &blocked_names,
+                &app.nostr_aliases,
+                channel_creators,
+                &channels_vec,
+                password_protected_channels,
+                channel_key_commitments,
+                &app_state.encrypted_channel_passwords,
+                nickname,
+            );
+            if let Err(e) = save_state(&state_to_save) {
                 let _ = ui_tx
-                    .send(format!(
-                        "system: Multiple users match '{}': {}. Use /block name#xxxx for exact match.",
-                        target_name,
-                        labels.join(", ")
-                    ))
+                    .send(format!("Warning: Could not save state: {}\n", e))
                     .await;
-                return true;
             }
 
-            let peer_id_to_block = peer_matches.first().map(|(id, _)| id.clone());
+            app.update_blocked_list(manual_block_entries(&app.blocked));
 
-            if let Some(peer_id) = peer_id_to_block {
-                if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&peer_id) {
-                    if !blocked_peers.insert(fingerprint) {
-                        let _ = ui_tx
-                            .send(format!("system: User '{}' is already blocked.", target_name))
-                            .await;
-                        return true;
-                    }
-                    let channels_vec = persistent_channels(chat_context);
-                    let blocked_names = manual_block_entries(&app.blocked);
-                    let state_to_save = create_app_state(
-                        blocked_peers,
-                        &blocked_names,
-                        &app.nostr_aliases,
-                        channel_creators,
-                        &channels_vec,
-                        password_protected_channels,
-                        channel_key_commitments,
-                        &app_state.encrypted_channel_passwords,
-                        nickname,
-                    );
-                    if let Err(e) = save_state(&state_to_save) {
-                        let _ = ui_tx
-                            .send(format!("Warning: Could not save state: {}\n", e))
-                            .await;
-                    }
-
-                    let blocked_entries =
-                        collect_blocked_display_entries(blocked_peers, peers, encryption_service)
-                            .await;
-                    app.update_blocked_list(blocked_entries);
-
-                    let _ = ui_tx
-                        .send(format!("\n\x1b[92m✓ Blocked {}\x1b[0m\n", target_name))
-                        .await;
-                } else {
-                    let _ = ui_tx
-                        .send(format!(
-                            "system: User '{}' is not blockable yet (no mesh fingerprint mapping).",
-                            target_name
-                        ))
-                        .await;
-                }
+            let msg = if added {
+                format!("system: Blocked '{}' in this Nostr context.", target_name)
             } else {
-                let _ = ui_tx
-                    .send(format!(
-                        "system: User '{}' not found in mesh peers. /block requires a username->fingerprint mapping.",
-                        target_name
-                    ))
-                    .await;
-            }
+                format!("system: User '{}' is already blocked.", target_name)
+            };
+            let _ = ui_tx.send(msg).await;
         }
         return true;
     }
@@ -1452,8 +1421,8 @@ pub async fn handle_block_command(
 pub async fn handle_unblock_command(
     line: &str,
     blocked_peers: &mut HashSet<String>,
-    peers: &Arc<Mutex<HashMap<String, Peer>>>,
-    encryption_service: &EncryptionService,
+    _peers: &Arc<Mutex<HashMap<String, Peer>>>,
+    _encryption_service: &EncryptionService,
     channel_creators: &HashMap<String, String>,
     chat_context: &ChatContext,
     password_protected_channels: &HashSet<String>,
@@ -1474,40 +1443,27 @@ pub async fn handle_unblock_command(
     ui_tx: mpsc::Sender<String>,
     app: &mut crate::tui::app::App,
 ) -> bool {
+    if line == "/unblock" {
+        let _ = ui_tx
+            .send("system: Usage: /unblock @user".to_string())
+            .await;
+        return true;
+    }
     if line.starts_with("/unblock ") {
+        if app.current_geohash_context_channel().is_none() {
+            let _ = ui_tx
+                .send("system: /unblock is only available in Nostr geohash channels.".to_string())
+                .await;
+            return true;
+        }
+
         let target_name = line
             .trim_start_matches("/unblock ")
             .trim()
             .trim_start_matches('@');
         let removed_manual = remove_manual_block_entry(app, target_name);
-        let peers_guard = peers.lock().await;
-        let (peer_matches, labels) = resolve_named_peers(&peers_guard, target_name);
-        drop(peers_guard);
-        if peer_matches.len() > 1 {
-            let _ = ui_tx
-                .send(format!(
-                    "system: Multiple users match '{}': {}. Use /unblock name#xxxx for exact match.",
-                    target_name,
-                    labels.join(", ")
-                ))
-                .await;
-            return true;
-        }
-        let peer_id_to_unblock = peer_matches.first().map(|(id, _)| id.clone());
-        let mut removed_fingerprint = false;
 
-        if let Some(peer_id) = peer_id_to_unblock {
-            if let Some(fingerprint) = encryption_service.get_peer_fingerprint(&peer_id) {
-                if blocked_peers.remove(&fingerprint) {
-                    removed_fingerprint = true;
-                }
-            }
-        }
-        let blocked_entries =
-            collect_blocked_display_entries(blocked_peers, peers, encryption_service).await;
-        app.update_blocked_list(blocked_entries);
-
-        if removed_fingerprint || removed_manual {
+        if removed_manual {
             let channels_vec = persistent_channels(chat_context);
             let blocked_names = manual_block_entries(&app.blocked);
             let state_to_save = create_app_state(
@@ -1526,6 +1482,7 @@ pub async fn handle_unblock_command(
                     .send(format!("Warning: Could not save state: {}\n", e))
                     .await;
             }
+            app.update_blocked_list(manual_block_entries(&app.blocked));
             let _ = ui_tx
                 .send(format!("\n\x1b[92m✓ Unblocked {}\x1b[0m\n", target_name))
                 .await;
