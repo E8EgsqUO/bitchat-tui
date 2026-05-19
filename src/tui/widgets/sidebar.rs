@@ -21,7 +21,7 @@ pub fn sidebar_visible_items(app: &App) -> Vec<(usize, Option<usize>)> {
                 1 => app.channels.len(),
                 2 => app.visible_people_count(),
                 3 => app.blocked.len(),
-                4 => 2, // Settings: Nickname, Network
+                4 => 3 + app.verified_identities.len(), // Settings: Nickname, Mesh, Verified summary + entries
                 _ => 0,
             };
             for idx in 0..count {
@@ -110,10 +110,20 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     .iter()
                     .enumerate()
                     .map(|(idx, s)| {
+                        let display_name = app.display_visible_person(s);
+                        let person_color = if !app.current_people_are_geohash()
+                            && app.is_mesh_person_verified(s)
+                        {
+                            Color::Magenta
+                        } else if app.is_person_aliased_in_current_context(s) {
+                            Color::Cyan
+                        } else {
+                            Color::Green
+                        };
                         (
-                            app.display_visible_person(s),
+                            display_name,
                             s.clone(),
-                            Color::Green,
+                            person_color,
                             app.sidebar_state.people_selected == Some(idx),
                         )
                     })
@@ -186,7 +196,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(format!("Nick: {}", app.nickname), style),
                 ])));
                 flat_idx += 1;
-                // Status
+                // Mesh status
                 let is_selected = app.sidebar_flat_selected == flat_idx;
                 style = if is_selected && app.focus_area == FocusArea::Sidebar {
                     Style::default().bg(Color::Blue).fg(Color::White)
@@ -208,6 +218,35 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     ),
                 ])));
                 flat_idx += 1;
+                // Verified summary
+                let is_selected = app.sidebar_flat_selected == flat_idx;
+                style = if is_selected && app.focus_area == FocusArea::Sidebar {
+                    Style::default().bg(Color::Blue).fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Magenta)
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("Verified: {}", app.verified_identities.len()),
+                        style,
+                    ),
+                ])));
+                flat_idx += 1;
+
+                for verified in &app.verified_identities {
+                    let is_selected = app.sidebar_flat_selected == flat_idx;
+                    let entry_style = if is_selected && app.focus_area == FocusArea::Sidebar {
+                        Style::default().bg(Color::Blue).fg(Color::White)
+                    } else {
+                        Style::default().fg(Color::Magenta)
+                    };
+                    items.push(ListItem::new(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(format!("✓ {}", verified), entry_style),
+                    ])));
+                    flat_idx += 1;
+                }
             }
         }
     }

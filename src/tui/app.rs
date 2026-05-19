@@ -159,6 +159,7 @@ pub struct App {
     pub nostr_aliases: HashMap<String, String>,
     pub geohash_presence: HashMap<String, HashMap<String, i64>>,
     pub blocked: Vec<String>,
+    pub verified_identities: Vec<String>,
 
     // Message storage
     pub channel_messages: HashMap<String, Vec<Message>>,
@@ -273,6 +274,7 @@ impl App {
             nostr_aliases: HashMap::new(),
             geohash_presence: HashMap::new(),
             blocked: Vec::new(),
+            verified_identities: Vec::new(),
             channel_messages,
             dm_messages: HashMap::new(),
             sidebar_state: SidebarMenuState::new(),
@@ -502,6 +504,53 @@ impl App {
         }
 
         target.to_string()
+    }
+
+    fn verified_label_from_entry(entry: &str) -> Option<&str> {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() || trimmed.starts_with("fingerprint:") {
+            return None;
+        }
+        if let Some((name, suffix_with_paren)) = trimmed.rsplit_once(" (") {
+            if suffix_with_paren.ends_with(')') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+        Some(trimmed)
+    }
+
+    pub fn is_mesh_person_verified(&self, person: &str) -> bool {
+        let person = person.trim().trim_start_matches('@');
+        if person.is_empty() || Self::parse_geohash_dm_key(person).is_some() {
+            return false;
+        }
+        self.verified_identities.iter().any(|entry| {
+            Self::verified_label_from_entry(entry)
+                .map(|label| label.eq_ignore_ascii_case(person))
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn is_person_aliased_in_current_context(&self, person: &str) -> bool {
+        if !self.current_people_are_geohash() {
+            return false;
+        }
+        let channel = self.get_selected_channel_name();
+        let Some(pubkey) = self.resolve_geohash_target_pubkey(&channel, person) else {
+            return false;
+        };
+        self.nostr_aliases.contains_key(&pubkey)
+    }
+
+    pub fn is_nostr_pubkey_aliased(&self, pubkey: &str) -> bool {
+        self.nostr_aliases.contains_key(pubkey)
+    }
+
+    pub fn is_mesh_dm_target_verified(&self, target: &str) -> bool {
+        self.is_mesh_person_verified(target)
     }
 
     pub fn short_pubkey(pubkey: &str) -> String {
@@ -2071,6 +2120,17 @@ impl App {
         self.blocked = blocked_nicknames;
     }
 
+    pub fn update_verified_identities(&mut self, entries: Vec<String>) {
+        let mut next = entries
+            .into_iter()
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect::<Vec<_>>();
+        next.sort();
+        next.dedup();
+        self.verified_identities = next;
+    }
+
     pub fn update_sidebar_flat_selection(&mut self) {
         let mut flat_idx = 0;
         for section in 0..5 {
@@ -2081,7 +2141,7 @@ impl App {
                     1 => self.channels.len(),
                     2 => self.visible_people_count(),
                     3 => self.blocked.len(),
-                    4 => 2,
+                    4 => 3 + self.verified_identities.len(),
                     _ => 0,
                 };
                 let is_current_section = match section {
