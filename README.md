@@ -105,6 +105,22 @@ If the Bluetooth mesh connection stalls or drops, press `r` on the error screen 
 - This is a TUI-only extension. iOS mesh clients still use their native image and voice-note transfers.
 - `/pass` has been removed from this fork.
 
+### Image Preview
+
+- Click an image message (local `[image] <path>` content) to open an in-TUI preview overlay.
+- Press `Esc` or click inside the preview area to close it.
+- Set `BITCHAT_IMAGE_PROTOCOL` to force preview protocol:
+  - `auto` (default)
+  - `kitty`
+  - `sixel`
+  - `iterm2`
+  - `halfblocks`
+- On Windows Terminal, `sixel` is usually the best choice:
+  - PowerShell: `$env:BITCHAT_IMAGE_PROTOCOL="sixel"`
+- Optional remote-image fetch tuning:
+  - `BITCHAT_REMOTE_IMAGE_TIMEOUT_SECS` (default `12`)
+  - `BITCHAT_REMOTE_IMAGE_MAX_BYTES` (default `20971520`, 20 MiB)
+
 ## Proxy Support
 
 Nostr geohash channels can go through a proxy. This is useful when direct relay access is blocked or when you want to route relay traffic through a local proxy.
@@ -190,6 +206,7 @@ BITCHAT_DEBUG=1
 - `r` is still useful as a recovery action when the Bluetooth scan needs to be restarted.
 - Proxy settings apply to Nostr relay traffic, not Bluetooth mesh traffic.
 - `/upload` also uses proxy env vars (`BITCHAT_TUI_NOSTR_PROXY`, `HTTP(S)_PROXY`, `ALL_PROXY`) when set.
+- Remote image URL localization also uses proxy env vars (`BITCHAT_TUI_NOSTR_PROXY`, `HTTP(S)_PROXY`, `ALL_PROXY`) when set.
 - `/reply` is a Bluetooth mesh command. `/block` and `/unblock` are Nostr geohash commands for local message filtering by user name.
 - Upload now defaults to Blossom on `blossom.nostr.build` (Nostr-signed auth).
 - To force provider selection, use `BITCHAT_UPLOAD_PROVIDER`:
