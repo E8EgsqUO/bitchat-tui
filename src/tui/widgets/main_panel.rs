@@ -25,6 +25,13 @@ enum MessageRole {
     Other,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SenderVisualTier {
+    Default,
+    Aliased,
+    Verified,
+}
+
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -51,7 +58,12 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 
     // --- Header Rendering ---
     let header_text = if let Some(ref user) = dm_target {
-        format!("Direct Message with {}", app.display_dm_target(user))
+        let display = app.display_dm_target(user);
+        if app.is_mesh_dm_target_verified(user) {
+            format!("Direct Message with {} [verified]", display)
+        } else {
+            format!("Direct Message with {}", display)
+        }
     } else if let Some(ref channel) = channel_name {
         if channel == "#public" {
             "Public Chat".to_string()
@@ -206,6 +218,21 @@ fn render_message_lines(
 
         let role = message_role(msg);
         let sender_display = resolved_sender(app, msg, geohash_channel.as_deref());
+        let sender_tier = if !is_dm && role == MessageRole::Other {
+            if msg.sender_pubkey.is_none() && app.is_mesh_person_verified(&sender_display) {
+                SenderVisualTier::Verified
+            } else if let Some(pubkey) = msg.sender_pubkey.as_deref() {
+                if app.is_nostr_pubkey_aliased(pubkey) {
+                    SenderVisualTier::Aliased
+                } else {
+                    SenderVisualTier::Default
+                }
+            } else {
+                SenderVisualTier::Default
+            }
+        } else {
+            SenderVisualTier::Default
+        };
         let show_sender_label = !is_dm && role == MessageRole::Other && group_starts_here;
         let content_indent = if role == MessageRole::Other {
             if is_dm {
@@ -228,6 +255,7 @@ fn render_message_lines(
                 available_width,
                 0,
                 true,
+                sender_tier,
                 app.should_highlight_copy_target(&sender_target),
             ));
             line_copy_targets.push(Some(sender_target));
@@ -244,6 +272,7 @@ fn render_message_lines(
                     available_width,
                     content_indent,
                     false,
+                    SenderVisualTier::Default,
                     app.should_highlight_copy_target(&MessageLineCopyTarget::Message(idx)),
                 ));
                 line_copy_targets.push(Some(MessageLineCopyTarget::Message(idx)));
@@ -330,6 +359,7 @@ fn render_aligned_message_line(
     available_width: usize,
     content_indent: usize,
     is_sender_label: bool,
+    sender_tier: SenderVisualTier,
     highlight: bool,
 ) -> ListItem<'static> {
     let base_style = match role {
@@ -337,7 +367,11 @@ fn render_aligned_message_line(
         MessageRole::SelfUser => Style::default().fg(Color::LightGreen),
         MessageRole::Other => {
             if is_sender_label {
-                Style::default().fg(Color::Cyan)
+                match sender_tier {
+                    SenderVisualTier::Verified => Style::default().fg(Color::Magenta),
+                    SenderVisualTier::Aliased => Style::default().fg(Color::Cyan),
+                    SenderVisualTier::Default => Style::default().fg(Color::Green),
+                }
             } else {
                 Style::default().fg(Color::White)
             }
