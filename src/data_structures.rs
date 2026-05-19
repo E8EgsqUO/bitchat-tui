@@ -22,7 +22,7 @@ pub fn file_logging_enabled() -> bool {
             value.to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no"
         ),
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 

@@ -2,8 +2,13 @@
 
 use chrono::{Local, TimeZone};
 use regex::Regex;
+use ratatui_image::{
+    picker::{Picker, ProtocolType},
+    protocol::StatefulProtocol,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
 use tui_input::Input;
@@ -191,11 +196,24 @@ pub struct App {
     pub message_line_copy_targets: Vec<Option<MessageLineCopyTarget>>,
     pub last_message_click: Option<MessageClickState>,
     pub copy_highlight: Option<CopyHighlightState>,
+    pub image_preview: Option<ImagePreviewState>,
+    pub image_preview_area_rect: Option<(u16, u16, u16, u16)>,
+    pub image_picker: Picker,
     pub paste_keyburst_active: bool,
     pub last_input_char_event_at: Option<Instant>,
     pub input_char_burst_count: u16,
     pub transient_message_expirations: HashMap<String, Instant>,
     pub transient_message_seq: u64,
+}
+
+pub enum ImagePreviewRenderState {
+    Ready(Box<dyn StatefulProtocol>),
+    Failed(String),
+}
+
+pub struct ImagePreviewState {
+    pub source_path: PathBuf,
+    pub render_state: ImagePreviewRenderState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,6 +294,9 @@ impl App {
             message_line_copy_targets: Vec::new(),
             last_message_click: None,
             copy_highlight: None,
+            image_preview: None,
+            image_preview_area_rect: None,
+            image_picker: build_image_picker(),
             paste_keyburst_active: false,
             last_input_char_event_at: None,
             input_char_burst_count: 0,
@@ -285,6 +306,59 @@ impl App {
 
         app.update_current_conversation();
         app
+    }
+
+    pub fn image_preview_is_open(&self) -> bool {
+        self.image_preview.is_some()
+    }
+
+    pub fn close_image_preview(&mut self) {
+        self.image_preview = None;
+        self.image_preview_area_rect = None;
+    }
+
+    pub fn set_image_preview_area(&mut self, area: Option<(u16, u16, u16, u16)>) {
+        self.image_preview_area_rect = area;
+    }
+
+    pub fn image_preview_contains_position(&self, row: u16, column: u16) -> bool {
+        let Some((x, y, width, height)) = self.image_preview_area_rect else {
+            return false;
+        };
+        if width == 0 || height == 0 {
+            return false;
+        }
+        column >= x
+            && column < x.saturating_add(width)
+            && row >= y
+            && row < y.saturating_add(height)
+    }
+
+    pub fn open_image_preview_for_message(&mut self, index: usize) -> Result<(), String> {
+        let message_content = {
+            let (messages, _, _) = self.get_current_messages();
+            let Some(message) = messages.get(index) else {
+                return Err("message not found".to_string());
+            };
+            message.content.clone()
+        };
+        let Some(path) = extract_preview_image_path(&message_content) else {
+            return Err("selected message does not contain a local image path".to_string());
+        };
+        if !path.exists() {
+            return Err(format!("image file not found: {}", path.display()));
+        }
+        let img = image::ImageReader::open(&path)
+            .map_err(|e| format!("failed to open {}: {}", path.display(), e))?
+            .decode()
+            .map_err(|e| format!("failed to decode {}: {}", path.display(), e))?;
+        let state = self.image_picker.new_resize_protocol(img);
+        self.image_preview = Some(ImagePreviewState {
+            source_path: path,
+            render_state: ImagePreviewRenderState::Ready(state),
+        });
+        self.image_preview_area_rect = None;
+        Ok(())
     }
 
     pub fn get_selected_channel_name(&self) -> String {
@@ -376,7 +450,7 @@ impl App {
     }
 
     fn is_pubkey_placeholder(name: &str) -> bool {
-        crate::nostr_geo::looks_like_dm_pubkey(name) || name.starts_with("npub")
+        crate::nostr_geo::is_pubkey_placeholder_name(name)
     }
 
     pub fn geohash_person_name_by_pubkey(&self, channel: &str, pubkey: &str) -> Option<String> {
@@ -718,6 +792,21 @@ impl App {
         (display, epoch)
     }
 
+    fn split_optional_epoch_and_content(rest: &str) -> (Option<&str>, String) {
+        let Some((maybe_epoch, content)) = rest.split_once(':') else {
+            return (None, rest.to_string());
+        };
+        if maybe_epoch.parse::<i64>().is_ok() {
+            (Some(maybe_epoch), content.to_string())
+        } else {
+            (None, rest.to_string())
+        }
+    }
+
+    fn looks_like_nostr_pubkey_field(value: &str) -> bool {
+        crate::nostr_geo::looks_like_dm_pubkey(value) || value.starts_with("npub")
+    }
+
     pub fn format_timestamp_for_display(
         &self,
         message: &Message,
@@ -757,51 +846,45 @@ impl App {
             return;
         }
 
-        if trimmed.starts_with("__DM__:") {
-            let parts: Vec<&str> = trimmed.splitn(5, ':').collect();
-            if parts.len() >= 4 {
-                let sender = parts[1].to_string();
-                if self.is_sender_blocked(&sender) {
-                    return;
-                }
-                let timestamp_raw = parts[2];
-                let (timestamp, timestamp_epoch) = if parts.len() >= 5 {
-                    Self::parse_display_and_epoch(timestamp_raw, parts.get(3).copied())
-                } else {
-                    Self::parse_display_and_epoch(timestamp_raw, None)
-                };
-                let content = if parts.len() >= 5 {
-                    parts[4].to_string()
-                } else {
-                    parts[3].to_string()
-                };
-
-                let sender_clone = sender.clone();
-                let msg = Message {
-                    sender,
-                    sender_pubkey: None,
-                    timestamp,
-                    timestamp_epoch,
-                    content,
-                    is_self: false,
-                    status: MessageStatus::None,
-                    local_id: None,
-                };
-
-                self.dm_messages
-                    .entry(sender_clone.clone())
-                    .or_default()
-                    .push(msg);
-
-                let dm_key = format!("dm:{}", sender_clone);
-                let (_, current_dm_target, _) = self.get_current_messages();
-                if current_dm_target.as_ref() != Some(&sender_clone) {
-                    self.add_unread_message(dm_key);
-                }
-
-                self.follow_or_mark_new_message();
+        if let Some(payload) = trimmed.strip_prefix("__DM__:") {
+            let Some((sender_raw, rest)) = payload.split_once(':') else {
+                return;
+            };
+            let Some((timestamp_raw, rest)) = rest.split_once(':') else {
+                return;
+            };
+            let sender = sender_raw.to_string();
+            if self.is_sender_blocked(&sender) {
                 return;
             }
+            let (epoch_raw, content) = Self::split_optional_epoch_and_content(rest);
+            let (timestamp, timestamp_epoch) = Self::parse_display_and_epoch(timestamp_raw, epoch_raw);
+
+            let sender_clone = sender.clone();
+            let msg = Message {
+                sender,
+                sender_pubkey: None,
+                timestamp,
+                timestamp_epoch,
+                content,
+                is_self: false,
+                status: MessageStatus::None,
+                local_id: None,
+            };
+
+            self.dm_messages
+                .entry(sender_clone.clone())
+                .or_default()
+                .push(msg);
+
+            let dm_key = format!("dm:{}", sender_clone);
+            let (_, current_dm_target, _) = self.get_current_messages();
+            if current_dm_target.as_ref() != Some(&sender_clone) {
+                self.add_unread_message(dm_key);
+            }
+
+            self.follow_or_mark_new_message();
+            return;
         }
 
         if trimmed.starts_with("__DM_STATUS__:") {
@@ -1026,82 +1109,86 @@ impl App {
             }
         }
 
-        if trimmed.starts_with("__CHANNEL__:") {
-            let parts: Vec<&str> = trimmed.splitn(7, ':').collect();
-            if parts.len() >= 5 {
-                let channel = parts[1].to_string();
-                let sender = parts[2].to_string();
-                if self.is_sender_blocked(&sender) {
-                    return;
-                }
-                let has_pubkey = parts.len() >= 6 && crate::nostr_geo::is_geohash_channel(&channel);
-                let sender_pubkey = has_pubkey.then(|| parts[3].to_string());
-                let timestamp_raw = if has_pubkey { parts[4] } else { parts[3] };
-                let (timestamp, timestamp_epoch, content) = if has_pubkey {
-                    if parts.len() >= 7 {
-                        let (ts, epoch) =
-                            Self::parse_display_and_epoch(timestamp_raw, parts.get(5).copied());
-                        (ts, epoch, parts[6].to_string())
-                    } else {
-                        let (ts, epoch) = Self::parse_display_and_epoch(timestamp_raw, None);
-                        (ts, epoch, parts[5].to_string())
-                    }
-                } else {
-                    if parts.len() >= 6 {
-                        let (ts, epoch) =
-                            Self::parse_display_and_epoch(timestamp_raw, parts.get(4).copied());
-                        (ts, epoch, parts[5].to_string())
-                    } else {
-                        let (ts, epoch) = Self::parse_display_and_epoch(timestamp_raw, None);
-                        (ts, epoch, parts[4].to_string())
-                    }
-                };
-                if crate::nostr_geo::is_geohash_channel(&channel) {
-                    if !self.channels.contains(&channel) {
-                        self.channels.push(channel.clone());
-                    }
-                    self.add_geohash_person(&channel, &sender, sender_pubkey.as_deref());
-                    if sender != self.nickname && self.message_mentions_self(&content) {
-                        let sender_key =
-                            sender_pubkey.clone().unwrap_or_else(|| sender.clone());
-                        self.geohash_last_mention_sender
-                            .insert(channel.clone(), sender_key);
-                    }
-                }
-
-                let msg = Message {
-                    sender,
-                    sender_pubkey,
-                    timestamp,
-                    timestamp_epoch,
-                    content,
-                    is_self: false,
-                    status: MessageStatus::None,
-                    local_id: None,
-                };
-
-                self.channel_messages
-                    .entry(channel.clone())
-                    .or_default()
-                    .push(msg);
-
-                let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
-                let in_dm = dm_target.is_some();
-                if channel == "#public" {
-                    // If not currently viewing public (i.e., in DM or in another channel), add unread
-                    if !self.sidebar_state.public_selected.unwrap_or(false) {
-                        self.add_unread_message("#public".to_string());
-                    }
-                } else {
-                    // For other channels, only add unread if not currently viewing that channel
-                    if channel_name.as_deref() != Some(&channel) || in_dm {
-                        self.add_unread_message(channel);
-                    }
-                }
-
-                self.follow_or_mark_new_message();
+        if let Some(payload) = trimmed.strip_prefix("__CHANNEL__:") {
+            let Some((channel_raw, rest)) = payload.split_once(':') else {
+                return;
+            };
+            let Some((sender_raw, rest)) = rest.split_once(':') else {
+                return;
+            };
+            let channel = channel_raw.to_string();
+            let sender = sender_raw.to_string();
+            if self.is_sender_blocked(&sender) {
                 return;
             }
+            let is_geohash = crate::nostr_geo::is_geohash_channel(&channel);
+
+            let (sender_pubkey, timestamp_raw, remainder) = if is_geohash {
+                let Some((third, after_third)) = rest.split_once(':') else {
+                    return;
+                };
+                if Self::looks_like_nostr_pubkey_field(third) {
+                    let Some((timestamp_raw, remainder)) = after_third.split_once(':') else {
+                        return;
+                    };
+                    (Some(third.to_string()), timestamp_raw, remainder)
+                } else {
+                    (None, third, after_third)
+                }
+            } else {
+                let Some((timestamp_raw, remainder)) = rest.split_once(':') else {
+                    return;
+                };
+                (None, timestamp_raw, remainder)
+            };
+
+            let (epoch_raw, content) = Self::split_optional_epoch_and_content(remainder);
+            let (timestamp, timestamp_epoch) = Self::parse_display_and_epoch(timestamp_raw, epoch_raw);
+
+            if is_geohash {
+                if !self.channels.contains(&channel) {
+                    self.channels.push(channel.clone());
+                }
+                self.add_geohash_person(&channel, &sender, sender_pubkey.as_deref());
+                if sender != self.nickname && self.message_mentions_self(&content) {
+                    let sender_key = sender_pubkey.clone().unwrap_or_else(|| sender.clone());
+                    self.geohash_last_mention_sender
+                        .insert(channel.clone(), sender_key);
+                }
+            }
+
+            let msg = Message {
+                sender,
+                sender_pubkey,
+                timestamp,
+                timestamp_epoch,
+                content,
+                is_self: false,
+                status: MessageStatus::None,
+                local_id: None,
+            };
+
+            self.channel_messages
+                .entry(channel.clone())
+                .or_default()
+                .push(msg);
+
+            let (dm_target, channel_name) = self.current_conv.clone().unwrap_or((None, None));
+            let in_dm = dm_target.is_some();
+            if channel == "#public" {
+                // If not currently viewing public (i.e., in DM or in another channel), add unread
+                if !self.sidebar_state.public_selected.unwrap_or(false) {
+                    self.add_unread_message("#public".to_string());
+                }
+            } else {
+                // For other channels, only add unread if not currently viewing that channel
+                if channel_name.as_deref() != Some(&channel) || in_dm {
+                    self.add_unread_message(channel);
+                }
+            }
+
+            self.follow_or_mark_new_message();
+            return;
         }
 
         if let Some(payload) = trimmed.strip_prefix("__PEER_CONNECTED__:") {
@@ -1766,12 +1853,35 @@ impl App {
                 .map(|(dm_channel, _)| dm_channel != channel)
                 .unwrap_or(true)
         });
+        // Drop unread/read-state entries tied to this geohash channel and its DMs.
+        self.unread_counts.retain(|key, _| {
+            if key == channel {
+                return false;
+            }
+            if let Some(dm_key) = key.strip_prefix("dm:") {
+                return Self::parse_geohash_dm_key(dm_key)
+                    .map(|(dm_channel, _)| dm_channel != channel)
+                    .unwrap_or(true);
+            }
+            true
+        });
+        self.last_read_messages.retain(|key, _| {
+            if key == channel {
+                return false;
+            }
+            if let Some(dm_key) = key.strip_prefix("dm:") {
+                return Self::parse_geohash_dm_key(dm_key)
+                    .map(|(dm_channel, _)| dm_channel != channel)
+                    .unwrap_or(true);
+            }
+            true
+        });
         self.switch_to_public();
     }
 
     pub fn mark_current_conversation_as_read(&mut self) {
         let (messages, dm_target, channel_name) = self.get_current_messages();
-        let conversation_key = if let Some(target) = dm_target {
+        let conversation_key = if let Some(target) = dm_target.as_ref() {
             format!("dm:{}", target)
         } else if let Some(channel) = channel_name {
             channel
@@ -1782,6 +1892,60 @@ impl App {
         self.last_read_messages
             .insert(conversation_key.clone(), message_count);
         self.unread_counts.remove(&conversation_key);
+
+        // Geohash DM targets can appear under alias/name/pubkey forms.
+        // Clear unread counters for keys that resolve to the same DM thread.
+        if let Some(current_dm_target) = dm_target.as_deref() {
+            let keys_to_remove: Vec<String> = self
+                .unread_counts
+                .keys()
+                .filter_map(|key| {
+                    let Some(other_dm_target) = key.strip_prefix("dm:") else {
+                        return None;
+                    };
+                    if self.dm_targets_equivalent(current_dm_target, other_dm_target) {
+                        Some(key.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for key in keys_to_remove {
+                self.unread_counts.remove(&key);
+            }
+        }
+    }
+
+    fn normalize_mesh_dm_target(value: &str) -> String {
+        value
+            .trim()
+            .trim_start_matches('@')
+            .to_ascii_lowercase()
+    }
+
+    fn canonical_geohash_dm_target(&self, channel: &str, target: &str) -> String {
+        self.resolve_geohash_target_pubkey(channel, target)
+            .unwrap_or_else(|| target.trim().to_ascii_lowercase())
+    }
+
+    fn dm_targets_equivalent(&self, left: &str, right: &str) -> bool {
+        if left == right {
+            return true;
+        }
+
+        match (Self::parse_geohash_dm_key(left), Self::parse_geohash_dm_key(right)) {
+            (Some((left_channel, left_target)), Some((right_channel, right_target))) => {
+                if left_channel != right_channel {
+                    return false;
+                }
+                self.canonical_geohash_dm_target(&left_channel, &left_target)
+                    == self.canonical_geohash_dm_target(&right_channel, &right_target)
+            }
+            (None, None) => {
+                Self::normalize_mesh_dm_target(left) == Self::normalize_mesh_dm_target(right)
+            }
+            _ => false,
+        }
     }
 
     pub fn add_unread_message(&mut self, conversation_key: String) {
@@ -1975,6 +2139,79 @@ impl App {
     }
 }
 
+fn build_image_picker() -> Picker {
+    let mut picker = Picker::new((8, 16));
+    let guessed = picker.guess_protocol();
+    picker.protocol_type = select_image_protocol_override(guessed);
+    picker
+}
+
+fn select_image_protocol_override(default: ProtocolType) -> ProtocolType {
+    if let Ok(raw) = std::env::var("BITCHAT_IMAGE_PROTOCOL") {
+        let value = raw.trim().to_ascii_lowercase();
+        let forced = match value.as_str() {
+            "kitty" => Some(ProtocolType::Kitty),
+            "sixel" => Some(ProtocolType::Sixel),
+            "iterm2" | "iterm" => Some(ProtocolType::Iterm2),
+            "halfblocks" | "halfblock" => Some(ProtocolType::Halfblocks),
+            "auto" | "" => None,
+            _ => None,
+        };
+        if let Some(protocol) = forced {
+            return protocol;
+        }
+    }
+
+    // WezTerm supports Kitty graphics; prefer it over iTerm2 protocol for better
+    // image quality and positioning behavior in our TUI preview.
+    if let Ok(term_program) = std::env::var("TERM_PROGRAM") {
+        if term_program.trim().eq_ignore_ascii_case("wezterm") {
+            return ProtocolType::Kitty;
+        }
+    }
+
+    // If TERM already looks like kitty, force Kitty protocol.
+    if let Ok(term) = std::env::var("TERM") {
+        if term.to_ascii_lowercase().contains("kitty") {
+            return ProtocolType::Kitty;
+        }
+    }
+
+    default
+}
+
+fn extract_preview_image_path(content: &str) -> Option<PathBuf> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(path) = trimmed.strip_prefix("[image] ") {
+        let candidate = PathBuf::from(path.trim());
+        if looks_like_supported_image_path(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    let candidate = PathBuf::from(trimmed);
+    if looks_like_supported_image_path(&candidate) {
+        return Some(candidate);
+    }
+
+    None
+}
+
+fn looks_like_supported_image_path(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2137,6 +2374,32 @@ mod tests {
     }
 
     #[test]
+    fn geohash_profile_metadata_replaces_anon_placeholder_from_dm() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let pubkey = "b4600ed4d0f359a1b7e6c64fa62c1f0db7b5c52780cf3fe79931f8a6f13bb661";
+        let key = App::geohash_dm_pubkey_key("#ws", pubkey);
+        let expected_suffix = App::stable_suffix_from_id(pubkey);
+
+        app.join_channel("#ws".to_string());
+        app.add_log_message(format!(
+            "__GEO_DM__:#ws:anon7301:{}:1201:msg-1:hello",
+            pubkey
+        ));
+
+        assert_eq!(
+            app.display_dm_target(&key),
+            format!("anon#{} in #ws", expected_suffix)
+        );
+
+        app.add_log_message(format!("__GEO_PERSON__:#ws:g8.bot:{}", pubkey));
+
+        assert_eq!(
+            app.display_dm_target(&key),
+            format!("g8.bot#{} in #ws", expected_suffix)
+        );
+    }
+
+    #[test]
     fn pending_geohash_dm_status_updates_in_current_thread() {
         let mut app = App::new_with_nickname("me".to_string());
         let pubkey = "4ccaa3888b3b303d28bd9ae6aa2278530232b404abccffa83d9aa815ed2ca4e2";
@@ -2250,6 +2513,30 @@ mod tests {
         app.switch_to_dm("anon7301".to_string());
 
         assert_eq!(app.get_visible_person_unread_count("anon7301"), 0);
+    }
+
+    #[test]
+    fn mesh_channel_message_keeps_windows_drive_path_content() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.add_log_message(
+            "__CHANNEL__:#public:alice:1201:1716000000:[image] X:\\received_files\\images\\incoming\\test.png"
+                .to_string(),
+        );
+
+        let messages = app.channel_messages.get("#public").unwrap();
+        assert_eq!(
+            messages.last().unwrap().content,
+            "[image] X:\\received_files\\images\\incoming\\test.png"
+        );
+    }
+
+    #[test]
+    fn legacy_dm_without_epoch_keeps_colon_content() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.add_log_message("__DM__:anon7301:1201:[image] X:\\a.png".to_string());
+
+        let messages = app.dm_messages.get("anon7301").unwrap();
+        assert_eq!(messages.last().unwrap().content, "[image] X:\\a.png");
     }
 
     #[test]

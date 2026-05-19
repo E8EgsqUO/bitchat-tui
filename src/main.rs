@@ -476,6 +476,321 @@ fn truncate_for_export(value: &str, max_chars: usize) -> String {
     out
 }
 
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn remote_image_fetch_proxy() -> Option<String> {
+    [
+        "BITCHAT_TUI_NOSTR_PROXY",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn build_remote_image_client() -> Option<reqwest::Client> {
+    let timeout_secs = env_u64("BITCHAT_REMOTE_IMAGE_TIMEOUT_SECS", 12);
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_secs));
+    if let Some(proxy_url) = remote_image_fetch_proxy() {
+        match reqwest::Proxy::all(&proxy_url) {
+            Ok(proxy) => {
+                builder = builder.proxy(proxy);
+            }
+            Err(e) => {
+                write_debug_log(&format!(
+                    "remote image fetch proxy is invalid ({}): {}",
+                    proxy_url, e
+                ));
+            }
+        }
+    }
+    builder.build().ok()
+}
+
+fn extract_first_http_url(content: &str) -> Option<String> {
+    for token in content.split_whitespace() {
+        let candidate = token.trim_matches(|ch: char| {
+            matches!(ch, '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';')
+        });
+        if !(candidate.starts_with("http://") || candidate.starts_with("https://")) {
+            continue;
+        }
+        if url::Url::parse(candidate).is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn ext_from_content_type(content_type: &str) -> Option<&'static str> {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/bmp" => Some("bmp"),
+        "image/avif" => Some("avif"),
+        _ => None,
+    }
+}
+
+fn ext_from_url(url: &url::Url) -> Option<String> {
+    let path = url.path();
+    let file_name = path.rsplit('/').next().unwrap_or_default();
+    let ext = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "avif" => Some(ext),
+        _ => None,
+    }
+}
+
+fn sanitized_base_name(url: &url::Url) -> String {
+    let path = url.path();
+    let segment = path.rsplit('/').next().unwrap_or_default();
+    let stem = std::path::Path::new(segment)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    let mut clean = stem
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    clean = clean.trim_matches('_').to_string();
+    if clean.is_empty() {
+        "image".to_string()
+    } else {
+        clean
+    }
+}
+
+async fn download_remote_image_to_incoming(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<std::path::PathBuf, String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {}", e))?;
+    let response = client
+        .get(parsed.clone())
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+
+    let max_bytes = env_u64("BITCHAT_REMOTE_IMAGE_MAX_BYTES", 20 * 1024 * 1024);
+    if let Some(length) = response.content_length() {
+        if length > max_bytes {
+            return Err(format!(
+                "image too large: {} bytes (limit {} bytes)",
+                length, max_bytes
+            ));
+        }
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let is_image = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("image/");
+    if !is_image {
+        return Err(format!("non-image content-type: {}", content_type));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("failed reading body: {}", e))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "image too large after download: {} bytes (limit {} bytes)",
+            bytes.len(),
+            max_bytes
+        ));
+    }
+
+    let ext = ext_from_content_type(&content_type)
+        .map(|value| value.to_string())
+        .or(ext_from_url(&parsed))
+        .unwrap_or_else(|| "img".to_string());
+    let file_name = format!(
+        "{}_{}.{}",
+        sanitized_base_name(&parsed),
+        Uuid::new_v4(),
+        ext
+    );
+
+    let destination = std::env::current_dir()
+        .map_err(|e| format!("cannot resolve current dir: {}", e))?
+        .join("received_files")
+        .join("images")
+        .join("incoming")
+        .join(file_name);
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("failed to create directory: {}", e))?;
+    }
+    tokio::fs::write(&destination, &bytes)
+        .await
+        .map_err(|e| format!("failed to write image: {}", e))?;
+    Ok(destination)
+}
+
+fn split_optional_epoch_and_content(raw: &str) -> (Option<String>, String) {
+    let Some((maybe_epoch, content)) = raw.split_once(':') else {
+        return (None, raw.to_string());
+    };
+    if maybe_epoch.parse::<i64>().is_ok() {
+        (Some(maybe_epoch.to_string()), content.to_string())
+    } else {
+        (None, raw.to_string())
+    }
+}
+
+async fn localize_image_content_if_url(
+    content: &str,
+    client: &reqwest::Client,
+) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.starts_with("[image] ") {
+        return None;
+    }
+    let url = extract_first_http_url(trimmed)?;
+    let local_path = match download_remote_image_to_incoming(client, &url).await {
+        Ok(path) => path,
+        Err(e) => {
+            write_debug_log(&format!("remote image auto-fetch skipped for {}: {}", url, e));
+            return None;
+        }
+    };
+    Some(format!("[image] {}", local_path.display()))
+}
+
+async fn maybe_localize_structured_remote_image_message(
+    raw: &str,
+    local_nickname: &str,
+    client: Option<&reqwest::Client>,
+) -> Option<String> {
+    let client = client?;
+
+    if let Some(payload) = raw.strip_prefix("__CHANNEL__:") {
+        let (channel, rest) = payload.split_once(':')?;
+        let (sender, rest) = rest.split_once(':')?;
+        if sender == local_nickname {
+            return None;
+        }
+        let is_geohash = nostr_geo::is_geohash_channel(channel);
+        if is_geohash {
+            let (third, rest) = rest.split_once(':')?;
+            if nostr_geo::looks_like_dm_pubkey(third) || third.starts_with("npub") {
+                let (timestamp, rest) = rest.split_once(':')?;
+                let (epoch, content) = split_optional_epoch_and_content(rest);
+                let localized = localize_image_content_if_url(&content, client).await?;
+                return Some(if let Some(epoch) = epoch {
+                    format!(
+                        "__CHANNEL__:{}:{}:{}:{}:{}:{}",
+                        channel, sender, third, timestamp, epoch, localized
+                    )
+                } else {
+                    format!(
+                        "__CHANNEL__:{}:{}:{}:{}:{}",
+                        channel, sender, third, timestamp, localized
+                    )
+                });
+            }
+
+            let timestamp = third;
+            let (epoch, content) = split_optional_epoch_and_content(rest);
+            let localized = localize_image_content_if_url(&content, client).await?;
+            return Some(if let Some(epoch) = epoch {
+                format!(
+                    "__CHANNEL__:{}:{}:{}:{}:{}",
+                    channel, sender, timestamp, epoch, localized
+                )
+            } else {
+                format!("__CHANNEL__:{}:{}:{}:{}", channel, sender, timestamp, localized)
+            });
+        }
+
+        let (timestamp, rest) = rest.split_once(':')?;
+        let (epoch, content) = split_optional_epoch_and_content(rest);
+        let localized = localize_image_content_if_url(&content, client).await?;
+        return Some(if let Some(epoch) = epoch {
+            format!(
+                "__CHANNEL__:{}:{}:{}:{}:{}",
+                channel, sender, timestamp, epoch, localized
+            )
+        } else {
+            format!("__CHANNEL__:{}:{}:{}:{}", channel, sender, timestamp, localized)
+        });
+    }
+
+    if let Some(payload) = raw.strip_prefix("__GEO_DM__:") {
+        let (channel, rest) = payload.split_once(':')?;
+        let (sender, rest) = rest.split_once(':')?;
+        if sender == local_nickname {
+            return None;
+        }
+        let (sender_pubkey, rest) = rest.split_once(':')?;
+        let (timestamp, rest) = rest.split_once(':')?;
+        let (epoch_or_id, rest) = rest.split_once(':')?;
+        if epoch_or_id.parse::<i64>().is_ok() {
+            let (message_id, content) = rest.split_once(':')?;
+            let localized = localize_image_content_if_url(content, client).await?;
+            return Some(format!(
+                "__GEO_DM__:{}:{}:{}:{}:{}:{}:{}",
+                channel, sender, sender_pubkey, timestamp, epoch_or_id, message_id, localized
+            ));
+        }
+        let message_id = epoch_or_id;
+        let content = rest;
+        let localized = localize_image_content_if_url(content, client).await?;
+        return Some(format!(
+            "__GEO_DM__:{}:{}:{}:{}:{}:{}",
+            channel, sender, sender_pubkey, timestamp, message_id, localized
+        ));
+    }
+
+    None
+}
+
 fn find_latest_geohash_with_messages(app: &App) -> Option<String> {
     app.channels
         .iter()
@@ -871,6 +1186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let mut active_saved_geohash_join: Option<tokio::task::JoinHandle<()>> = None;
+    let remote_image_client = build_remote_image_client();
 
     let mut last_tick = std::time::Instant::now();
     let tick_rate = StdDuration::from_millis(100);
@@ -924,7 +1240,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else if matches!(app.phase, tui::app::TuiPhase::Connecting) {
                 app.add_popup_message(msg);
             } else {
-                app.add_log_message(msg);
+                let rewritten = maybe_localize_structured_remote_image_message(
+                    &msg,
+                    &nickname,
+                    remote_image_client.as_ref(),
+                )
+                .await;
+                app.add_log_message(rewritten.unwrap_or(msg));
             }
         }
 

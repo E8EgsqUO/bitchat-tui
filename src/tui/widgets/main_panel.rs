@@ -13,9 +13,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::tui::app::{App, FocusArea, Message, MessageLineCopyTarget, MessageStatus};
 
 const TIME_DIVIDER_GAP_MINUTES: i32 = 15;
-const OTHER_MESSAGE_INDENT: usize = 2;
-const DM_OTHER_INDENT: usize = 0;
-const SELF_MESSAGE_RIGHT_PADDING: usize = 0;
+const OTHER_MESSAGE_INDENT: usize = 3;
+const DM_OTHER_INDENT: usize = 3;
+const SELF_MESSAGE_RIGHT_PADDING: usize = 3;
 const BUBBLE_MAX_WIDTH_PERCENT: usize = 90;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -397,10 +397,36 @@ fn render_bubble_border_line(
         MessageRole::Other => content_indent,
     };
     let style = bubble_border_style();
-    ListItem::new(Line::from(vec![
-        Span::raw(" ".repeat(leading)),
-        Span::styled(line, style),
-    ]))
+    if is_top || role == MessageRole::System {
+        return ListItem::new(Line::from(vec![
+            Span::raw(" ".repeat(leading)),
+            Span::styled(line, style),
+        ]));
+    }
+
+    match role {
+        MessageRole::Other => {
+            // Keep 3-column left gutter; use the second column for the tail.
+            let tail_leading = leading.saturating_sub(2);
+            let gap = leading.saturating_sub(tail_leading).saturating_sub(1);
+            ListItem::new(Line::from(vec![
+                Span::raw(" ".repeat(tail_leading)),
+                Span::styled("◣", style),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(line, style),
+            ]))
+        }
+        MessageRole::SelfUser => {
+            // Keep 3-column right gutter; use the second column for the tail.
+            ListItem::new(Line::from(vec![
+                Span::raw(" ".repeat(leading)),
+                Span::styled(line, style),
+                Span::raw(" ".repeat(1)),
+                Span::styled("◢", style),
+            ]))
+        }
+        MessageRole::System => unreachable!(),
+    }
 }
 
 fn render_bubble_content_line(

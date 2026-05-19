@@ -107,6 +107,10 @@ const EMBEDDED_GEO_RELAYS: &[(&str, f64, f64)] = &[
     ("relay-arg.zombi.cloudrodion.com", -34.6037, -58.3816),
 ];
 
+const DEFAULT_SUBSCRIBE_RELAY_LIMIT_LEN2: usize = 10;
+const DEFAULT_SUBSCRIBE_RELAY_LIMIT_LEN4: usize = 7;
+const DEFAULT_SUBSCRIBE_RELAY_LIMIT_FINE: usize = 5;
+
 #[derive(Clone)]
 pub struct NostrGeoClient {
     inner: Arc<NostrGeoInner>,
@@ -212,12 +216,14 @@ impl NostrGeoClient {
 
         let relays = resolve_relays(&geohash).await;
         let dm_relays = dm_relays();
-        let subscribe_relays = merge_relays(&relays, &dm_relays);
+        let subscribe_relays =
+            build_subscribe_relays(&geohash, relays.clone(), dm_relays.clone());
         write_nostr_debug_log(&format!(
-            "joined geohash #{} public_relays={} dm_relays={}",
+            "joined geohash #{} public_relays={} dm_relays={} subscribe_relays={}",
             geohash,
             relays.join(","),
-            dm_relays.join(",")
+            dm_relays.join(","),
+            subscribe_relays.join(",")
         ));
         self.inner
             .relays_by_geohash
@@ -792,8 +798,21 @@ async fn known_person_name(inner: &Arc<NostrGeoInner>, pubkey: &str) -> Option<S
     inner.people_by_pubkey.lock().await.get(pubkey).cloned()
 }
 
-fn is_pubkey_placeholder_name(name: &str) -> bool {
-    name.starts_with("npub") || looks_like_dm_pubkey(name)
+fn is_generated_anon_placeholder_name(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    if let Some(suffix) = normalized.strip_prefix("anon#") {
+        return suffix.len() == 4 && suffix.chars().all(|ch| ch.is_ascii_hexdigit());
+    }
+    if let Some(suffix) = normalized.strip_prefix("anon") {
+        return !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit());
+    }
+    false
+}
+
+pub fn is_pubkey_placeholder_name(name: &str) -> bool {
+    name.starts_with("npub")
+        || looks_like_dm_pubkey(name)
+        || is_generated_anon_placeholder_name(name)
 }
 
 async fn update_known_person(inner: &Arc<NostrGeoInner>, channel: &str, pubkey: &str, name: &str) {
@@ -987,9 +1006,16 @@ async fn handle_private_text_event(
     content: String,
 ) {
     let sender = if let Some(nickname) = sender_nickname {
-        update_known_person(inner, channel, &sender_pubkey, &nickname).await;
-        nickname
+        let sanitized = sanitize_display_field(&nickname);
+        update_known_person(inner, channel, &sender_pubkey, &sanitized).await;
+        if is_pubkey_placeholder_name(&sanitized) {
+            schedule_metadata_lookup(inner.clone(), channel.to_string(), sender_pubkey.clone()).await;
+        }
+        sanitized
     } else if let Some(name) = known_person_name(inner, &sender_pubkey).await {
+        if is_pubkey_placeholder_name(&name) {
+            schedule_metadata_lookup(inner.clone(), channel.to_string(), sender_pubkey.clone()).await;
+        }
         name
     } else {
         let fallback = format!("npub{}", sender_pubkey.chars().take(8).collect::<String>());
@@ -1599,6 +1625,8 @@ fn decrypt_private_message(
     let rumor_json = nip44_decrypt(&seal.content, &seal.pubkey, local_secret)?;
     let rumor: Nip17Event = serde_json::from_str(&rumor_json).map_err(|e| e.to_string())?;
     let sender_nickname = event_tag_value(&rumor, "bitchat-nick")
+        .or_else(|| event_tag_value(&rumor, "n"))
+        .or_else(|| event_tag_value(&rumor, "name"))
         .map(|value| sanitize_display_field(&value))
         .filter(|value| !value.starts_with("npub"));
     Ok((
@@ -2213,11 +2241,51 @@ async fn resolve_relays(geohash: &str) -> Vec<String> {
 }
 
 fn relay_count_for_geohash(geohash: &str) -> usize {
+    if let Some(override_count) = env_override_usize("BITCHAT_TUI_NOSTR_RELAY_COUNT") {
+        return override_count.max(1);
+    }
     match geohash.len() {
         2 => 15,
         4 => 10,
         _ => 5,
     }
+}
+
+fn subscribe_relay_limit_for_geohash(geohash: &str) -> usize {
+    if let Some(override_count) = env_override_usize("BITCHAT_TUI_NOSTR_SUBSCRIBE_RELAY_LIMIT") {
+        return override_count.max(1);
+    }
+    match geohash.len() {
+        2 => DEFAULT_SUBSCRIBE_RELAY_LIMIT_LEN2,
+        4 => DEFAULT_SUBSCRIBE_RELAY_LIMIT_LEN4,
+        _ => DEFAULT_SUBSCRIBE_RELAY_LIMIT_FINE,
+    }
+}
+
+fn limited_subscribe_relays(geohash: &str, relays: Vec<String>) -> Vec<String> {
+    let limit = subscribe_relay_limit_for_geohash(geohash);
+    if relays.len() <= limit {
+        relays
+    } else {
+        relays.into_iter().take(limit).collect()
+    }
+}
+
+fn build_subscribe_relays(
+    geohash: &str,
+    public_relays: Vec<String>,
+    dm_relays: Vec<String>,
+) -> Vec<String> {
+    let limited_public = limited_subscribe_relays(geohash, public_relays);
+    // Keep iOS-compatible DM relays always subscribed; only public relay fan-out is limited.
+    merge_relays(&limited_public, &dm_relays)
+}
+
+fn env_override_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 async fn fetch_geo_relays() -> Result<Vec<RelayEntry>, String> {

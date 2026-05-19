@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::InputRequest;
 
-use crate::tui::app::{App, FocusArea};
+use crate::tui::app::{App, FocusArea, MessageLineCopyTarget};
 use crate::tui::widgets::sidebar::sidebar_visible_items;
 
 const MAX_GLOBAL_HISTORY_SCROLL_STEP: usize = 8;
@@ -35,6 +35,12 @@ pub fn handle_key_event(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Sen
         && key_event.code == KeyCode::Char('r')
     {
         app.trigger_connection_retry();
+        return;
+    }
+    if app.image_preview_is_open() {
+        if key_event.code == KeyCode::Esc {
+            app.close_image_preview();
+        }
         return;
     }
     if app.popup_active {
@@ -192,13 +198,18 @@ fn upload_command_from_freeform_input(value: &str) -> Option<String> {
 }
 
 pub fn handle_mouse_event(app: &mut App, mouse_event: MouseEvent) {
+    if app.image_preview_is_open() {
+        if matches!(mouse_event.kind, MouseEventKind::Up(MouseButton::Left))
+            && app.image_preview_contains_position(mouse_event.row, mouse_event.column)
+        {
+            app.close_image_preview();
+        }
+        return;
+    }
     if app.popup_active {
         return;
     }
-    if !matches!(
-        mouse_event.kind,
-        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
-    ) {
+    if !matches!(mouse_event.kind, MouseEventKind::Up(MouseButton::Left)) {
         return;
     }
 
@@ -208,11 +219,7 @@ pub fn handle_mouse_event(app: &mut App, mouse_event: MouseEvent) {
     };
     let conversation_key = app.current_conversation_key();
     let now = Instant::now();
-    let click_kind = match mouse_event.kind {
-        MouseEventKind::Down(MouseButton::Left) => 0,
-        MouseEventKind::Up(MouseButton::Left) => 1,
-        _ => 2,
-    };
+    let click_kind = 1;
 
     let is_double_click = app
         .last_message_click
@@ -236,6 +243,13 @@ pub fn handle_mouse_event(app: &mut App, mouse_event: MouseEvent) {
             }
         }
         return;
+    }
+
+    if let MessageLineCopyTarget::Message(index) = target.clone() {
+        if app.open_image_preview_for_message(index).is_ok() {
+            app.last_message_click = None;
+            return;
+        }
     }
 
     app.last_message_click = Some(crate::tui::app::MessageClickState {
@@ -847,5 +861,51 @@ mod tests {
         handle_mouse_event(&mut app, mouse_up_left(1, 5));
 
         assert!(app.last_message_click.is_some());
+    }
+
+    #[test]
+    fn single_click_image_message_opens_preview_and_escape_closes() {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join(format!(
+            "bitchat_preview_{}_{}.png",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]));
+        image.save(&path).expect("save png");
+        app.add_sent_message(format!("[image] {}", path.to_string_lossy()));
+        app.messages_area_rect = Some((0, 0, 80, 12));
+        app.message_first_visible_index = 0;
+        app.message_line_copy_targets = vec![Some(MessageLineCopyTarget::Message(0))];
+
+        handle_mouse_event(&mut app, mouse_down_left(1, 5));
+        assert!(app.image_preview_is_open());
+
+        handle_key_event(&mut app, key(KeyCode::Esc), &input_tx);
+        assert!(!app.image_preview_is_open());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn click_in_preview_area_closes_preview() {
+        let mut app = App::new_with_nickname("me".to_string());
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join(format!(
+            "bitchat_preview_{}_{}_2.png",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255]));
+        image.save(&path).expect("save png");
+        app.add_sent_message(format!("[image] {}", path.to_string_lossy()));
+
+        assert!(app.open_image_preview_for_message(0).is_ok());
+        app.set_image_preview_area(Some((10, 5, 30, 10)));
+        handle_mouse_event(&mut app, mouse_down_left(8, 20));
+
+        assert!(!app.image_preview_is_open());
+        let _ = std::fs::remove_file(path);
     }
 }

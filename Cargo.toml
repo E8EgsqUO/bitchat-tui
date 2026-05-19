@@ -15,6 +15,8 @@ path = "src/main.rs"
 [dependencies]
 # Dependencies for all platforms
 ratatui = { version = "0.26.2", features = ["all-widgets"] }
+ratatui-image = "1.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 crossterm = "0.27.0"
 tui-input = "0.8.0"
 futures-util = "0.3.30"
