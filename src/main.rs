@@ -1,7 +1,9 @@
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Manager, Peripheral};
+use ed25519_dalek::{Signature, VerifyingKey};
 
 use futures::stream::StreamExt;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -113,7 +115,8 @@ type AppStateFactory = Box<
 >;
 
 fn build_app_state_factory(
-    favorites: Option<HashSet<String>>,
+    verified_fingerprints_state: Arc<std::sync::Mutex<HashSet<String>>>,
+    verified_labels_state: Arc<std::sync::Mutex<HashMap<String, String>>>,
     identity_key: Option<Vec<u8>>,
     noise_static_key: Option<Vec<u8>>,
 ) -> AppStateFactory {
@@ -132,11 +135,12 @@ fn build_app_state_factory(
                 blocked_peers: blocked.clone(),
                 blocked_names: blocked_names.to_vec(),
                 nostr_aliases: nostr_aliases.clone(),
+                verified_labels: verified_labels_state.lock().unwrap().clone(),
                 channel_creators: creators.clone(),
                 joined_channels: channels.clone(),
                 password_protected_channels: protected.clone(),
                 channel_key_commitments: commitments.clone(),
-                favorites: favorites.clone().unwrap_or_default(),
+                favorites: verified_fingerprints_state.lock().unwrap().clone(),
                 identity_key: identity_key.clone(),
                 noise_static_key: noise_static_key.clone(),
                 encrypted_channel_passwords: encrypted_passwords.clone(),
@@ -192,11 +196,56 @@ fn collect_manual_blocked_names(entries: &[String]) -> Vec<String> {
     manual
 }
 
+fn short_fingerprint(value: &str) -> String {
+    if value.len() <= 10 {
+        value.to_string()
+    } else {
+        value[..10].to_string()
+    }
+}
+
+fn is_hex_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn format_verified_entries(
+    verified_fingerprints: &HashSet<String>,
+    verified_labels: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut fingerprints: Vec<String> = verified_fingerprints.iter().cloned().collect();
+    fingerprints.sort();
+    fingerprints
+        .into_iter()
+        .map(|fp| {
+            if let Some(label) = verified_labels.get(&fp) {
+                format!("{} ({})", label, short_fingerprint(&fp))
+            } else {
+                format!("fingerprint:{}", short_fingerprint(&fp))
+            }
+        })
+        .collect()
+}
+
+fn parse_verify_like_command(line: &str, command: &str) -> Option<Vec<String>> {
+    let rest = line.strip_prefix(command)?;
+    if !rest.is_empty() && !rest.chars().next()?.is_whitespace() {
+        return None;
+    }
+    Some(
+        rest.split_whitespace()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+            .collect(),
+    )
+}
+
 fn persist_runtime_state(
     chat_context: &ChatContext,
     blocked_peers: &HashSet<String>,
     blocked_entries: &[String],
     nostr_aliases: &HashMap<String, String>,
+    verified_labels: &HashMap<String, String>,
+    verified_fingerprints: &HashSet<String>,
     channel_creators: &HashMap<String, String>,
     password_protected_channels: &HashSet<String>,
     channel_key_commitments: &HashMap<String, String>,
@@ -217,6 +266,9 @@ fn persist_runtime_state(
         &app_state.encrypted_channel_passwords,
         nickname,
     );
+    let mut state_to_save = state_to_save;
+    state_to_save.favorites = verified_fingerprints.clone();
+    state_to_save.verified_labels = verified_labels.clone();
     save_state(&state_to_save)
 }
 
@@ -423,6 +475,147 @@ fn parse_upload_path(line: &str) -> Result<Option<String>, &'static str> {
         return Err("Usage: /upload <path>");
     }
     Ok(Some(arg.to_string()))
+}
+
+#[derive(Debug, Clone)]
+struct VerificationLinkPayload {
+    version: i32,
+    noise_key_hex: String,
+    sign_key_hex: String,
+    npub: Option<String>,
+    nickname: String,
+    ts: i64,
+    nonce_b64: String,
+}
+
+fn parse_verifylink_command(line: &str) -> Result<Option<String>, &'static str> {
+    let Some(rest) = line.strip_prefix("/verifylink") else {
+        return Ok(None);
+    };
+    if !rest.is_empty() && !rest.chars().next().unwrap_or(' ').is_whitespace() {
+        return Ok(None);
+    }
+    let value = rest.trim();
+    if value.is_empty() {
+        return Err("usage");
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn build_verification_qr_canonical_bytes(payload: &VerificationLinkPayload) -> Vec<u8> {
+    let mut out = Vec::new();
+    fn append_field(out: &mut Vec<u8>, value: &str) {
+        let bytes = value.as_bytes();
+        let len = bytes.len().min(255);
+        out.push(len as u8);
+        out.extend_from_slice(&bytes[..len]);
+    }
+
+    append_field(&mut out, "bitchat-verify-v1");
+    append_field(&mut out, &payload.version.to_string());
+    append_field(&mut out, &payload.noise_key_hex.to_ascii_lowercase());
+    append_field(&mut out, &payload.sign_key_hex.to_ascii_lowercase());
+    append_field(&mut out, payload.npub.as_deref().unwrap_or(""));
+    append_field(&mut out, &payload.nickname);
+    append_field(&mut out, &payload.ts.to_string());
+    append_field(&mut out, &payload.nonce_b64);
+    out
+}
+
+fn verification_link_noise_fingerprint(noise_key_hex: &str) -> Result<String, String> {
+    let noise_key_bytes = hex::decode(noise_key_hex).map_err(|_| "invalid noise hex".to_string())?;
+    if noise_key_bytes.len() != 32 {
+        return Err("noise must be 32-byte hex".to_string());
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&noise_key_bytes);
+    let digest = hasher.finalize();
+    Ok(hex::encode(digest))
+}
+
+fn verify_bitchat_verify_link(
+    link: &str,
+    max_age_secs: i64,
+) -> Result<VerificationLinkPayload, String> {
+    let url = url::Url::parse(link).map_err(|e| format!("invalid URL: {}", e))?;
+    if !url.scheme().eq_ignore_ascii_case("bitchat") {
+        return Err("invalid scheme".to_string());
+    }
+    if !matches!(url.host_str(), Some("verify")) {
+        return Err("invalid host".to_string());
+    }
+
+    let mut query: HashMap<String, String> = HashMap::new();
+    for (k, v) in url.query_pairs() {
+        query.insert(k.to_string(), v.to_string());
+    }
+    let get_required = |name: &str| -> Result<String, String> {
+        query
+            .get(name)
+            .cloned()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("missing field '{}'", name))
+    };
+
+    let version = get_required("v")?
+        .parse::<i32>()
+        .map_err(|_| "invalid v".to_string())?;
+    if version != 1 {
+        return Err(format!("unsupported v={}", version));
+    }
+    let noise_key_hex = get_required("noise")?.to_ascii_lowercase();
+    let sign_key_hex = get_required("sign")?.to_ascii_lowercase();
+    let nickname = get_required("nick")?;
+    let ts = get_required("ts")?
+        .parse::<i64>()
+        .map_err(|_| "invalid ts".to_string())?;
+    let nonce_b64 = get_required("nonce")?;
+    let sig_hex = get_required("sig")?.to_ascii_lowercase();
+    let npub = query.get("npub").cloned().filter(|value| !value.is_empty());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or_default();
+    if now.saturating_sub(ts) > max_age_secs {
+        return Err("verification link expired".to_string());
+    }
+
+    let noise_key_bytes = hex::decode(&noise_key_hex).map_err(|_| "invalid noise hex".to_string())?;
+    if noise_key_bytes.len() != 32 {
+        return Err("noise must be 32-byte hex".to_string());
+    }
+
+    let sign_key_bytes = hex::decode(&sign_key_hex).map_err(|_| "invalid sign hex".to_string())?;
+    let sign_key_array: [u8; 32] = sign_key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "sign must be 32-byte hex".to_string())?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&sign_key_array).map_err(|_| "invalid signing key".to_string())?;
+
+    let sig_bytes = hex::decode(&sig_hex).map_err(|_| "invalid sig hex".to_string())?;
+    let sig_array: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "sig must be 64-byte hex".to_string())?;
+    let signature = Signature::from_bytes(&sig_array);
+
+    let payload = VerificationLinkPayload {
+        version,
+        noise_key_hex,
+        sign_key_hex,
+        npub,
+        nickname,
+        ts,
+        nonce_b64,
+    };
+    let canonical = build_verification_qr_canonical_bytes(&payload);
+    verifying_key
+        .verify_strict(&canonical, &signature)
+        .map_err(|_| "signature verification failed".to_string())?;
+    Ok(payload)
 }
 
 fn parse_channel_shortcut(line: &str) -> Option<usize> {
@@ -1088,6 +1281,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new_with_nickname(saved_nickname);
     let mut last_terminal_title = String::new();
     app.update_blocked_list(saved_state.blocked_names.clone());
+    app.update_verified_identities({
+        let mut entries = Vec::new();
+        for fp in &saved_state.favorites {
+            let short = if fp.len() > 10 { &fp[..10] } else { fp.as_str() };
+            if let Some(label) = saved_state.verified_labels.get(fp) {
+                entries.push(format!("{} ({})", label, short));
+            } else {
+                entries.push(format!("fingerprint:{}", short));
+            }
+        }
+        entries
+    });
     app.nostr_aliases = saved_state.nostr_aliases.clone();
     let nostr_geo_client =
         nostr_geo::NostrGeoClient::new(ui_tx.clone(), nostr_identity_seed.clone());
@@ -1134,10 +1339,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut channel_key_commitments: Option<HashMap<String, String>> =
         Some(saved_state.channel_key_commitments.clone());
     let mut discovered_channels: Option<HashSet<String>> = Some(HashSet::new());
-    let mut _favorites: Option<HashSet<String>> = Some(saved_state.favorites.clone());
+    let mut favorites: Option<HashSet<String>> = Some(saved_state.favorites.clone());
+    let mut verified_labels: Option<HashMap<String, String>> =
+        Some(saved_state.verified_labels.clone());
+    let verified_fingerprints_state =
+        Arc::new(std::sync::Mutex::new(saved_state.favorites.clone()));
+    let verified_labels_state =
+        Arc::new(std::sync::Mutex::new(saved_state.verified_labels.clone()));
     let mut _identity_key: Option<Vec<u8>> = saved_state.identity_key.clone();
     let create_app_state: Option<AppStateFactory> = Some(build_app_state_factory(
-        _favorites.clone(),
+        verified_fingerprints_state.clone(),
+        verified_labels_state.clone(),
         _identity_key.clone(),
         app_state
             .as_ref()
@@ -1438,6 +1650,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     debug_full_println!("[NOISE] Handshake required for peer: {}", peer_id);
                     // TODO: Update UI encryption status here
                 });
+
+                if let Some(known_verified) = favorites.as_ref() {
+                    temp_noise_session_manager.load_verified_fingerprints(known_verified.clone());
+                }
 
                 noise_session_manager = Some(temp_noise_session_manager);
 
@@ -1836,6 +2052,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(channel_key_commitments),
                 Some(app_state),
                 Some(create_app_state),
+                Some(favorites),
+                Some(verified_labels),
             ) = (
                 chat_context.as_ref(),
                 blocked_peers.as_ref(),
@@ -1844,12 +2062,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 channel_key_commitments.as_ref(),
                 app_state.as_ref(),
                 create_app_state.as_ref(),
+                favorites.as_ref(),
+                verified_labels.as_ref(),
             ) {
                 if let Err(e) = persist_runtime_state(
                     chat_context,
                     blocked_peers,
                     &app.blocked,
                     &app.nostr_aliases,
+                    verified_labels,
+                    favorites,
                     channel_creators,
                     password_protected_channels,
                     channel_key_commitments,
@@ -1964,6 +2186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(channel_key_commitments),
                     Some(app_state),
                     Some(create_app_state),
+                    Some(favorites),
+                    Some(verified_labels),
                 ) = (
                     chat_context.as_ref(),
                     blocked_peers.as_ref(),
@@ -1972,12 +2196,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     channel_key_commitments.as_ref(),
                     app_state.as_ref(),
                     create_app_state.as_ref(),
+                    favorites.as_ref(),
+                    verified_labels.as_ref(),
                 ) {
                     if let Err(e) = persist_runtime_state(
                         chat_context,
                         blocked_peers,
                         &app.blocked,
                         &app.nostr_aliases,
+                        verified_labels,
+                        favorites,
                         channel_creators,
                         password_protected_channels,
                         channel_key_commitments,
@@ -2006,6 +2234,407 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // `/help` is a local self command output; don't mark it as unseen/new messages.
                 app.unseen_divider_message_index = None;
                 app.unseen_divider_line_index = None;
+                continue;
+            }
+
+            if let Some(args) = parse_verify_like_command(&line, "/verified") {
+                if !args.is_empty() {
+                    app.add_log_message("system: Usage: /verified".to_string());
+                    continue;
+                }
+                let favorites_ref = favorites.as_ref().unwrap();
+                let labels_ref = verified_labels.as_ref().unwrap();
+                if favorites_ref.is_empty() {
+                    app.add_log_message("system: No verified mesh identities yet.".to_string());
+                    continue;
+                }
+                app.add_log_message(format!(
+                    "system: Verified mesh identities: {}",
+                    favorites_ref.len()
+                ));
+                for entry in format_verified_entries(favorites_ref, labels_ref) {
+                    app.add_log_message(format!("system:   {}", entry));
+                }
+                continue;
+            }
+
+            if let Some(args) = parse_verify_like_command(&line, "/verify") {
+                if args.is_empty() {
+                    app.add_log_message(
+                        "system: Usage: /verify <@user|fingerprint|prefix> [label]".to_string(),
+                    );
+                    continue;
+                }
+                let target_raw = args[0].trim().trim_start_matches('@');
+                if target_raw.is_empty() {
+                    app.add_log_message(
+                        "system: Usage: /verify <@user|fingerprint|prefix> [label]".to_string(),
+                    );
+                    continue;
+                }
+                let label_override = if args.len() > 1 {
+                    Some(args[1..].join(" ").trim().to_string())
+                } else {
+                    None
+                }
+                .filter(|value| !value.is_empty());
+
+                let token = target_raw.to_ascii_lowercase();
+                let mut resolved_fp: Option<String> = None;
+                let mut resolved_label: Option<String> = None;
+                let mut prefix_candidates: Vec<String> = Vec::new();
+
+                if is_hex_fingerprint(&token) {
+                    resolved_fp = Some(token.clone());
+                } else if token.len() >= 6 && token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    for fp in favorites.as_ref().unwrap().iter() {
+                        if fp.starts_with(&token) {
+                            prefix_candidates.push(fp.clone());
+                        }
+                    }
+                    let peers_guard = peers.as_ref().unwrap().lock().await;
+                    for (peer_id, peer) in peers_guard.iter() {
+                        if let Some(fp) = encryption_service
+                            .as_ref()
+                            .unwrap()
+                            .get_peer_fingerprint(peer_id)
+                        {
+                            if fp.starts_with(&token) && !prefix_candidates.iter().any(|e| e == &fp)
+                            {
+                                prefix_candidates.push(fp);
+                            }
+                        }
+                    }
+                    if prefix_candidates.len() == 1 {
+                        resolved_fp = prefix_candidates.first().cloned();
+                    } else if prefix_candidates.len() > 1 {
+                        app.add_log_message(format!(
+                            "system: Fingerprint prefix '{}' matches {} entries; use a longer prefix or full fingerprint.",
+                            token,
+                            prefix_candidates.len()
+                        ));
+                        continue;
+                    }
+                }
+
+                if resolved_fp.is_none() {
+                    let peers_guard = peers.as_ref().unwrap().lock().await;
+                    let mut matched: Vec<(String, String)> = peers_guard
+                        .iter()
+                        .filter_map(|(peer_id, peer)| {
+                            let nick = peer.nickname.as_ref()?;
+                            if !nick.eq_ignore_ascii_case(target_raw) {
+                                return None;
+                            }
+                            let fp = encryption_service
+                                .as_ref()
+                                .unwrap()
+                                .get_peer_fingerprint(peer_id)?;
+                            Some((fp, nick.clone()))
+                        })
+                        .collect();
+                    matched.sort_by(|a, b| a.0.cmp(&b.0));
+                    matched.dedup_by(|a, b| a.0 == b.0);
+                    if matched.len() == 1 {
+                        resolved_fp = Some(matched[0].0.clone());
+                        resolved_label = Some(matched[0].1.clone());
+                    } else if matched.len() > 1 {
+                        app.add_log_message(format!(
+                            "system: User '{}' matched multiple peers; use fingerprint instead.",
+                            target_raw
+                        ));
+                        continue;
+                    }
+                }
+
+                let Some(fingerprint) = resolved_fp else {
+                    app.add_log_message(format!(
+                        "system: Could not resolve '{}'. Use /online then /verify @user, or /verify <fingerprint>.",
+                        target_raw
+                    ));
+                    continue;
+                };
+
+                favorites
+                    .as_mut()
+                    .unwrap()
+                    .insert(fingerprint.to_ascii_lowercase());
+                let chosen_label = label_override.or(resolved_label);
+                if let Some(label) = chosen_label {
+                    verified_labels
+                        .as_mut()
+                        .unwrap()
+                        .insert(fingerprint.clone(), label);
+                }
+                {
+                    let mut favorites_guard = verified_fingerprints_state.lock().unwrap();
+                    *favorites_guard = favorites.as_ref().unwrap().clone();
+                }
+                {
+                    let mut labels_guard = verified_labels_state.lock().unwrap();
+                    *labels_guard = verified_labels.as_ref().unwrap().clone();
+                }
+
+                if let Some(noise_manager) = noise_session_manager.as_mut() {
+                    noise_manager.verify_fingerprint(&fingerprint);
+                }
+
+                if let Some(state) = app_state.as_mut() {
+                    state.favorites = favorites.as_ref().unwrap().clone();
+                    state.verified_labels = verified_labels.as_ref().unwrap().clone();
+                    let _ = save_state(state);
+                }
+
+                app.update_verified_identities(format_verified_entries(
+                    favorites.as_ref().unwrap(),
+                    verified_labels.as_ref().unwrap(),
+                ));
+
+                if let Err(e) = persist_runtime_state(
+                    chat_context.as_ref().unwrap(),
+                    blocked_peers.as_ref().unwrap(),
+                    &app.blocked,
+                    &app.nostr_aliases,
+                    verified_labels.as_ref().unwrap(),
+                    favorites.as_ref().unwrap(),
+                    channel_creators.as_ref().unwrap(),
+                    password_protected_channels.as_ref().unwrap(),
+                    channel_key_commitments.as_ref().unwrap(),
+                    app_state.as_ref().unwrap(),
+                    create_app_state.as_ref().unwrap(),
+                    &nickname,
+                ) {
+                    app.add_log_message(format!("system: Warning: Could not save state: {}", e));
+                }
+
+                app.add_log_message(format!(
+                    "system: Verified mesh identity {}.",
+                    short_fingerprint(&fingerprint)
+                ));
+                continue;
+            }
+
+            match parse_verifylink_command(&line) {
+                Ok(Some(link)) => {
+                    const IOS_VERIFY_LINK_MAX_AGE_SECS: i64 = 300;
+                    let payload =
+                        match verify_bitchat_verify_link(&link, IOS_VERIFY_LINK_MAX_AGE_SECS) {
+                            Ok(payload) => payload,
+                            Err(err) => {
+                                app.add_log_message(format!(
+                                    "system: Invalid verify link: {}",
+                                    err
+                                ));
+                                continue;
+                            }
+                        };
+
+                    let fingerprint = match verification_link_noise_fingerprint(&payload.noise_key_hex)
+                    {
+                        Ok(fp) => fp,
+                        Err(err) => {
+                            app.add_log_message(format!(
+                                "system: Invalid verify link: {}",
+                                err
+                            ));
+                            continue;
+                        }
+                    };
+
+                    let label = payload.nickname.trim().to_string();
+                    favorites
+                        .as_mut()
+                        .unwrap()
+                        .insert(fingerprint.to_ascii_lowercase());
+                    if !label.is_empty() {
+                        verified_labels
+                            .as_mut()
+                            .unwrap()
+                            .insert(fingerprint.clone(), label.clone());
+                    }
+
+                    {
+                        let mut favorites_guard = verified_fingerprints_state.lock().unwrap();
+                        *favorites_guard = favorites.as_ref().unwrap().clone();
+                    }
+                    {
+                        let mut labels_guard = verified_labels_state.lock().unwrap();
+                        *labels_guard = verified_labels.as_ref().unwrap().clone();
+                    }
+
+                    if let Some(noise_manager) = noise_session_manager.as_mut() {
+                        noise_manager.verify_fingerprint(&fingerprint);
+                    }
+
+                    if let Some(state) = app_state.as_mut() {
+                        state.favorites = favorites.as_ref().unwrap().clone();
+                        state.verified_labels = verified_labels.as_ref().unwrap().clone();
+                        let _ = save_state(state);
+                    }
+
+                    app.update_verified_identities(format_verified_entries(
+                        favorites.as_ref().unwrap(),
+                        verified_labels.as_ref().unwrap(),
+                    ));
+
+                    if let Err(e) = persist_runtime_state(
+                        chat_context.as_ref().unwrap(),
+                        blocked_peers.as_ref().unwrap(),
+                        &app.blocked,
+                        &app.nostr_aliases,
+                        verified_labels.as_ref().unwrap(),
+                        favorites.as_ref().unwrap(),
+                        channel_creators.as_ref().unwrap(),
+                        password_protected_channels.as_ref().unwrap(),
+                        channel_key_commitments.as_ref().unwrap(),
+                        app_state.as_ref().unwrap(),
+                        create_app_state.as_ref().unwrap(),
+                        &nickname,
+                    ) {
+                        app.add_log_message(format!("system: Warning: Could not save state: {}", e));
+                    }
+
+                    let mut verified_msg = format!(
+                        "system: Verified {} via /verifylink (fingerprint {}).",
+                        if label.is_empty() {
+                            "identity".to_string()
+                        } else {
+                            label.clone()
+                        },
+                        short_fingerprint(&fingerprint)
+                    );
+                    if let Some(npub) = payload.npub.as_deref() {
+                        verified_msg.push_str(&format!(" npub={}.", npub));
+                    }
+                    app.add_log_message(verified_msg);
+                    continue;
+                }
+                Ok(None) => {}
+                Err("usage") => {
+                    app.add_log_message("system: Usage: /verifylink <bitchat://verify?...>".to_string());
+                    continue;
+                }
+                Err(_) => {}
+            }
+
+            if let Some(args) = parse_verify_like_command(&line, "/unverify") {
+                if args.is_empty() {
+                    app.add_log_message(
+                        "system: Usage: /unverify <@user|fingerprint|prefix>".to_string(),
+                    );
+                    continue;
+                }
+                let token = args[0].trim().trim_start_matches('@').to_ascii_lowercase();
+                let mut target_fp: Option<String> = None;
+
+                if is_hex_fingerprint(&token) {
+                    target_fp = Some(token.clone());
+                } else if token.len() >= 6 && token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    let mut matches: Vec<String> = favorites
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .filter(|fp| fp.starts_with(&token))
+                        .cloned()
+                        .collect();
+                    matches.sort();
+                    matches.dedup();
+                    if matches.len() == 1 {
+                        target_fp = matches.first().cloned();
+                    } else if matches.len() > 1 {
+                        app.add_log_message(format!(
+                            "system: Fingerprint prefix '{}' matches {} entries; use a longer prefix.",
+                            token,
+                            matches.len()
+                        ));
+                        continue;
+                    }
+                }
+
+                if target_fp.is_none() {
+                    let peers_guard = peers.as_ref().unwrap().lock().await;
+                    let mut matches: Vec<String> = peers_guard
+                        .iter()
+                        .filter_map(|(peer_id, peer)| {
+                            let nick = peer.nickname.as_ref()?;
+                            if !nick.eq_ignore_ascii_case(&token) {
+                                return None;
+                            }
+                            encryption_service
+                                .as_ref()
+                                .unwrap()
+                                .get_peer_fingerprint(peer_id)
+                        })
+                        .collect();
+                    matches.sort();
+                    matches.dedup();
+                    if matches.len() == 1 {
+                        target_fp = matches.first().cloned();
+                    }
+                }
+
+                let Some(fingerprint) = target_fp else {
+                    app.add_log_message(format!(
+                        "system: Could not resolve '{}'. Use /verified to list stored entries.",
+                        token
+                    ));
+                    continue;
+                };
+
+                let removed = favorites.as_mut().unwrap().remove(&fingerprint);
+                verified_labels.as_mut().unwrap().remove(&fingerprint);
+                if !removed {
+                    app.add_log_message(format!(
+                        "system: Fingerprint {} is not in verified list.",
+                        short_fingerprint(&fingerprint)
+                    ));
+                    continue;
+                }
+                {
+                    let mut favorites_guard = verified_fingerprints_state.lock().unwrap();
+                    *favorites_guard = favorites.as_ref().unwrap().clone();
+                }
+                {
+                    let mut labels_guard = verified_labels_state.lock().unwrap();
+                    *labels_guard = verified_labels.as_ref().unwrap().clone();
+                }
+
+                if let Some(noise_manager) = noise_session_manager.as_mut() {
+                    noise_manager.load_verified_fingerprints(favorites.as_ref().unwrap().clone());
+                }
+
+                if let Some(state) = app_state.as_mut() {
+                    state.favorites = favorites.as_ref().unwrap().clone();
+                    state.verified_labels = verified_labels.as_ref().unwrap().clone();
+                    let _ = save_state(state);
+                }
+
+                app.update_verified_identities(format_verified_entries(
+                    favorites.as_ref().unwrap(),
+                    verified_labels.as_ref().unwrap(),
+                ));
+
+                if let Err(e) = persist_runtime_state(
+                    chat_context.as_ref().unwrap(),
+                    blocked_peers.as_ref().unwrap(),
+                    &app.blocked,
+                    &app.nostr_aliases,
+                    verified_labels.as_ref().unwrap(),
+                    favorites.as_ref().unwrap(),
+                    channel_creators.as_ref().unwrap(),
+                    password_protected_channels.as_ref().unwrap(),
+                    channel_key_commitments.as_ref().unwrap(),
+                    app_state.as_ref().unwrap(),
+                    create_app_state.as_ref().unwrap(),
+                    &nickname,
+                ) {
+                    app.add_log_message(format!("system: Warning: Could not save state: {}", e));
+                }
+
+                app.add_log_message(format!(
+                    "system: Removed verified mesh identity {}.",
+                    short_fingerprint(&fingerprint)
+                ));
                 continue;
             }
 
@@ -2089,6 +2718,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     blocked_peers.as_ref().unwrap(),
                     &app.blocked,
                     &app.nostr_aliases,
+                    verified_labels.as_ref().unwrap(),
+                    favorites.as_ref().unwrap(),
                     channel_creators.as_ref().unwrap(),
                     password_protected_channels.as_ref().unwrap(),
                     channel_key_commitments.as_ref().unwrap(),
@@ -2141,6 +2772,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             blocked_peers.as_ref().unwrap(),
                             &app.blocked,
                             &app.nostr_aliases,
+                            verified_labels.as_ref().unwrap(),
+                            favorites.as_ref().unwrap(),
                             channel_creators.as_ref().unwrap(),
                             password_protected_channels.as_ref().unwrap(),
                             channel_key_commitments.as_ref().unwrap(),
@@ -2211,6 +2844,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             blocked_peers.as_ref().unwrap(),
                             &app.blocked,
                             &app.nostr_aliases,
+                            verified_labels.as_ref().unwrap(),
+                            favorites.as_ref().unwrap(),
                             channel_creators.as_ref().unwrap(),
                             password_protected_channels.as_ref().unwrap(),
                             channel_key_commitments.as_ref().unwrap(),
@@ -2411,6 +3046,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             blocked_peers.as_ref().unwrap(),
                             &app.blocked,
                             &app.nostr_aliases,
+                            verified_labels.as_ref().unwrap(),
+                            favorites.as_ref().unwrap(),
                             channel_creators.as_ref().unwrap(),
                             password_protected_channels.as_ref().unwrap(),
                             channel_key_commitments.as_ref().unwrap(),
@@ -3060,6 +3697,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     blocked_peers.as_ref().unwrap(),
                     &app.blocked,
                     &app.nostr_aliases,
+                    verified_labels.as_ref().unwrap(),
+                    favorites.as_ref().unwrap(),
                     channel_creators.as_ref().unwrap(),
                     password_protected_channels.as_ref().unwrap(),
                     channel_key_commitments.as_ref().unwrap(),
@@ -3274,6 +3913,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(channel_key_commitments),
         Some(app_state),
         Some(create_app_state),
+        Some(favorites),
+        Some(verified_labels),
     ) = (
         chat_context.as_ref(),
         blocked_peers.as_ref(),
@@ -3282,12 +3923,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         channel_key_commitments.as_ref(),
         app_state.as_ref(),
         create_app_state.as_ref(),
+        favorites.as_ref(),
+        verified_labels.as_ref(),
     ) {
         let _ = persist_runtime_state(
             chat_context,
             blocked_peers,
             &app.blocked,
             &app.nostr_aliases,
+            verified_labels,
+            favorites,
             channel_creators,
             password_protected_channels,
             channel_key_commitments,
@@ -3457,5 +4102,48 @@ mod tests {
         );
         assert_eq!(parse_upload_path("/upload"), Err("Usage: /upload <path>"));
         assert_eq!(parse_upload_path("/upload-now"), Ok(None));
+    }
+
+    #[test]
+    fn parses_verifylink_command_and_usage() {
+        assert_eq!(
+            parse_verifylink_command("/verifylink bitchat://verify?v=1"),
+            Ok(Some("bitchat://verify?v=1".to_string()))
+        );
+        assert_eq!(parse_verifylink_command("/verifylink"), Err("usage"));
+        assert_eq!(parse_verifylink_command("/verifylink-now"), Ok(None));
+    }
+
+    #[test]
+    fn verifies_ios_style_verify_link_signature() {
+        use ed25519_dalek::Signer;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let sign_pub_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        let noise_hex = "11".repeat(32);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let payload = VerificationLinkPayload {
+            version: 1,
+            noise_key_hex: noise_hex.clone(),
+            sign_key_hex: sign_pub_hex.clone(),
+            npub: Some("npub1example".to_string()),
+            nickname: "alice".to_string(),
+            ts,
+            nonce_b64: "abcd1234".to_string(),
+        };
+        let canonical = build_verification_qr_canonical_bytes(&payload);
+        let sig = signing_key.sign(&canonical);
+        let sig_hex = hex::encode(sig.to_bytes());
+
+        let link = format!(
+            "bitchat://verify?v=1&noise={}&sign={}&nick=alice&ts={}&nonce=abcd1234&sig={}&npub=npub1example",
+            noise_hex, sign_pub_hex, ts, sig_hex
+        );
+        let verified = verify_bitchat_verify_link(&link, 300).expect("verify link should pass");
+        assert_eq!(verified.nickname, "alice");
+        assert_eq!(verified.noise_key_hex, noise_hex);
     }
 }

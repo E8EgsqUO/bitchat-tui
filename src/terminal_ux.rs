@@ -193,6 +193,17 @@ pub fn get_help_text() -> String {
         cmd_line("/block, /b @user", "Block a user in Nostr geohash channels"),
         cmd_line("/block", "List blocked users"),
         cmd_line("/unblock, /u @user", "Unblock a user in Nostr geohash channels"),
+        cmd_line("/fingerprint", "Show your mesh identity fingerprint"),
+        cmd_line(
+            "/verify <@user|fp> [label]",
+            "Mark mesh fingerprint as verified and persist it",
+        ),
+        cmd_line(
+            "/verifylink <bitchat://verify...>",
+            "Verify from iOS-style verification link",
+        ),
+        cmd_line("/verified", "List verified mesh fingerprints"),
+        cmd_line("/unverify <@user|fp>", "Remove a verified mesh fingerprint"),
         "".to_string(),
         "==========================================================".to_string(),
     ];
