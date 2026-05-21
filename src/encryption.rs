@@ -73,6 +73,44 @@ impl EncryptionService {
         }
     }
 
+    pub fn new_with_persistent_keys(
+        noise_static_key: Option<&[u8]>,
+        identity_key: Option<&[u8]>,
+    ) -> Self {
+        let private_key = noise_static_key
+            .and_then(|bytes| <&[u8; 32]>::try_from(bytes).ok())
+            .map(|arr| StaticSecret::from(*arr))
+            .unwrap_or_else(|| StaticSecret::random_from_rng(OsRng));
+        let public_key = PublicKey::from(&private_key);
+
+        let signing_key = identity_key
+            .and_then(|bytes| <&[u8; 32]>::try_from(bytes).ok())
+            .map(|arr| SigningKey::from_bytes(arr))
+            .unwrap_or_else(|| SigningKey::generate(&mut OsRng));
+        let verifying_key = signing_key.verifying_key();
+
+        // Use the same persisted identity seed for identity key material when present.
+        let identity_key = identity_key
+            .and_then(|bytes| <&[u8; 32]>::try_from(bytes).ok())
+            .map(|arr| SigningKey::from_bytes(arr))
+            .unwrap_or_else(|| SigningKey::generate(&mut OsRng));
+        let identity_public = identity_key.verifying_key();
+
+        Self {
+            private_key,
+            public_key,
+            signing_key,
+            verifying_key,
+            _identity_key: identity_key,
+            identity_public,
+            peer_public_keys: Arc::new(RwLock::new(HashMap::new())),
+            peer_signing_keys: Arc::new(RwLock::new(HashMap::new())),
+            peer_identity_keys: Arc::new(RwLock::new(HashMap::new())),
+            shared_secrets: Arc::new(RwLock::new(HashMap::new())),
+            noise_manager: None,
+        }
+    }
+
     /// Create combined public key data for exchange (96 bytes total)
     pub fn get_combined_public_key_data(&self) -> Vec<u8> {
         let mut data = Vec::with_capacity(96);

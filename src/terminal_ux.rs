@@ -202,6 +202,8 @@ pub fn get_help_text() -> String {
             "/verifylink <bitchat://verify...>",
             "Verify from iOS-style verification link",
         ),
+        cmd_line("/verifyme", "Generate your iOS-style verify link"),
+        cmd_line("/verifyqr", "Render your verify link as a terminal QR"),
         cmd_line("/verified", "List verified mesh fingerprints"),
         cmd_line("/unverify <@user|fp>", "Remove a verified mesh fingerprint"),
         "".to_string(),

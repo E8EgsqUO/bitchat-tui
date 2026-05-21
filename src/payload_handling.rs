@@ -52,6 +52,9 @@ pub fn unpad_message(data: &[u8]) -> Vec<u8> {
 pub const NOISE_PAYLOAD_PRIVATE_MESSAGE: u8 = 0x01;
 pub const NOISE_PAYLOAD_READ_RECEIPT: u8 = 0x02;
 pub const NOISE_PAYLOAD_DELIVERED: u8 = 0x03;
+pub const NOISE_PAYLOAD_VERIFY_CHALLENGE: u8 = 0x10;
+pub const NOISE_PAYLOAD_VERIFY_RESPONSE: u8 = 0x11;
+const VERIFY_RESPONSE_CONTEXT: &str = "bitchat-verify-resp-v1";
 
 pub fn create_private_noise_payload(
     message_id: &str,
@@ -125,6 +128,133 @@ pub fn parse_private_noise_payload(data: &[u8]) -> Result<(String, String), &'st
 
 pub fn parse_private_noise_ack_payload(data: &[u8]) -> Result<String, &'static str> {
     String::from_utf8(data.to_vec()).map_err(|_| "Invalid UTF-8 in private ack message ID")
+}
+
+pub fn parse_verify_noise_challenge_payload(
+    data: &[u8],
+) -> Result<(String, Vec<u8>), &'static str> {
+    let mut offset = 0usize;
+    let mut noise_key_hex: Option<String> = None;
+    let mut nonce_a: Option<Vec<u8>> = None;
+
+    while offset < data.len() {
+        if data.len().saturating_sub(offset) < 2 {
+            return Err("Verify challenge TLV truncated");
+        }
+        let field_type = data[offset];
+        let field_len = data[offset + 1] as usize;
+        offset += 2;
+        if data.len().saturating_sub(offset) < field_len {
+            return Err("Verify challenge TLV length exceeds payload");
+        }
+        let field = &data[offset..offset + field_len];
+        offset += field_len;
+
+        match field_type {
+            0x01 => {
+                let value = String::from_utf8(field.to_vec())
+                    .map_err(|_| "Invalid UTF-8 in verify challenge noise key")?;
+                noise_key_hex = Some(value);
+            }
+            0x02 => {
+                nonce_a = Some(field.to_vec());
+            }
+            _ => {}
+        }
+    }
+
+    Ok((
+        noise_key_hex.ok_or("Missing noise key in verify challenge")?,
+        nonce_a.ok_or("Missing nonce in verify challenge")?,
+    ))
+}
+
+pub fn create_verify_noise_response_payload(
+    noise_key_hex: &str,
+    nonce_a: &[u8],
+    encryption_service: &EncryptionService,
+) -> Result<Vec<u8>, &'static str> {
+    let noise_key_bytes = noise_key_hex.as_bytes();
+    if noise_key_bytes.len() > u8::MAX as usize {
+        return Err("Verify response noise key too long");
+    }
+    if nonce_a.len() > u8::MAX as usize {
+        return Err("Verify response nonce too long");
+    }
+
+    let mut signature_message = Vec::new();
+    signature_message.extend_from_slice(VERIFY_RESPONSE_CONTEXT.as_bytes());
+    signature_message.push(noise_key_bytes.len() as u8);
+    signature_message.extend_from_slice(noise_key_bytes);
+    signature_message.extend_from_slice(nonce_a);
+    let signature = encryption_service.sign(&signature_message);
+    if signature.len() > u8::MAX as usize {
+        return Err("Verify response signature too long");
+    }
+
+    let mut payload = Vec::with_capacity(
+        1 + 2 + noise_key_bytes.len() + 2 + nonce_a.len() + 2 + signature.len(),
+    );
+    payload.push(NOISE_PAYLOAD_VERIFY_RESPONSE);
+
+    payload.push(0x01);
+    payload.push(noise_key_bytes.len() as u8);
+    payload.extend_from_slice(noise_key_bytes);
+
+    payload.push(0x02);
+    payload.push(nonce_a.len() as u8);
+    payload.extend_from_slice(nonce_a);
+
+    payload.push(0x03);
+    payload.push(signature.len() as u8);
+    payload.extend_from_slice(&signature);
+
+    Ok(payload)
+}
+
+#[allow(dead_code)]
+pub fn parse_verify_noise_response_payload(
+    data: &[u8],
+) -> Result<(String, Vec<u8>, Vec<u8>), &'static str> {
+    let mut offset = 0usize;
+    let mut noise_key_hex: Option<String> = None;
+    let mut nonce_a: Option<Vec<u8>> = None;
+    let mut signature: Option<Vec<u8>> = None;
+
+    while offset < data.len() {
+        if data.len().saturating_sub(offset) < 2 {
+            return Err("Verify response TLV truncated");
+        }
+        let field_type = data[offset];
+        let field_len = data[offset + 1] as usize;
+        offset += 2;
+        if data.len().saturating_sub(offset) < field_len {
+            return Err("Verify response TLV length exceeds payload");
+        }
+        let field = &data[offset..offset + field_len];
+        offset += field_len;
+
+        match field_type {
+            0x01 => {
+                let value = String::from_utf8(field.to_vec())
+                    .map_err(|_| "Invalid UTF-8 in verify response noise key")?;
+                noise_key_hex = Some(value);
+            }
+            0x02 => {
+                nonce_a = Some(field.to_vec());
+            }
+            0x03 => {
+                signature = Some(field.to_vec());
+            }
+            _ => {}
+        }
+    }
+
+    Ok((
+        noise_key_hex.ok_or("Missing noise key in verify response")?,
+        nonce_a.ok_or("Missing nonce in verify response")?,
+        signature.ok_or("Missing signature in verify response")?,
+    ))
 }
 
 pub fn parse_bitchat_message_payload(data: &[u8]) -> Result<BitchatMessage, &'static str> {
@@ -499,6 +629,7 @@ pub fn create_encrypted_channel_message_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
     #[test]
     fn private_noise_payload_round_trips() {
@@ -535,5 +666,57 @@ mod tests {
         let content = "x".repeat(256);
 
         assert!(create_private_noise_payload("msg-1", &content).is_err());
+    }
+
+    #[test]
+    fn verify_challenge_payload_round_trips() {
+        let noise_key_hex = "ab".repeat(32);
+        let nonce = vec![0x01, 0x02, 0x03, 0x04];
+        let mut payload = vec![NOISE_PAYLOAD_VERIFY_CHALLENGE];
+        payload.push(0x01);
+        payload.push(noise_key_hex.len() as u8);
+        payload.extend_from_slice(noise_key_hex.as_bytes());
+        payload.push(0x02);
+        payload.push(nonce.len() as u8);
+        payload.extend_from_slice(&nonce);
+
+        let (parsed_noise, parsed_nonce) =
+            parse_verify_noise_challenge_payload(&payload[1..]).expect("challenge should parse");
+        assert_eq!(parsed_noise, noise_key_hex);
+        assert_eq!(parsed_nonce, nonce);
+    }
+
+    #[test]
+    fn verify_response_payload_round_trips_and_signature_verifies() {
+        let encryption = EncryptionService::new();
+        let noise_key_hex = "cd".repeat(32);
+        let nonce = vec![0x10, 0x20, 0x30, 0x40, 0x50];
+
+        let payload = create_verify_noise_response_payload(&noise_key_hex, &nonce, &encryption)
+            .expect("response should be created");
+        assert_eq!(payload.first().copied(), Some(NOISE_PAYLOAD_VERIFY_RESPONSE));
+        let (parsed_noise, parsed_nonce, parsed_sig) =
+            parse_verify_noise_response_payload(&payload[1..]).expect("response should parse");
+        assert_eq!(parsed_noise, noise_key_hex);
+        assert_eq!(parsed_nonce, nonce);
+
+        let mut signed = Vec::new();
+        signed.extend_from_slice(VERIFY_RESPONSE_CONTEXT.as_bytes());
+        signed.push(parsed_noise.len() as u8);
+        signed.extend_from_slice(parsed_noise.as_bytes());
+        signed.extend_from_slice(&parsed_nonce);
+
+        let sign_pub_bytes: [u8; 32] = encryption
+            .get_signing_public_key_data()
+            .try_into()
+            .expect("signing public key length");
+        let verifying_key =
+            VerifyingKey::from_bytes(&sign_pub_bytes).expect("valid signing public key");
+        let sig_array: [u8; 64] = parsed_sig
+            .as_slice()
+            .try_into()
+            .expect("signature should be 64 bytes");
+        let signature = Signature::from_bytes(&sig_array);
+        assert!(verifying_key.verify(&signed, &signature).is_ok());
     }
 }

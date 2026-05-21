@@ -10,7 +10,7 @@ use crate::packet_creation::{
 use crate::payload_handling::create_private_noise_payload;
 use crate::persistence::{encrypt_password, save_state, AppState, EncryptedPassword};
 use crate::terminal_ux::{ChatContext, ChatMode};
-use btleplug::api::{Peripheral as _, WriteType};
+use btleplug::api::{Characteristic, Peripheral as _, WriteType};
 use btleplug::platform::Peripheral;
 use chrono;
 use regex::Regex;
@@ -22,6 +22,40 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+async fn send_packet_to_mesh_targets(
+    targets: &[(Peripheral, Characteristic)],
+    packet: Vec<u8>,
+    my_peer_id: &str,
+    msg_type: MessageType,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if targets.is_empty() {
+        return Err("No Bluetooth mesh links available".into());
+    }
+
+    let mut sent_any = false;
+    let mut errors = Vec::new();
+    for (idx, (peripheral, cmd_char)) in targets.iter().enumerate() {
+        match send_packet_with_fragmentation_as(
+            peripheral,
+            cmd_char,
+            packet.clone(),
+            my_peer_id,
+            msg_type,
+        )
+        .await
+        {
+            Ok(()) => sent_any = true,
+            Err(e) => errors.push(format!("link {}: {}", idx + 1, e)),
+        }
+    }
+
+    if sent_any {
+        Ok(())
+    } else {
+        Err(format!("all mesh sends failed: {}", errors.join("; ")).into())
+    }
+}
 
 const MAX_FILE_TRANSFER_BYTES: u64 = 1024 * 1024;
 const TUI_FILE_TRANSFER_MIME: &str = "application/vnd.bitchat-tui.file";
@@ -908,6 +942,7 @@ pub async fn handle_dm_command(
     _encryption_service: &EncryptionService,
     peripheral: &Peripheral,
     cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(Peripheral, Characteristic)],
     ui_tx: mpsc::Sender<String>,
     app: &mut crate::tui::app::App,
     _noise_session_manager: &mut NoiseSessionManager,
@@ -972,6 +1007,11 @@ pub async fn handle_dm_command(
 
         if let Some(target_peer_id) = peer_id {
             chat_context.enter_dm_mode(target_lookup, &target_peer_id);
+            let owned_targets = if mesh_targets.is_empty() {
+                vec![(peripheral.clone(), cmd_char.clone())]
+            } else {
+                mesh_targets.to_vec()
+            };
             // If no message provided, enter DM mode
             if !has_inline_message {
                 if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
@@ -1021,16 +1061,26 @@ pub async fn handle_dm_command(
                             handshake_data,
                             None,
                         );
-                        if let Err(e) = peripheral
-                            .write(cmd_char, &handshake_packet, WriteType::WithoutResponse)
-                            .await
+                        if let Err(e) = send_packet_to_mesh_targets(
+                            &owned_targets,
+                            handshake_packet,
+                            my_peer_id,
+                            MessageType::NoiseHandshakeInit,
+                        )
+                        .await
                         {
-                            let _ = ui_tx
-                                .send(format!(
-                                    "\n\x1b[91m❌ Failed to start DM handshake: {}\x1b[0m\n",
-                                    e
-                                ))
-                                .await;
+                            crate::notification_handlers::write_noise_debug_log(&format!(
+                                "[DEBUG] Failed to start DM handshake: {}",
+                                e
+                            ));
+                            if crate::tui::app::bitchat_debug_enabled() {
+                                let _ = ui_tx
+                                    .send(format!(
+                                        "\n\x1b[91m❌ Failed to start DM handshake: {}\x1b[0m\n",
+                                        e
+                                    ))
+                                    .await;
+                            }
                             return true;
                         }
 
@@ -1055,12 +1105,18 @@ pub async fn handle_dm_command(
                         return true;
                     }
                     Err(e) => {
-                        let _ = ui_tx
-                            .send(format!(
-                                "\n\x1b[91m❌ Failed to initiate DM handshake: {}\x1b[0m\n",
-                                e
-                            ))
-                            .await;
+                        crate::notification_handlers::write_noise_debug_log(&format!(
+                            "[DEBUG] Failed to initiate DM handshake: {}",
+                            e
+                        ));
+                        if crate::tui::app::bitchat_debug_enabled() {
+                            let _ = ui_tx
+                                .send(format!(
+                                    "\n\x1b[91m❌ Failed to initiate DM handshake: {}\x1b[0m\n",
+                                    e
+                                ))
+                                .await;
+                        }
                         return true;
                     }
                 }
@@ -1103,9 +1159,13 @@ pub async fn handle_dm_command(
                 None,
             );
 
-            if let Err(e) = peripheral
-                .write(cmd_char, &packet, WriteType::WithoutResponse)
-                .await
+            if let Err(e) = send_packet_to_mesh_targets(
+                &owned_targets,
+                packet,
+                my_peer_id,
+                MessageType::NoiseEncrypted,
+            )
+            .await
             {
                 let _ = ui_tx
                     .send(format!(

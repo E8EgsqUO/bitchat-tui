@@ -50,6 +50,8 @@ pub enum NoiseSessionState {
 
 // MARK: - Pending Message
 
+const PENDING_MESSAGE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct PendingMessage {
     pub content: String,
@@ -118,9 +120,15 @@ impl NoiseSession {
     }
 
     pub fn get_pending_messages(&mut self) -> Vec<String> {
+        let now = SystemTime::now();
         let messages: Vec<String> = self
             .pending_messages
             .iter()
+            .filter(|pm| {
+                now.duration_since(pm.timestamp)
+                    .map(|age| age <= PENDING_MESSAGE_MAX_AGE)
+                    .unwrap_or(true)
+            })
             .map(|pm| pm.content.clone())
             .collect();
         self.pending_messages.clear();
@@ -1181,7 +1189,7 @@ impl NoiseSessionManager {
             peer_id
         ));
 
-        // CRITICAL FIX: Check for existing established session first
+        // Keep established sessions stable; ignore redundant handshake packets.
         {
             let sessions = self.sessions.lock().unwrap();
             if let Some(sess) = sessions.get(peer_id) {
@@ -1234,6 +1242,54 @@ impl NoiseSessionManager {
         }
 
         result
+    }
+
+    pub fn handle_incoming_handshake_init(
+        &mut self,
+        peer_id: &str,
+        handshake_data: &[u8],
+    ) -> Result<Option<Vec<u8>>, NoiseError> {
+        let preserved_pending: Vec<String> = {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(existing) = sessions.remove(peer_id) {
+                existing
+                    .pending_messages
+                    .into_iter()
+                    .map(|pm| pm.content)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.insert(
+                peer_id.to_string(),
+                NoiseSession {
+                    peer_id: peer_id.to_string(),
+                    role: NoiseRole::Responder,
+                    state: NoiseSessionState::Uninitialized,
+                    handshake_state: None,
+                    send_cipher: None,
+                    receive_cipher: None,
+                    local_static_key: self.local_static_key.clone(),
+                    remote_static_public_key: None,
+                    sent_handshake_messages: Vec::new(),
+                    handshake_hash: None,
+                    pending_messages: preserved_pending
+                        .into_iter()
+                        .map(|content| PendingMessage {
+                            content,
+                            timestamp: std::time::SystemTime::now(),
+                            retry_count: 0,
+                        })
+                        .collect(),
+                },
+            );
+        }
+
+        self.handle_incoming_handshake(peer_id, handshake_data)
     }
 
     // MARK: - Encryption/Decryption

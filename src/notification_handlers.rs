@@ -1,5 +1,5 @@
 use bloomfilter::Bloom;
-use btleplug::api::{Peripheral as _, WriteType};
+use btleplug::api::{Characteristic, Peripheral as _, WriteType};
 use btleplug::platform::Peripheral;
 use chrono;
 use hex;
@@ -26,9 +26,11 @@ use crate::packet_creation::{create_bitchat_packet, create_bitchat_packet_with_r
 use crate::packet_delivery::{create_delivery_ack, should_send_ack};
 use crate::packet_parser::{generate_keys_and_payload, parse_bitchat_packet};
 use crate::payload_handling::{
-    create_private_noise_payload, parse_bitchat_message_payload, parse_private_noise_ack_payload,
-    parse_private_noise_payload, unpad_message, NOISE_PAYLOAD_DELIVERED,
-    NOISE_PAYLOAD_PRIVATE_MESSAGE, NOISE_PAYLOAD_READ_RECEIPT,
+    create_private_noise_payload, create_verify_noise_response_payload,
+    parse_bitchat_message_payload, parse_private_noise_ack_payload, parse_private_noise_payload,
+    parse_verify_noise_challenge_payload, unpad_message, NOISE_PAYLOAD_DELIVERED,
+    NOISE_PAYLOAD_PRIVATE_MESSAGE, NOISE_PAYLOAD_READ_RECEIPT, NOISE_PAYLOAD_VERIFY_CHALLENGE,
+    NOISE_PAYLOAD_VERIFY_RESPONSE,
 };
 use crate::persistence::{save_state, AppState, EncryptedPassword};
 use crate::terminal_ux::{ChatContext, ChatMode};
@@ -51,6 +53,83 @@ pub fn write_noise_debug_log(message: &str) {
             .as_secs();
         let log_entry = format!("[{}] {}\n", timestamp, message);
         let _ = file.write_all(log_entry.as_bytes());
+    }
+}
+
+async fn send_packet_to_mesh_targets(
+    mesh_targets: &[(Peripheral, Characteristic)],
+    fallback_peripheral: &Peripheral,
+    fallback_cmd_char: &Characteristic,
+    packet: Vec<u8>,
+    my_peer_id: &str,
+    original_msg_type: MessageType,
+) -> Result<(), String> {
+    let owned_targets = if mesh_targets.is_empty() {
+        vec![(fallback_peripheral.clone(), fallback_cmd_char.clone())]
+    } else {
+        mesh_targets.to_vec()
+    };
+
+    let mut sent_any = false;
+    let mut errors = Vec::new();
+    for (idx, (peripheral, cmd_char)) in owned_targets.iter().enumerate() {
+        match crate::fragmentation::send_packet_with_fragmentation_as(
+            peripheral,
+            cmd_char,
+            packet.clone(),
+            my_peer_id,
+            original_msg_type,
+        )
+        .await
+        {
+            Ok(()) => sent_any = true,
+            Err(e) => errors.push(format!("link {}: {}", idx + 1, e)),
+        }
+    }
+
+    if sent_any {
+        Ok(())
+    } else {
+        Err(format!("all mesh sends failed: {}", errors.join("; ")))
+    }
+}
+
+async fn relay_packet_to_mesh_targets(
+    mesh_targets: &[(Peripheral, Characteristic)],
+    fallback_peripheral: &Peripheral,
+    fallback_cmd_char: &Characteristic,
+    packet: Vec<u8>,
+    label: &str,
+) -> Result<usize, String> {
+    let owned_targets = if mesh_targets.is_empty() {
+        vec![(fallback_peripheral.clone(), fallback_cmd_char.clone())]
+    } else {
+        mesh_targets.to_vec()
+    };
+
+    let write_type = if cfg!(target_os = "windows") || packet.len() > 512 {
+        WriteType::WithResponse
+    } else {
+        WriteType::WithoutResponse
+    };
+
+    let mut sent_count = 0usize;
+    let mut errors = Vec::new();
+    for (idx, (peripheral, cmd_char)) in owned_targets.iter().enumerate() {
+        match peripheral.write(cmd_char, &packet, write_type).await {
+            Ok(()) => sent_count += 1,
+            Err(e) => errors.push(format!("link {}: {}", idx + 1, e)),
+        }
+    }
+
+    if sent_count > 0 {
+        Ok(sent_count)
+    } else {
+        Err(format!(
+            "{} relay failed on all mesh links: {}",
+            label,
+            errors.join("; ")
+        ))
     }
 }
 
@@ -401,12 +480,15 @@ pub async fn handle_announce_message(
     let peer_nickname = parse_announcement_nickname(&packet.payload)
         .unwrap_or_else(|| String::from_utf8_lossy(&packet.payload).trim().to_string());
 
-    let is_new_peer = !peers_lock.contains_key(&packet.sender_id_str);
+    let previous_nickname = peers_lock
+        .get(&packet.sender_id_str)
+        .and_then(|peer| peer.nickname.clone());
+    let is_new_peer = previous_nickname.is_none();
     let peer_entry = peers_lock.entry(packet.sender_id_str.clone()).or_default();
 
     peer_entry.nickname = Some(peer_nickname.clone());
 
-    if is_new_peer {
+    if is_new_peer || previous_nickname.as_deref() != Some(peer_nickname.as_str()) {
         let _ = ui_tx
             .send(format!(
                 "__PEER_CONNECTED__:{}:{}",
@@ -1381,9 +1463,11 @@ pub async fn handle_read_receipt_message(_packet: &BitchatPacket, ui_tx: mpsc::S
 // Handler for Noise handshake initiation messages
 pub async fn handle_noise_handshake_init(
     packet: &BitchatPacket,
+    notification_value: &[u8],
     noise_session_manager: &mut NoiseSessionManager,
     peripheral: &Peripheral,
     cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(Peripheral, Characteristic)],
     my_peer_id: &str,
     ui_tx: mpsc::Sender<String>,
 ) {
@@ -1392,18 +1476,45 @@ pub async fn handle_noise_handshake_init(
         packet.sender_id_str
     ));
 
-    // Check if we already have an established session
+    // Transit-only packet: relay and stop.
+    if packet.recipient_id_str.as_deref() != Some(my_peer_id) {
+        if packet.ttl > 1 && notification_value.len() > 2 {
+            let mut relay_data = notification_value.to_vec();
+            relay_data[2] = packet.ttl - 1;
+            match relay_packet_to_mesh_targets(
+                mesh_targets,
+                peripheral,
+                cmd_char,
+                relay_data,
+                "NoiseHandshakeInit",
+            )
+            .await
+            {
+                Ok(sent_count) => {
+                    write_noise_debug_log(&format!(
+                        "[DEBUG] Relayed NoiseHandshakeInit {} -> {:?}, ttl {} -> {}, links={}",
+                        packet.sender_id_str,
+                        packet.recipient_id_str,
+                        packet.ttl,
+                        packet.ttl - 1,
+                        sent_count
+                    ));
+                }
+                Err(e) => {
+                    write_noise_debug_log(&format!(
+                        "[DEBUG] Failed to relay NoiseHandshakeInit {} -> {:?}: {}",
+                        packet.sender_id_str, packet.recipient_id_str, e
+                    ));
+                }
+            }
+        }
+        return;
+    }
+
     write_noise_debug_log(&format!(
         "[DEBUG] Checking if session exists for peer: {}",
         packet.sender_id_str
     ));
-    if noise_session_manager.has_established_session(&packet.sender_id_str) {
-        write_noise_debug_log(&format!(
-            "[DEBUG] Session already established for peer: {}",
-            packet.sender_id_str
-        ));
-        return;
-    }
 
     // Check if we have a session that's not established yet
     if noise_session_manager.has_session(&packet.sender_id_str) {
@@ -1434,9 +1545,15 @@ pub async fn handle_noise_handshake_init(
                     );
 
                     write_noise_debug_log("[DEBUG] About to send handshake response");
-                    match peripheral
-                        .write(cmd_char, &response_packet, WriteType::WithoutResponse)
-                        .await
+                    match send_packet_to_mesh_targets(
+                        mesh_targets,
+                        peripheral,
+                        cmd_char,
+                        response_packet,
+                        my_peer_id,
+                        MessageType::NoiseHandshakeInit,
+                    )
+                    .await
                     {
                         Ok(_) => {
                             write_noise_debug_log("[DEBUG] Successfully sent handshake response");
@@ -1455,6 +1572,7 @@ pub async fn handle_noise_handshake_init(
                                     noise_session_manager,
                                     peripheral,
                                     cmd_char,
+                                    mesh_targets,
                                     my_peer_id,
                                     &packet.sender_id_str,
                                     ui_tx.clone(),
@@ -1488,6 +1606,7 @@ pub async fn handle_noise_handshake_init(
                             noise_session_manager,
                             peripheral,
                             cmd_char,
+                            mesh_targets,
                             my_peer_id,
                             &packet.sender_id_str,
                             ui_tx.clone(),
@@ -1544,9 +1663,15 @@ pub async fn handle_noise_handshake_init(
                             );
 
                             write_noise_debug_log("[DEBUG] About to send handshake response");
-                            match peripheral
-                                .write(cmd_char, &response_packet, WriteType::WithoutResponse)
-                                .await
+                            match send_packet_to_mesh_targets(
+                                mesh_targets,
+                                peripheral,
+                                cmd_char,
+                                response_packet,
+                                my_peer_id,
+                                MessageType::NoiseHandshakeInit,
+                            )
+                            .await
                             {
                                 Ok(_) => {
                                     write_noise_debug_log(
@@ -1568,6 +1693,7 @@ pub async fn handle_noise_handshake_init(
                                             noise_session_manager,
                                             peripheral,
                                             cmd_char,
+                                            mesh_targets,
                                             my_peer_id,
                                             &packet.sender_id_str,
                                             ui_tx.clone(),
@@ -1607,6 +1733,7 @@ pub async fn handle_noise_handshake_init(
                                     noise_session_manager,
                                     peripheral,
                                     cmd_char,
+                                    mesh_targets,
                                     my_peer_id,
                                     &packet.sender_id_str,
                                     ui_tx.clone(),
@@ -1639,9 +1766,11 @@ pub async fn handle_noise_handshake_init(
 // Handler for Noise handshake response messages
 pub async fn handle_noise_handshake_resp(
     packet: &BitchatPacket,
+    notification_value: &[u8],
     noise_session_manager: &mut NoiseSessionManager,
     peripheral: &Peripheral,
     cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(Peripheral, Characteristic)],
     my_peer_id: &str,
     ui_tx: mpsc::Sender<String>,
 ) {
@@ -1649,6 +1778,41 @@ pub async fn handle_noise_handshake_resp(
         "[DEBUG] Starting handle_noise_handshake_resp for peer: {}",
         packet.sender_id_str
     ));
+
+    // Transit-only packet: relay and stop.
+    if packet.recipient_id_str.as_deref() != Some(my_peer_id) {
+        if packet.ttl > 1 && notification_value.len() > 2 {
+            let mut relay_data = notification_value.to_vec();
+            relay_data[2] = packet.ttl - 1;
+            match relay_packet_to_mesh_targets(
+                mesh_targets,
+                peripheral,
+                cmd_char,
+                relay_data,
+                "NoiseHandshakeResp",
+            )
+            .await
+            {
+                Ok(sent_count) => {
+                    write_noise_debug_log(&format!(
+                        "[DEBUG] Relayed NoiseHandshakeResp {} -> {:?}, ttl {} -> {}, links={}",
+                        packet.sender_id_str,
+                        packet.recipient_id_str,
+                        packet.ttl,
+                        packet.ttl - 1,
+                        sent_count
+                    ));
+                }
+                Err(e) => {
+                    write_noise_debug_log(&format!(
+                        "[DEBUG] Failed to relay NoiseHandshakeResp {} -> {:?}: {}",
+                        packet.sender_id_str, packet.recipient_id_str, e
+                    ));
+                }
+            }
+        }
+        return;
+    }
 
     // Check if we have a session for this peer
     write_noise_debug_log(&format!(
@@ -1678,18 +1842,24 @@ pub async fn handle_noise_handshake_resp(
 
             if let Some(response_data) = response {
                 // Wrap the Noise payload in a BitchatPacket.
-                let response_packet = create_bitchat_packet_with_recipient(
-                    my_peer_id,
-                    Some(&packet.sender_id_str), // send it **only** to the peer that asked
-                    MessageType::NoiseHandshakeInit,
-                    response_data,
-                    None, // no signature
-                );
+                            let response_packet = create_bitchat_packet_with_recipient(
+                                my_peer_id,
+                                Some(&packet.sender_id_str), // send it **only** to the peer that asked
+                                MessageType::NoiseHandshakeInit,
+                                response_data,
+                                None, // no signature
+                            );
 
                 write_noise_debug_log("[DEBUG] About to send handshake response");
-                match peripheral
-                    .write(cmd_char, &response_packet, WriteType::WithoutResponse)
-                    .await
+                match send_packet_to_mesh_targets(
+                    mesh_targets,
+                    peripheral,
+                    cmd_char,
+                    response_packet,
+                    my_peer_id,
+                    MessageType::NoiseHandshakeInit,
+                )
+                .await
                 {
                     Ok(_) => {
                         write_noise_debug_log("[DEBUG] Successfully sent handshake response");
@@ -1707,6 +1877,7 @@ pub async fn handle_noise_handshake_resp(
                                 noise_session_manager,
                                 peripheral,
                                 cmd_char,
+                                mesh_targets,
                                 my_peer_id,
                                 &packet.sender_id_str,
                                 ui_tx.clone(),
@@ -1739,6 +1910,7 @@ pub async fn handle_noise_handshake_resp(
                     noise_session_manager,
                     peripheral,
                     cmd_char,
+                    mesh_targets,
                     my_peer_id,
                     &packet.sender_id_str,
                     ui_tx,
@@ -1776,9 +1948,15 @@ pub async fn handle_noise_handshake_resp(
                                 );
 
                                 write_noise_debug_log("[DEBUG] About to send handshake response");
-                                match peripheral
-                                    .write(cmd_char, &response_packet, WriteType::WithoutResponse)
-                                    .await
+                                match send_packet_to_mesh_targets(
+                                    mesh_targets,
+                                    peripheral,
+                                    cmd_char,
+                                    response_packet,
+                                    my_peer_id,
+                                    MessageType::NoiseHandshakeInit,
+                                )
+                                .await
                                 {
                                     Ok(_) => {
                                         write_noise_debug_log(
@@ -1800,6 +1978,7 @@ pub async fn handle_noise_handshake_resp(
                                                 noise_session_manager,
                                                 peripheral,
                                                 cmd_char,
+                                                mesh_targets,
                                                 my_peer_id,
                                                 &packet.sender_id_str,
                                                 ui_tx.clone(),
@@ -1837,6 +2016,7 @@ pub async fn handle_noise_handshake_resp(
                                     noise_session_manager,
                                     peripheral,
                                     cmd_char,
+                                    mesh_targets,
                                     my_peer_id,
                                     &packet.sender_id_str,
                                     ui_tx,
@@ -1885,6 +2065,7 @@ async fn send_pending_messages(
     noise_session_manager: &mut NoiseSessionManager,
     peripheral: &Peripheral,
     cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(Peripheral, Characteristic)],
     my_peer_id: &str,
     target_peer_id: &str,
     ui_tx: mpsc::Sender<String>,
@@ -1958,8 +2139,13 @@ async fn send_pending_messages(
                         packet.len()
                     ));
 
-                    if crate::fragmentation::send_packet_with_fragmentation(
-                        peripheral, cmd_char, packet, my_peer_id,
+                    if send_packet_to_mesh_targets(
+                        mesh_targets,
+                        peripheral,
+                        cmd_char,
+                        packet,
+                        my_peer_id,
+                        crate::data_structures::MessageType::NoiseEncrypted,
                     )
                     .await
                     .is_err()
@@ -2008,6 +2194,7 @@ async fn send_pending_messages(
 // Handler for Noise encrypted messages
 pub async fn handle_noise_encrypted_message(
     packet: &BitchatPacket,
+    notification_value: &[u8],
     noise_manager: &mut NoiseSessionManager,
     peers_lock: &mut HashMap<String, Peer>,
     bloom: &mut Bloom<String>,
@@ -2019,6 +2206,7 @@ pub async fn handle_noise_encrypted_message(
     encryption_service: &EncryptionService,
     peripheral: &Peripheral,
     cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(Peripheral, Characteristic)],
     nickname: &str,
     my_peer_id: &str,
     blocked_peers: &HashSet<String>,
@@ -2037,12 +2225,61 @@ pub async fn handle_noise_encrypted_message(
         &packet.payload[..std::cmp::min(16, packet.payload.len())]
     ));
 
+    // Transit-only packet: relay and stop.
+    if packet.recipient_id_str.as_deref() != Some(my_peer_id) {
+        if packet.ttl > 1 && notification_value.len() > 2 {
+            let mut relay_data = notification_value.to_vec();
+            relay_data[2] = packet.ttl - 1;
+            match relay_packet_to_mesh_targets(
+                mesh_targets,
+                peripheral,
+                cmd_char,
+                relay_data,
+                "NoiseEncrypted",
+            )
+            .await
+            {
+                Ok(sent_count) => {
+                    write_noise_debug_log(&format!(
+                        "[DEBUG] Relayed NoiseEncrypted {} -> {:?}, ttl {} -> {}, links={}",
+                        packet.sender_id_str,
+                        packet.recipient_id_str,
+                        packet.ttl,
+                        packet.ttl - 1,
+                        sent_count
+                    ));
+                }
+                Err(e) => {
+                    write_noise_debug_log(&format!(
+                        "[DEBUG] Failed to relay NoiseEncrypted {} -> {:?}: {}",
+                        packet.sender_id_str, packet.recipient_id_str, e
+                    ));
+                }
+            }
+        }
+        return;
+    }
+
     // Check if we have an established session
     if !noise_manager.is_session_ready(&packet.sender_id_str) {
         write_noise_debug_log(&format!(
-            "[DEBUG] No established session for peer: {}",
+            "[DEBUG] No established session for peer: {}, requesting fresh handshake",
             packet.sender_id_str
         ));
+        if noise_manager.has_session(&packet.sender_id_str) {
+            noise_manager.remove_session(&packet.sender_id_str);
+        }
+        send_handshake_request(
+            &packet.sender_id_str,
+            0,
+            my_peer_id,
+            nickname,
+            peripheral,
+            cmd_char,
+            mesh_targets,
+            ui_tx.clone(),
+        )
+        .await;
         return;
     }
 
@@ -2125,6 +2362,7 @@ pub async fn handle_noise_encrypted_message(
                                     noise_manager,
                                     peripheral,
                                     cmd_char,
+                                    mesh_targets,
                                     my_peer_id,
                                     &packet.sender_id_str,
                                     NOISE_PAYLOAD_DELIVERED,
@@ -2163,6 +2401,60 @@ pub async fn handle_noise_encrypted_message(
                                 ));
                             }
                         }
+                        return;
+                    }
+                    NOISE_PAYLOAD_VERIFY_CHALLENGE => {
+                        match parse_verify_noise_challenge_payload(payload_data) {
+                            Ok((challenge_noise_key_hex, nonce_a)) => {
+                                let my_noise_hex =
+                                    hex::encode(encryption_service.get_static_public_key_data())
+                                        .to_ascii_lowercase();
+                                if challenge_noise_key_hex.to_ascii_lowercase() != my_noise_hex {
+                                    write_noise_debug_log(
+                                        "[DEBUG] Verify challenge ignored (noise key mismatch)",
+                                    );
+                                    return;
+                                }
+
+                                match create_verify_noise_response_payload(
+                                    &challenge_noise_key_hex,
+                                    &nonce_a,
+                                    encryption_service,
+                                ) {
+                                    Ok(response_payload) => {
+                                        send_private_noise_payload(
+                                            noise_manager,
+                                            peripheral,
+                                            cmd_char,
+                                            mesh_targets,
+                                            my_peer_id,
+                                            &packet.sender_id_str,
+                                            &response_payload,
+                                        )
+                                        .await;
+                                        write_noise_debug_log(
+                                            "[DEBUG] Sent verify response payload to peer",
+                                        );
+                                    }
+                                    Err(e) => {
+                                        write_noise_debug_log(&format!(
+                                            "[DEBUG] Failed to create verify response payload: {}",
+                                            e
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                write_noise_debug_log(&format!(
+                                    "[DEBUG] Failed to parse verify challenge payload: {}",
+                                    e
+                                ));
+                            }
+                        }
+                        return;
+                    }
+                    NOISE_PAYLOAD_VERIFY_RESPONSE => {
+                        write_noise_debug_log("[DEBUG] Received verify response payload");
                         return;
                     }
                     _ => {}
@@ -2250,6 +2542,7 @@ async fn send_private_noise_ack(
     noise_manager: &mut NoiseSessionManager,
     peripheral: &Peripheral,
     cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(Peripheral, Characteristic)],
     my_peer_id: &str,
     target_peer_id: &str,
     payload_type: u8,
@@ -2278,13 +2571,64 @@ async fn send_private_noise_ack(
         None,
     );
 
-    if let Err(e) = peripheral
-        .write(cmd_char, &packet, WriteType::WithoutResponse)
-        .await
+    if let Err(e) = send_packet_to_mesh_targets(
+        mesh_targets,
+        peripheral,
+        cmd_char,
+        packet,
+        my_peer_id,
+        MessageType::NoiseEncrypted,
+    )
+    .await
     {
         write_noise_debug_log(&format!(
             "[DEBUG] Failed to send private Noise ack {}: {}",
             message_id, e
+        ));
+    }
+}
+
+async fn send_private_noise_payload(
+    noise_manager: &mut NoiseSessionManager,
+    peripheral: &Peripheral,
+    cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(Peripheral, Characteristic)],
+    my_peer_id: &str,
+    target_peer_id: &str,
+    payload: &[u8],
+) {
+    let encrypted = match noise_manager.encrypt_message(target_peer_id, payload) {
+        Ok(encrypted) => encrypted,
+        Err(e) => {
+            write_noise_debug_log(&format!(
+                "[DEBUG] Failed to encrypt private Noise payload: {:?}",
+                e
+            ));
+            return;
+        }
+    };
+
+    let packet = create_bitchat_packet_with_recipient(
+        my_peer_id,
+        Some(target_peer_id),
+        MessageType::NoiseEncrypted,
+        encrypted,
+        None,
+    );
+
+    if let Err(e) = send_packet_to_mesh_targets(
+        mesh_targets,
+        peripheral,
+        cmd_char,
+        packet,
+        my_peer_id,
+        MessageType::NoiseEncrypted,
+    )
+    .await
+    {
+        write_noise_debug_log(&format!(
+            "[DEBUG] Failed to send private Noise payload: {}",
+            e
         ));
     }
 }
@@ -2450,6 +2794,7 @@ pub async fn send_handshake_request(
     my_nickname: &str,
     peripheral: &Peripheral,
     cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(Peripheral, Characteristic)],
     ui_tx: mpsc::Sender<String>,
 ) {
     write_noise_debug_log(&format!(
@@ -2480,10 +2825,15 @@ pub async fn send_handshake_request(
         None, // No signature
     );
 
-    // Send the packet
-    match peripheral
-        .write(cmd_char, &packet_data, WriteType::WithoutResponse)
-        .await
+    match send_packet_to_mesh_targets(
+        mesh_targets,
+        peripheral,
+        cmd_char,
+        packet_data,
+        my_peer_id,
+        MessageType::HandshakeRequest,
+    )
+    .await
     {
         Ok(_) => {
             write_noise_debug_log(&format!(
@@ -2517,6 +2867,7 @@ pub async fn handle_handshake_request_message(
     noise_session_manager: &mut NoiseSessionManager,
     peripheral: &Peripheral,
     cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(Peripheral, Characteristic)],
     my_peer_id: &str,
     ui_tx: mpsc::Sender<String>,
 ) {
@@ -2617,8 +2968,14 @@ pub async fn handle_handshake_request_message(
                                     handshake_data,
                                     None,
                                 );
-                                match peripheral
-                                    .write(cmd_char, &handshake_packet, WriteType::WithoutResponse)
+                                match send_packet_to_mesh_targets(
+                                    mesh_targets,
+                                    peripheral,
+                                    cmd_char,
+                                    handshake_packet,
+                                    my_peer_id,
+                                    MessageType::NoiseHandshakeInit,
+                                )
                                     .await
                                 {
                                     Ok(_) => {

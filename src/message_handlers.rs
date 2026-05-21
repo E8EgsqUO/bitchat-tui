@@ -1,6 +1,8 @@
 use crate::data_structures::{DebugLevel, DeliveryTracker, MessageType, DEBUG_LEVEL};
 use crate::encryption::EncryptionService;
-use crate::fragmentation::{send_packet_with_fragmentation, should_fragment};
+use crate::fragmentation::{
+    send_packet_with_fragmentation, send_packet_with_fragmentation_as, should_fragment,
+};
 use crate::noise_session::NoiseSessionManager;
 use crate::notification_handlers::write_noise_debug_log;
 use crate::packet_creation::{
@@ -13,7 +15,7 @@ use crate::payload_handling::{
     create_private_noise_payload,
 };
 use crate::terminal_ux::{format_message_display, ChatContext};
-use btleplug::api::{Peripheral, WriteType};
+use btleplug::api::{Characteristic, Peripheral, WriteType};
 use btleplug::platform::Peripheral as PlatformPeripheral;
 use chrono::Local;
 use std::collections::{HashMap, HashSet};
@@ -42,13 +44,78 @@ fn write_send_debug_log(message: &str) {
     }
 }
 
+async fn send_packet_to_mesh_targets(
+    targets: &[(PlatformPeripheral, Characteristic)],
+    packet: Vec<u8>,
+    my_peer_id: &str,
+    original_msg_type: MessageType,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if targets.is_empty() {
+        return Err("No Bluetooth mesh links available".into());
+    }
+
+    let mut sent_any = false;
+    let mut errors = Vec::new();
+    for (idx, (peripheral, cmd_char)) in targets.iter().enumerate() {
+        let result = if should_fragment(&packet) {
+            send_packet_with_fragmentation_as(
+                peripheral,
+                cmd_char,
+                packet.clone(),
+                my_peer_id,
+                original_msg_type,
+            )
+            .await
+        } else {
+            let write_type = if cfg!(target_os = "windows") || packet.len() > 512 {
+                WriteType::WithResponse
+            } else {
+                WriteType::WithoutResponse
+            };
+            peripheral
+                .write(cmd_char, &packet, write_type)
+                .await
+                .map_err(Into::into)
+        };
+
+        match result {
+            Ok(()) => {
+                sent_any = true;
+                write_send_debug_log(&format!(
+                    "mesh send ok: link={}, type={:?}, packet_len={}",
+                    idx + 1,
+                    original_msg_type,
+                    packet.len()
+                ));
+            }
+            Err(e) => {
+                write_send_debug_log(&format!(
+                    "mesh send failed: link={}, type={:?}, packet_len={}, error={}",
+                    idx + 1,
+                    original_msg_type,
+                    packet.len(),
+                    e
+                ));
+                errors.push(format!("link {}: {}", idx + 1, e));
+            }
+        }
+    }
+
+    if sent_any {
+        Ok(())
+    } else {
+        Err(format!("all mesh sends failed: {}", errors.join("; ")).into())
+    }
+}
+
 // Handler for private DM messages using Noise protocol
 pub async fn handle_private_dm_message(
     message: &str,
     target_peer_id: &str,
     noise_session_manager: &mut Option<NoiseSessionManager>,
-    peripheral: &impl btleplug::api::Peripheral,
+    peripheral: &PlatformPeripheral,
     cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(PlatformPeripheral, Characteristic)],
     my_peer_id: &str,
     ui_tx: mpsc::Sender<String>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -114,17 +181,38 @@ pub async fn handle_private_dm_message(
                                     handshake_data,
                                     None,
                                 );
+                                write_send_debug_log(&format!(
+                                    "dm handshake init: target={}, packet_len={}, type=0x{:02x}, ttl={}, flags=0x{:02x}, payload_len={}, packet_hex={}",
+                                    target_peer_id,
+                                    handshake_packet.len(),
+                                    handshake_packet.get(1).copied().unwrap_or_default(),
+                                    handshake_packet.get(2).copied().unwrap_or_default(),
+                                    handshake_packet.get(11).copied().unwrap_or_default(),
+                                    handshake_packet
+                                        .get(12..14)
+                                        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+                                        .unwrap_or_default(),
+                                    hex::encode(&handshake_packet)
+                                ));
 
                                 write_noise_debug_log("[DEBUG] About to send handshake packet");
-                                match peripheral
-                                    .write(
-                                        cmd_char,
-                                        &handshake_packet,
-                                        btleplug::api::WriteType::WithoutResponse,
-                                    )
-                                    .await
+                                let owned_targets = if mesh_targets.is_empty() {
+                                    vec![(peripheral.clone(), cmd_char.clone())]
+                                } else {
+                                    mesh_targets.to_vec()
+                                };
+                                match send_packet_to_mesh_targets(
+                                    &owned_targets,
+                                    handshake_packet,
+                                    my_peer_id,
+                                    crate::data_structures::MessageType::NoiseHandshakeInit,
+                                )
+                                .await
                                 {
                                     Ok(_) => {
+                                        write_send_debug_log(&format!(
+                                            "dm handshake write result: mode=fragmentation, result=Ok(())"
+                                        ));
                                         write_noise_debug_log(
                                             "[DEBUG] Handshake packet sent successfully",
                                         );
@@ -137,6 +225,10 @@ pub async fn handle_private_dm_message(
                                         return Ok(None);
                                     }
                                     Err(e) => {
+                                        write_send_debug_log(&format!(
+                                            "dm handshake write result: mode=fragmentation, result=Err({})",
+                                            e
+                                        ));
                                         write_noise_debug_log(&format!(
                                             "[DEBUG] Failed to send handshake packet: {:?}",
                                             e
@@ -221,25 +313,50 @@ pub async fn handle_private_dm_message(
         encrypted_data.clone(),
         None,
     );
+    write_send_debug_log(&format!(
+        "dm noise encrypted: target={}, packet_len={}, type=0x{:02x}, ttl={}, flags=0x{:02x}, payload_len={}, packet_hex={}",
+        target_peer_id,
+        encrypted_packet.len(),
+        encrypted_packet.get(1).copied().unwrap_or_default(),
+        encrypted_packet.get(2).copied().unwrap_or_default(),
+        encrypted_packet.get(11).copied().unwrap_or_default(),
+        encrypted_packet
+            .get(12..14)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+            .unwrap_or_default(),
+        hex::encode(&encrypted_packet)
+    ));
 
     write_noise_debug_log(&format!(
         "[DEBUG] Created encrypted packet, length: {}, about to send via Bluetooth",
         encrypted_packet.len()
     ));
-    peripheral
-        .write(
-            cmd_char,
-            &encrypted_packet,
-            btleplug::api::WriteType::WithoutResponse,
-        )
-        .await
-        .map_err(|e| {
+    let owned_targets = if mesh_targets.is_empty() {
+        vec![(peripheral.clone(), cmd_char.clone())]
+    } else {
+        mesh_targets.to_vec()
+    };
+    send_packet_to_mesh_targets(
+        &owned_targets,
+        encrypted_packet,
+        my_peer_id,
+        crate::data_structures::MessageType::NoiseEncrypted,
+    )
+    .await
+    .map_err(|e| {
+            write_send_debug_log(&format!(
+                "dm noise encrypted write result: mode=fragmentation, result=Err({})",
+                e
+            ));
             write_noise_debug_log(&format!(
                 "[DEBUG] Failed to send encrypted message via Bluetooth: {:?}",
                 e
             ));
             format!("Failed to send encrypted message: {}", e)
         })?;
+    write_send_debug_log(&format!(
+        "dm noise encrypted write result: mode=fragmentation, result=Ok(())"
+    ));
     write_noise_debug_log(&format!(
         "[DEBUG] Encrypted message sent successfully to peer: {}",
         target_peer_id
@@ -431,8 +548,9 @@ pub async fn handle_regular_message(
     delivery_tracker: &mut DeliveryTracker,
     peripheral: &PlatformPeripheral,
     cmd_char: &btleplug::api::Characteristic,
+    mesh_targets: &[(PlatformPeripheral, Characteristic)],
     ui_tx: mpsc::Sender<String>,
-    _app: &mut crate::tui::app::App,
+    app: &mut crate::tui::app::App,
 ) {
     if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
         let _ = ui_tx
@@ -461,6 +579,7 @@ pub async fn handle_regular_message(
     }
 
     let (message_payload, message_id) = if current_channel.is_none() {
+        // Mesh public chat stays on legacy plain-text payload for iOS compatibility.
         (line.as_bytes().to_vec(), Uuid::new_v4().to_string())
     } else if let Some(ref channel) = current_channel {
         if let Some(channel_key) = channel_keys.get(channel) {
@@ -544,7 +663,12 @@ pub async fn handle_regular_message(
         hex::encode(&message_packet)
     ));
 
-    // THIS BLOCK IS NOW CORRECT
+    let owned_targets = if mesh_targets.is_empty() {
+        vec![(peripheral.clone(), cmd_char.clone())]
+    } else {
+        mesh_targets.to_vec()
+    };
+
     let send_result: Result<(), Box<dyn Error>> = if should_fragment(&message_packet) {
         if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
             let _ = ui_tx
@@ -554,7 +678,13 @@ pub async fn handle_regular_message(
                 ))
                 .await;
         }
-        send_packet_with_fragmentation(peripheral, cmd_char, message_packet, my_peer_id).await
+        send_packet_to_mesh_targets(
+            &owned_targets,
+            message_packet,
+            my_peer_id,
+            MessageType::Message,
+        )
+        .await
     } else {
         if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
             let _ = ui_tx
@@ -564,24 +694,41 @@ pub async fn handle_regular_message(
                 ))
                 .await;
         }
-        let write_type = if cfg!(target_os = "windows") || message_packet.len() > 512 {
-            WriteType::WithResponse
-        } else {
-            WriteType::WithoutResponse
-        };
-        let write_result = peripheral
-            .write(cmd_char, &message_packet, write_type)
-            .await;
+        let write_result = send_packet_to_mesh_targets(
+            &owned_targets,
+            message_packet,
+            my_peer_id,
+            MessageType::Message,
+        )
+        .await;
         write_send_debug_log(&format!(
-            "public message write result: write_type={:?}, result={:?}",
-            write_type,
+            "public message write result: links={}, result={:?}",
+            owned_targets.len(),
             write_result.as_ref().map(|_| ())
         ));
-        write_result.map_err(Into::into)
+        write_result
     };
 
-    if let Err(_) = send_result {
-        let _ = ui_tx.send("\n\x1b[91mâŒ Message delivery failed\x1b[0m\n\x1b[90mConnection lost. Please restart BitChat to reconnect.\x1b[0m\n".to_string()).await;
+    if let Err(e) = send_result {
+        let err_text = e.to_string();
+        let err_lower = err_text.to_ascii_lowercase();
+        let link_closed = err_text.contains("0x80000013")
+            || err_text.contains("对象已关闭")
+            || (err_lower.contains("object") && err_lower.contains("closed"));
+
+        if link_closed {
+            app.trigger_connection_retry();
+            let _ = ui_tx
+                .send(
+                    "system: Bluetooth link dropped while sending; restarting mesh scan automatically. Wait a few seconds, or run /r."
+                        .to_string(),
+                )
+                .await;
+        } else {
+            let _ = ui_tx
+                .send(format!("system: Message delivery failed: {}", err_text))
+                .await;
+        }
         return;
     }
 

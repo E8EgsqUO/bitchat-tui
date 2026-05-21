@@ -191,6 +191,10 @@ fn upload_command_from_freeform_input(value: &str) -> Option<String> {
         return None;
     }
     let unquoted = strip_wrapping_quotes(trimmed);
+    // Do not reinterpret links/deep-links as local upload paths.
+    if unquoted.contains("://") {
+        return None;
+    }
     if !looks_like_upload_file_reference(unquoted) {
         return None;
     }
@@ -708,6 +712,24 @@ mod tests {
         handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
 
         assert_eq!(input_rx.try_recv().unwrap(), "test D:\\t.png");
+    }
+
+    #[test]
+    fn deep_link_is_not_converted_to_upload_command() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        app.focus_area = FocusArea::InputBox;
+        handle_paste_event(
+            &mut app,
+            "bitchat://verify?v=1&noise=abc&sign=def&nick=me&ts=1&nonce=x&sig=y",
+        );
+
+        handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            "bitchat://verify?v=1&noise=abc&sign=def&nick=me&ts=1&nonce=x&sig=y"
+        );
     }
 
     #[test]

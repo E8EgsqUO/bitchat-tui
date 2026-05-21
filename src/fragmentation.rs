@@ -7,8 +7,7 @@ use std::time::Duration;
 use tokio::time;
 
 // Match Swift's fragment size limit: 500 bytes per fragment
-// This aligns with Swift's maxFragmentSize configuration
-// BLE 5.0 supports up to 512 bytes MTU on iOS
+// This aligns with Swift's maxFragmentSize configuration.
 #[allow(dead_code)]
 const MAX_FRAGMENT_SIZE: usize = 500; // Match Swift implementation
 
@@ -129,10 +128,8 @@ pub fn create_fragment_packet(sender_id: &str, fragment: Fragment) -> Vec<u8> {
     create_bitchat_packet(sender_id, msg_type, payload)
 }
 
-// Enable fragmentation to match Swift's 500-byte threshold
-// This fixes the issue where messages disappear after a certain length
 pub fn should_fragment(packet_data: &[u8]) -> bool {
-    packet_data.len() > 500 // Fragment complete packets larger than 500 bytes
+    packet_data.len() > 500
 }
 
 // Swift-compatible packet sending with automatic fragmentation
@@ -326,8 +323,13 @@ pub async fn send_packet_with_fragmentation_as(
             }
 
             // Send fragment
+            let write_type = if cfg!(target_os = "windows") {
+                WriteType::WithResponse
+            } else {
+                WriteType::WithoutResponse
+            };
             if peripheral
-                .write(cmd_char, &fragment_packet, WriteType::WithoutResponse)
+                .write(cmd_char, &fragment_packet, write_type)
                 .await
                 .is_err()
             {
@@ -357,7 +359,7 @@ pub async fn send_packet_with_fragmentation_as(
         Ok(())
     } else {
         // Packet is small enough, send directly
-        let write_type = if packet.len() > 512 {
+        let write_type = if cfg!(target_os = "windows") || packet.len() > 512 {
             WriteType::WithResponse
         } else {
             WriteType::WithoutResponse

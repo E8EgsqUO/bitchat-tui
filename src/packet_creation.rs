@@ -283,14 +283,36 @@ pub fn create_announcement_payload(
     noise_public_key: &[u8],
     signing_public_key: &[u8],
 ) -> Option<Vec<u8>> {
+    create_announcement_payload_with_neighbors(nickname, noise_public_key, signing_public_key, &[])
+}
+
+pub fn create_announcement_payload_with_neighbors(
+    nickname: &str,
+    noise_public_key: &[u8],
+    signing_public_key: &[u8],
+    neighbor_peer_ids: &[String],
+) -> Option<Vec<u8>> {
     let nickname_bytes = nickname.as_bytes();
-    if nickname_bytes.len() > 255 || noise_public_key.len() > 255 || signing_public_key.len() > 255
+    let neighbor_bytes_len = neighbor_peer_ids.len().checked_mul(8)?;
+    if nickname_bytes.len() > 255
+        || noise_public_key.len() > 255
+        || signing_public_key.len() > 255
+        || neighbor_bytes_len > 255
     {
         return None;
     }
 
     let mut data = Vec::with_capacity(
-        2 + nickname_bytes.len() + 2 + noise_public_key.len() + 2 + signing_public_key.len(),
+        2 + nickname_bytes.len()
+            + 2
+            + noise_public_key.len()
+            + 2
+            + signing_public_key.len()
+            + if neighbor_peer_ids.is_empty() {
+                0
+            } else {
+                2 + neighbor_bytes_len
+            },
     );
 
     data.push(0x01);
@@ -304,6 +326,14 @@ pub fn create_announcement_payload(
     data.push(0x03);
     data.push(signing_public_key.len() as u8);
     data.extend_from_slice(signing_public_key);
+
+    if !neighbor_peer_ids.is_empty() {
+        data.push(0x04);
+        data.push(neighbor_bytes_len as u8);
+        for peer_id in neighbor_peer_ids {
+            data.extend_from_slice(&id_bytes_from_str(peer_id));
+        }
+    }
 
     Some(data)
 }
@@ -614,6 +644,25 @@ mod tests {
         assert_eq!(payload[40], 0x03);
         assert_eq!(payload[41], 32);
         assert_eq!(&payload[42..74], &[2; 32]);
+    }
+
+    #[test]
+    fn announcement_payload_can_include_neighbor_list() {
+        let payload = create_announcement_payload_with_neighbors(
+            "anon",
+            &[1; 32],
+            &[2; 32],
+            &[
+                "0102030405060708".to_string(),
+                "1112131415161718".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(payload[74], 0x04);
+        assert_eq!(payload[75], 16);
+        assert_eq!(&payload[76..84], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&payload[84..92], &[17, 18, 19, 20, 21, 22, 23, 24]);
     }
 
     #[test]

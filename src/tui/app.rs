@@ -7,7 +7,7 @@ use ratatui_image::{
     protocol::StatefulProtocol,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
@@ -160,6 +160,7 @@ pub struct App {
     pub geohash_presence: HashMap<String, HashMap<String, i64>>,
     pub blocked: Vec<String>,
     pub verified_identities: Vec<String>,
+    verified_mesh_peer_ids: HashSet<String>,
 
     // Message storage
     pub channel_messages: HashMap<String, Vec<Message>>,
@@ -275,6 +276,7 @@ impl App {
             geohash_presence: HashMap::new(),
             blocked: Vec::new(),
             verified_identities: Vec::new(),
+            verified_mesh_peer_ids: HashSet::new(),
             channel_messages,
             dm_messages: HashMap::new(),
             sidebar_state: SidebarMenuState::new(),
@@ -526,6 +528,14 @@ impl App {
         let person = person.trim().trim_start_matches('@');
         if person.is_empty() || Self::parse_geohash_dm_key(person).is_some() {
             return false;
+        }
+        if self
+            .mesh_people_peer_ids
+            .get(person)
+            .map(|peer_id| self.verified_mesh_peer_ids.contains(peer_id))
+            .unwrap_or(false)
+        {
+            return true;
         }
         self.verified_identities.iter().any(|entry| {
             Self::verified_label_from_entry(entry)
@@ -1658,6 +1668,9 @@ impl App {
         line.contains("Scanning for bitchat service")
             || line.contains("Restarting Bluetooth mesh scan...")
             || line.starts_with("[DM] ")
+            || line.contains("Bluetooth mesh link ready:")
+            || line.contains("Failed to start DM handshake:")
+            || line.contains("Failed to initiate DM handshake:")
             || line.contains("No BitChat service found")
             || line.contains("Another device is running BitChat")
             || line.starts_with("Scan timed out after")
@@ -2129,6 +2142,18 @@ impl App {
         next.sort();
         next.dedup();
         self.verified_identities = next;
+    }
+
+    pub fn set_mesh_peer_verified(&mut self, peer_id: &str, verified: bool) {
+        let peer_id = peer_id.trim();
+        if peer_id.is_empty() {
+            return;
+        }
+        if verified {
+            self.verified_mesh_peer_ids.insert(peer_id.to_string());
+        } else {
+            self.verified_mesh_peer_ids.remove(peer_id);
+        }
     }
 
     pub fn update_sidebar_flat_selection(&mut self) {
@@ -2607,6 +2632,20 @@ mod tests {
 
         assert_eq!(app.people, vec!["anon7301".to_string()]);
         assert!(app.mesh_people_peer_ids.contains_key("anon7301"));
+    }
+
+    #[test]
+    fn mesh_person_verified_can_match_peer_id_not_only_label() {
+        let mut app = App::new_with_nickname("me".to_string());
+
+        app.add_log_message("__PEER_CONNECTED__:anon7301:peer7301".to_string());
+        app.update_verified_identities(vec!["fingerprint:1d0eb75fc2".to_string()]);
+
+        assert!(!app.is_mesh_person_verified("anon7301"));
+
+        app.set_mesh_peer_verified("peer7301", true);
+
+        assert!(app.is_mesh_person_verified("anon7301"));
     }
 
     #[test]
