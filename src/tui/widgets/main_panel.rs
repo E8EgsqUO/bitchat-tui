@@ -608,12 +608,11 @@ fn format_message_body(msg: &Message, role: MessageRole) -> String {
 }
 
 fn resolved_sender(app: &App, msg: &Message, geohash_channel: Option<&str>) -> String {
+    if let Some(channel) = geohash_channel {
+        return app.display_geohash_sender(channel, msg);
+    }
+
     if let Some(pubkey) = &msg.sender_pubkey {
-        if let Some(channel) = geohash_channel {
-            return app
-                .geohash_person_name_by_pubkey(channel, pubkey)
-                .unwrap_or_else(|| App::short_pubkey(pubkey));
-        }
         return App::short_pubkey(pubkey);
     }
     msg.sender.clone()
@@ -634,12 +633,11 @@ fn message_group_key(app: &App, message: &Message, geohash_channel: Option<&str>
         MessageRole::System => "system".to_string(),
         MessageRole::SelfUser => "self".to_string(),
         MessageRole::Other => {
+            if let Some(channel) = geohash_channel {
+                return format!("other:{}", app.display_geohash_sender(channel, message));
+            }
+
             if let Some(pubkey) = &message.sender_pubkey {
-                if let Some(channel) = geohash_channel {
-                    if let Some(name) = app.geohash_person_name_by_pubkey(channel, pubkey) {
-                        return format!("other:{name}:{pubkey}");
-                    }
-                }
                 return format!("other:{pubkey}");
             }
             format!("other:{}", message.sender)

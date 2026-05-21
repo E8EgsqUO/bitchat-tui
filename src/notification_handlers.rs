@@ -156,6 +156,41 @@ fn parse_announcement_nickname(payload: &[u8]) -> Option<String> {
     None
 }
 
+fn looks_like_hex_identity(value: &str) -> bool {
+    let trimmed = value.trim().trim_start_matches('@');
+    (trimmed.len() == 64 || trimmed.len() == 128)
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+}
+
+fn fallback_sender_name(peer_id: &str) -> String {
+    let short = peer_id.chars().take(4).collect::<String>();
+    format!("anon{}", short)
+}
+
+fn resolve_sender_display_name(
+    sender_field: &str,
+    sender_peer_id: &str,
+    peers_lock: &HashMap<String, Peer>,
+) -> String {
+    let peer_name = peers_lock
+        .get(sender_peer_id)
+        .and_then(|peer| peer.nickname.clone())
+        .filter(|name| !name.trim().is_empty());
+
+    let sender_trimmed = sender_field.trim();
+    if sender_trimmed.is_empty() {
+        return peer_name.unwrap_or_else(|| fallback_sender_name(sender_peer_id));
+    }
+
+    if looks_like_hex_identity(sender_trimmed) || sender_trimmed.starts_with("npub") {
+        return peer_name.unwrap_or_else(|| fallback_sender_name(sender_peer_id));
+    }
+
+    sender_trimmed.to_string()
+}
+
 const MAX_FILE_TRANSFER_BYTES: usize = 1024 * 1024;
 const TUI_FILE_TRANSFER_MIME: &str = "application/vnd.bitchat-tui.file";
 const TUI_FILE_TRANSFER_MAGIC: &[u8] = b"bitchat-tui-file-v1";
@@ -746,8 +781,8 @@ pub async fn handle_message_packet(
         if !bloom.check(&message.id) {
             bloom.set(&message.id);
 
-            // Use the sender from the parsed message instead of the peer nickname
-            let sender_nick = &message.sender;
+            let sender_nick =
+                resolve_sender_display_name(&message.sender, &packet.sender_id_str, peers_lock);
 
             // Add the sender to peers list if they're not already there
             if !peers_lock.contains_key(&packet.sender_id_str) {
@@ -831,7 +866,7 @@ pub async fn handle_message_packet(
 
                 chat_context.last_private_sender =
                     Some((packet.sender_id_str.clone(), sender_nick.to_string()));
-                chat_context.add_dm(sender_nick, &packet.sender_id_str);
+                chat_context.add_dm(&sender_nick, &packet.sender_id_str);
 
                 // Send structured message for TUI to parse
                 let structured_msg = format!(
@@ -1078,16 +1113,22 @@ pub async fn handle_fragment_packet(
                             bloom.set(&message.id);
 
                             // Add the sender to peers list if they're not already there
+                            let sender_nick = resolve_sender_display_name(
+                                &message.sender,
+                                &reassembled.sender_id_str,
+                                peers_lock,
+                            );
+
                             if !peers_lock.contains_key(&reassembled.sender_id_str) {
                                 let peer_entry = peers_lock
                                     .entry(reassembled.sender_id_str.clone())
                                     .or_default();
-                                peer_entry.nickname = Some(message.sender.clone());
+                                peer_entry.nickname = Some(sender_nick.clone());
                                 if unsafe { DEBUG_LEVEL >= DebugLevel::Basic } {
                                     let _ = ui_tx
                                         .send(format!(
                                             "[PEER] Discovered new peer via fragment: {} ({})\n",
-                                            message.sender, reassembled.sender_id_str
+                                            sender_nick, reassembled.sender_id_str
                                         ))
                                         .await;
                                 }
@@ -1095,12 +1136,10 @@ pub async fn handle_fragment_packet(
                                 let _ = ui_tx
                                     .send(format!(
                                         "__PEER_CONNECTED__:{}:{}",
-                                        message.sender, reassembled.sender_id_str
+                                        sender_nick, reassembled.sender_id_str
                                     ))
                                     .await;
                             }
-
-                            let sender_nick = &message.sender;
 
                             if let Some(ch) = &message.channel {
                                 discovered_channels.insert(ch.clone());
@@ -1144,7 +1183,7 @@ pub async fn handle_fragment_packet(
                             if is_private_message {
                                 chat_context.last_private_sender = Some((
                                     reassembled.sender_id_str.clone(),
-                                    sender_nick.to_string(),
+                                    sender_nick,
                                 ));
                             }
                         }
@@ -2655,17 +2694,22 @@ async fn handle_decrypted_message(
 ) {
     if !bloom.check(&message.id) {
         bloom.set(&message.id);
+        let sender_nick = resolve_sender_display_name(
+            &message.sender,
+            &inner_packet.sender_id_str,
+            peers_lock,
+        );
 
         // Add the sender to peers list if not already there
         if !peers_lock.contains_key(&inner_packet.sender_id_str) {
             let peer_entry = peers_lock
                 .entry(inner_packet.sender_id_str.clone())
                 .or_default();
-            peer_entry.nickname = Some(message.sender.clone());
+            peer_entry.nickname = Some(sender_nick.clone());
             let _ = ui_tx
                 .send(format!(
                     "__PEER_CONNECTED__:{}:{}",
-                    message.sender, inner_packet.sender_id_str
+                    sender_nick, inner_packet.sender_id_str
                 ))
                 .await;
         }
@@ -2707,13 +2751,13 @@ async fn handle_decrypted_message(
 
         // This is a private message since it was Noise-encrypted
         chat_context.last_private_sender =
-            Some((inner_packet.sender_id_str.clone(), message.sender.clone()));
-        chat_context.add_dm(&message.sender, &inner_packet.sender_id_str);
+            Some((inner_packet.sender_id_str.clone(), sender_nick.clone()));
+        chat_context.add_dm(&sender_nick, &inner_packet.sender_id_str);
 
         // Send structured message for TUI
         let structured_msg = format!(
             "__DM__:{}:{}:{}:{}",
-            message.sender,
+            sender_nick,
             timestamp.format("%H%M"),
             timestamp_epoch,
             display_content
