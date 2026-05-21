@@ -34,6 +34,7 @@ use crate::payload_handling::{
 };
 use crate::persistence::{save_state, AppState, EncryptedPassword};
 use crate::terminal_ux::{ChatContext, ChatMode};
+use crate::tui::app::bitchat_debug_enabled;
 
 // MARK: - Debug Logging
 
@@ -2840,24 +2841,28 @@ pub async fn send_handshake_request(
                 "[DEBUG] Handshake request sent successfully to {}",
                 target_peer_id
             ));
-            let _ = ui_tx
-                .send(format!(
-                    "[DEBUG] Sent handshake request to {}\n",
-                    target_peer_id
-                ))
-                .await;
+            if bitchat_debug_enabled() {
+                let _ = ui_tx
+                    .send(format!(
+                        "[DEBUG] Sent handshake request to {}\n",
+                        target_peer_id
+                    ))
+                    .await;
+            }
         }
         Err(e) => {
             write_noise_debug_log(&format!(
                 "[DEBUG] Failed to send handshake request: {:?}",
                 e
             ));
-            let _ = ui_tx
-                .send(format!(
-                    "[ERROR] Failed to send handshake request: {:?}\n",
-                    e
-                ))
-                .await;
+            if bitchat_debug_enabled() {
+                let _ = ui_tx
+                    .send(format!(
+                        "[ERROR] Failed to send handshake request: {:?}\n",
+                        e
+                    ))
+                    .await;
+            }
         }
     }
 }
