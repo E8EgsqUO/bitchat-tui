@@ -58,8 +58,6 @@ async fn send_packet_to_mesh_targets(
 }
 
 const MAX_FILE_TRANSFER_BYTES: u64 = 1024 * 1024;
-const TUI_FILE_TRANSFER_MIME: &str = "application/vnd.bitchat-tui.file";
-const TUI_FILE_TRANSFER_MAGIC: &[u8] = b"bitchat-tui-file-v1";
 
 fn strip_display_suffix(target: &str) -> &str {
     let trimmed = target.trim();
@@ -111,7 +109,8 @@ fn normalize_block_target(value: &str) -> String {
         trimmed = base.to_string();
     }
     if let Some((base, suffix)) = trimmed.rsplit_once('#') {
-        if !base.is_empty() && suffix.len() == 4 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        if !base.is_empty() && suffix.len() == 4 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
             trimmed = base.to_string();
         }
     }
@@ -130,7 +129,8 @@ fn parse_name_with_optional_suffix(value: &str) -> (String, Option<String>) {
         }
     }
     if let Some((base, suffix)) = normalized.rsplit_once('#') {
-        if !base.is_empty() && suffix.len() == 4 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        if !base.is_empty() && suffix.len() == 4 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
             return (normalize_block_target(base), Some(suffix.to_string()));
         }
     }
@@ -187,7 +187,10 @@ fn names_match(lhs: &str, rhs: &str) -> bool {
 
 fn merge_manual_blocked_entries(blocked_entries: &mut Vec<String>, manual_entries: &[String]) {
     for entry in manual_entries {
-        if blocked_entries.iter().any(|existing| names_match(existing, entry)) {
+        if blocked_entries
+            .iter()
+            .any(|existing| names_match(existing, entry))
+        {
             continue;
         }
         if !entry.trim().is_empty() {
@@ -198,10 +201,15 @@ fn merge_manual_blocked_entries(blocked_entries: &mut Vec<String>, manual_entrie
 }
 
 fn add_manual_block_entry(app: &mut crate::tui::app::App, target_name: &str) {
-    if app.blocked.iter().any(|entry| names_match(entry, target_name)) {
+    if app
+        .blocked
+        .iter()
+        .any(|entry| names_match(entry, target_name))
+    {
         return;
     }
-    app.blocked.push(target_name.trim().trim_start_matches('@').to_string());
+    app.blocked
+        .push(target_name.trim().trim_start_matches('@').to_string());
     app.blocked.sort();
 }
 
@@ -428,6 +436,16 @@ fn push_tlv_u16(payload: &mut Vec<u8>, field_type: u8, value: &[u8]) -> Result<(
     Ok(())
 }
 
+fn push_tlv_u32(payload: &mut Vec<u8>, field_type: u8, value: &[u8]) -> Result<(), String> {
+    if value.len() > u32::MAX as usize {
+        return Err("File payload is too large".to_string());
+    }
+    payload.push(field_type);
+    payload.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    payload.extend_from_slice(value);
+    Ok(())
+}
+
 fn infer_mime_type(path: &Path) -> &'static str {
     match path
         .extension()
@@ -463,19 +481,14 @@ fn create_file_transfer_payload(
         .ok_or_else(|| "File path must include a valid file name".to_string())?;
 
     let mut payload = Vec::with_capacity(file_name.len() + content.len() + 64);
-    push_tlv_u16(&mut payload, 0x7F, TUI_FILE_TRANSFER_MAGIC)?;
     push_tlv_u16(&mut payload, 0x01, file_name.as_bytes())?;
 
     payload.push(0x02);
-    payload.extend_from_slice(&8u16.to_be_bytes());
-    payload.extend_from_slice(&(content.len() as u64).to_be_bytes());
-
-    push_tlv_u16(&mut payload, 0x03, TUI_FILE_TRANSFER_MIME.as_bytes())?;
-    push_tlv_u16(&mut payload, 0x06, infer_mime_type(path).as_bytes())?;
-
-    payload.push(0x04);
+    payload.extend_from_slice(&4u16.to_be_bytes());
     payload.extend_from_slice(&(content.len() as u32).to_be_bytes());
-    payload.extend_from_slice(content);
+
+    push_tlv_u16(&mut payload, 0x03, infer_mime_type(path).as_bytes())?;
+    push_tlv_u32(&mut payload, 0x04, content)?;
 
     if let Some(channel) = channel {
         push_tlv_u16(&mut payload, 0x05, channel.as_bytes())?;
@@ -996,8 +1009,7 @@ pub async fn handle_dm_command(
                     peer.nickname
                         .as_deref()
                         .map(|nick| {
-                            strip_display_suffix(nick.trim_start_matches('@'))
-                                .to_ascii_lowercase()
+                            strip_display_suffix(nick.trim_start_matches('@')).to_ascii_lowercase()
                                 == normalized_target
                         })
                         .unwrap_or(false)
@@ -1123,33 +1135,33 @@ pub async fn handle_dm_command(
             }
 
             let message_id = Uuid::new_v4().to_string();
-            let noise_payload =
-                match create_private_noise_payload(&message_id, private_message) {
-                    Ok(payload) => payload,
-                    Err(e) => {
-                        let _ = ui_tx
-                            .send(format!(
-                                "\n\x1b[91m❌ Failed to build DM payload: {}\x1b[0m\n",
-                                e
-                            ))
-                            .await;
-                        return true;
-                    }
-                };
-            delivery_tracker.track_message(message_id.clone(), private_message.to_string(), true);
-
-            let encrypted = match _noise_session_manager.encrypt_message(&target_peer_id, &noise_payload) {
-                Ok(encrypted) => encrypted,
+            let noise_payload = match create_private_noise_payload(&message_id, private_message) {
+                Ok(payload) => payload,
                 Err(e) => {
                     let _ = ui_tx
                         .send(format!(
-                            "\n\x1b[91m❌ Failed to encrypt private message: {}\x1b[0m\n",
+                            "\n\x1b[91m❌ Failed to build DM payload: {}\x1b[0m\n",
                             e
                         ))
                         .await;
                     return true;
                 }
             };
+            delivery_tracker.track_message(message_id.clone(), private_message.to_string(), true);
+
+            let encrypted =
+                match _noise_session_manager.encrypt_message(&target_peer_id, &noise_payload) {
+                    Ok(encrypted) => encrypted,
+                    Err(e) => {
+                        let _ = ui_tx
+                            .send(format!(
+                                "\n\x1b[91m❌ Failed to encrypt private message: {}\x1b[0m\n",
+                                e
+                            ))
+                            .await;
+                        return true;
+                    }
+                };
 
             let packet = create_bitchat_packet_with_recipient(
                 my_peer_id,
@@ -1650,5 +1662,59 @@ mod tests {
 
         assert_eq!(offer.target_nickname, None);
         assert_eq!(offer.path, "./photo.png");
+    }
+
+    #[test]
+    fn creates_ios_compatible_image_file_transfer_payload() {
+        let payload =
+            create_file_transfer_payload(Path::new("photo.png"), b"pngdata", Some("#public"))
+                .unwrap();
+
+        let mut offset = 0usize;
+        assert_eq!(payload[offset], 0x01);
+        offset += 1;
+        let name_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        assert_eq!(&payload[offset..offset + name_len], b"photo.png");
+        offset += name_len;
+
+        assert_eq!(payload[offset], 0x02);
+        offset += 1;
+        assert_eq!(
+            u16::from_be_bytes([payload[offset], payload[offset + 1]]),
+            4
+        );
+        offset += 2;
+        assert_eq!(
+            u32::from_be_bytes([
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3]
+            ]),
+            7
+        );
+        offset += 4;
+
+        assert_eq!(payload[offset], 0x03);
+        offset += 1;
+        let mime_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        assert_eq!(&payload[offset..offset + mime_len], b"image/png");
+        offset += mime_len;
+
+        assert_eq!(payload[offset], 0x04);
+        offset += 1;
+        assert_eq!(
+            u32::from_be_bytes([
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3]
+            ]),
+            7
+        );
+        offset += 4;
+        assert_eq!(&payload[offset..offset + 7], b"pngdata");
     }
 }

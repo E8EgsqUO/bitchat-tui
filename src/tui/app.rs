@@ -1,11 +1,11 @@
 // src/tui/app.rs
 
 use chrono::{Local, TimeZone};
-use regex::Regex;
 use ratatui_image::{
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
 };
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -917,7 +917,8 @@ impl App {
                 return;
             }
             let (epoch_raw, content) = Self::split_optional_epoch_and_content(rest);
-            let (timestamp, timestamp_epoch) = Self::parse_display_and_epoch(timestamp_raw, epoch_raw);
+            let (timestamp, timestamp_epoch) =
+                Self::parse_display_and_epoch(timestamp_raw, epoch_raw);
 
             let sender_clone = sender.clone();
             let msg = Message {
@@ -1202,7 +1203,8 @@ impl App {
             };
 
             let (epoch_raw, content) = Self::split_optional_epoch_and_content(remainder);
-            let (timestamp, timestamp_epoch) = Self::parse_display_and_epoch(timestamp_raw, epoch_raw);
+            let (timestamp, timestamp_epoch) =
+                Self::parse_display_and_epoch(timestamp_raw, epoch_raw);
 
             if is_geohash {
                 if !self.channels.contains(&channel) {
@@ -1582,7 +1584,10 @@ impl App {
             self.channel_messages.entry(channel).or_default().push(msg);
         } else {
             let current_channel = self.get_selected_channel_name();
-            self.channel_messages.entry(current_channel).or_default().push(msg);
+            self.channel_messages
+                .entry(current_channel)
+                .or_default()
+                .push(msg);
         }
         self.follow_or_mark_new_message();
     }
@@ -1979,10 +1984,7 @@ impl App {
     }
 
     fn normalize_mesh_dm_target(value: &str) -> String {
-        value
-            .trim()
-            .trim_start_matches('@')
-            .to_ascii_lowercase()
+        value.trim().trim_start_matches('@').to_ascii_lowercase()
     }
 
     fn canonical_geohash_dm_target(&self, channel: &str, target: &str) -> String {
@@ -1995,7 +1997,10 @@ impl App {
             return true;
         }
 
-        match (Self::parse_geohash_dm_key(left), Self::parse_geohash_dm_key(right)) {
+        match (
+            Self::parse_geohash_dm_key(left),
+            Self::parse_geohash_dm_key(right),
+        ) {
             (Some((left_channel, left_target)), Some((right_channel, right_target))) => {
                 if left_channel != right_channel {
                     return false;

@@ -192,9 +192,8 @@ pub fn create_verify_noise_response_payload(
         return Err("Verify response signature too long");
     }
 
-    let mut payload = Vec::with_capacity(
-        1 + 2 + noise_key_bytes.len() + 2 + nonce_a.len() + 2 + signature.len(),
-    );
+    let mut payload =
+        Vec::with_capacity(1 + 2 + noise_key_bytes.len() + 2 + nonce_a.len() + 2 + signature.len());
     payload.push(NOISE_PAYLOAD_VERIFY_RESPONSE);
 
     payload.push(0x01);
@@ -694,7 +693,10 @@ mod tests {
 
         let payload = create_verify_noise_response_payload(&noise_key_hex, &nonce, &encryption)
             .expect("response should be created");
-        assert_eq!(payload.first().copied(), Some(NOISE_PAYLOAD_VERIFY_RESPONSE));
+        assert_eq!(
+            payload.first().copied(),
+            Some(NOISE_PAYLOAD_VERIFY_RESPONSE)
+        );
         let (parsed_noise, parsed_nonce, parsed_sig) =
             parse_verify_noise_response_payload(&payload[1..]).expect("response should parse");
         assert_eq!(parsed_noise, noise_key_hex);

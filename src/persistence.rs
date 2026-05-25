@@ -20,21 +20,21 @@ pub struct EncryptedPassword {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AppState {
     // Match iOS UserDefaults keys exactly
-    pub nickname: Option<String>,                     // bitchat.nickname
-    pub blocked_peers: HashSet<String>,               // bitchat.blockedUsers (SHA256 fingerprints)
+    pub nickname: Option<String>,       // bitchat.nickname
+    pub blocked_peers: HashSet<String>, // bitchat.blockedUsers (SHA256 fingerprints)
     #[serde(default)]
-    pub blocked_names: Vec<String>,                   // Local name-based blocks for UI filtering
+    pub blocked_names: Vec<String>, // Local name-based blocks for UI filtering
     #[serde(default)]
-    pub nostr_aliases: HashMap<String, String>,       // Nostr pubkey -> local alias
+    pub nostr_aliases: HashMap<String, String>, // Nostr pubkey -> local alias
     #[serde(default)]
-    pub verified_labels: HashMap<String, String>,     // Mesh fingerprint -> local label
-    pub channel_creators: HashMap<String, String>,    // bitchat.channelCreators
-    pub joined_channels: Vec<String>,                 // bitchat.joinedChannels
+    pub verified_labels: HashMap<String, String>, // Mesh fingerprint -> local label
+    pub channel_creators: HashMap<String, String>, // bitchat.channelCreators
+    pub joined_channels: Vec<String>,   // bitchat.joinedChannels
     pub password_protected_channels: HashSet<String>, // bitchat.passwordProtectedChannels
     pub channel_key_commitments: HashMap<String, String>, // bitchat.channelKeyCommitments
-    pub favorites: HashSet<String>,                   // bitchat.favorites (SHA256 fingerprints)
-    pub identity_key: Option<Vec<u8>>,                // bitchat.identityKey (Ed25519 private key)
-    pub noise_static_key: Option<Vec<u8>>,            // bitchat.noiseStaticKey (X25519 private key)
+    pub favorites: HashSet<String>,     // bitchat.favorites (SHA256 fingerprints)
+    pub identity_key: Option<Vec<u8>>,  // bitchat.identityKey (Ed25519 private key)
+    pub noise_static_key: Option<Vec<u8>>, // bitchat.noiseStaticKey (X25519 private key)
     pub encrypted_channel_passwords: HashMap<String, EncryptedPassword>, // Encrypted channel passwords
 }
 

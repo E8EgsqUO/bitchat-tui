@@ -1,6 +1,8 @@
-use btleplug::api::{Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType};
-use btleplug::platform::{Manager, Peripheral};
 use base64::Engine as _;
+use btleplug::api::{
+    Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
+};
+use btleplug::platform::{Manager, Peripheral};
 use ed25519_dalek::{Signature, VerifyingKey};
 use qrcode::{render::unicode, QrCode};
 
@@ -29,16 +31,20 @@ const UI_EVENT_BUFFER_SIZE: usize = 4096;
 const MAX_UI_MESSAGES_PER_TICK: usize = 512;
 const MESH_ANNOUNCE_INTERVAL: StdDuration = StdDuration::from_secs(6);
 const MESH_MAX_CENTRAL_LINKS: usize = 4;
-const MESH_MULTI_LINK_GRACE: StdDuration = StdDuration::from_secs(4);
 const MESH_BACKGROUND_REFRESH_COOLDOWN: StdDuration = StdDuration::from_secs(3);
-const MESH_BACKGROUND_SCAN_INTERVAL: StdDuration = StdDuration::from_secs(6);
-const MESH_BACKGROUND_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+const MESH_BACKGROUND_SCAN_INTERVAL: StdDuration = StdDuration::from_secs(9);
+const MESH_BACKGROUND_SCAN_TIMEOUT: Duration = Duration::from_secs(4);
 const MESH_BACKGROUND_SCAN_GRACE: StdDuration = StdDuration::from_secs(1);
 const MESH_LINK_HEALTH_CHECK_INTERVAL: StdDuration = StdDuration::from_secs(10);
 const MESH_SCAN_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MESH_PRIMARY_SCAN_TIMEOUT: Duration = Duration::from_secs(15);
+const MESH_PRIMARY_SCAN_GRACE: StdDuration = StdDuration::from_secs(4);
+const MESH_PRIMARY_RETRY_FAST_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const MESH_PRIMARY_RETRY_SLOW_INTERVAL: StdDuration = StdDuration::from_secs(15);
+const MESH_PRIMARY_RETRY_FAST_WINDOW: StdDuration = StdDuration::from_secs(60);
 
 // Debug logging function
-fn write_debug_log(message: &str) {
+pub(crate) fn write_debug_log(message: &str) {
     if !crate::data_structures::file_logging_enabled() {
         return;
     }
@@ -59,6 +65,7 @@ fn write_debug_log(message: &str) {
 
 mod binary_encoding;
 mod binary_protocol_utils;
+mod ble_peripheral;
 mod command_handling;
 mod compression;
 mod data_structures;
@@ -80,7 +87,7 @@ mod wormhole_transfer;
 
 use crate::data_structures::{
     DebugLevel, DeliveryTracker, FragmentCollector, MessageType, Peer, BITCHAT_CHARACTERISTIC_UUID,
-    BITCHAT_SERVICE_UUID, DEBUG_LEVEL,
+    BITCHAT_SERVICE_UUID, BITCHAT_TEST_SERVICE_UUID, DEBUG_LEVEL,
 };
 use crate::noise_session::NoiseSessionManager;
 use crate::notification_handlers::handle_handshake_request_message;
@@ -148,7 +155,10 @@ fn mesh_send_targets(mesh_links: &[MeshLink]) -> Vec<(Peripheral, Characteristic
 fn merge_mesh_links(mesh_links: &mut Vec<MeshLink>, new_links: Vec<MeshLink>) -> bool {
     let mut changed = false;
     for link in new_links {
-        if let Some(existing_idx) = mesh_links.iter().position(|existing| existing.id == link.id) {
+        if let Some(existing_idx) = mesh_links
+            .iter()
+            .position(|existing| existing.id == link.id)
+        {
             mesh_links[existing_idx] = link;
             changed = true;
         } else if mesh_links.len() < MESH_MAX_CENTRAL_LINKS {
@@ -206,7 +216,12 @@ async fn relay_raw_packet_to_mesh_links(mesh_links: &[MeshLink], packet: &[u8]) 
 
     let mut sent = 0usize;
     for link in mesh_links {
-        if link.peripheral.write(&link.cmd, packet, write_type).await.is_ok() {
+        if link
+            .peripheral
+            .write(&link.cmd, packet, write_type)
+            .await
+            .is_ok()
+        {
             sent += 1;
         }
     }
@@ -230,6 +245,28 @@ fn spawn_background_mesh_scan(
         MESH_BACKGROUND_SCAN_GRACE,
         false,
     )
+}
+
+fn spawn_primary_mesh_scan(
+    ui_tx: mpsc::Sender<String>,
+) -> tokio::task::JoinHandle<Result<Vec<Peripheral>, Box<dyn std::error::Error + Send + Sync>>> {
+    spawn_bluetooth_scan(
+        ui_tx,
+        "__CONNECTED__",
+        "__ERROR__",
+        HashSet::new(),
+        MESH_PRIMARY_SCAN_TIMEOUT,
+        MESH_PRIMARY_SCAN_GRACE,
+        true,
+    )
+}
+
+fn primary_retry_interval(window_started_at: std::time::Instant) -> StdDuration {
+    if window_started_at.elapsed() <= MESH_PRIMARY_RETRY_FAST_WINDOW {
+        MESH_PRIMARY_RETRY_FAST_INTERVAL
+    } else {
+        MESH_PRIMARY_RETRY_SLOW_INTERVAL
+    }
 }
 
 async fn retain_connected_mesh_links(mesh_links: &mut Vec<MeshLink>) -> bool {
@@ -461,7 +498,23 @@ async fn setup_bluetooth_connections(
         }
     };
 
-    adapter.start_scan(ScanFilter::default()).await?;
+    let use_targeted_scan = std::env::var("BITCHAT_TARGETED_SCAN")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false);
+    if use_targeted_scan {
+        let targeted_filter = ScanFilter {
+            services: vec![BITCHAT_SERVICE_UUID, BITCHAT_TEST_SERVICE_UUID],
+        };
+        if let Err(scan_err) = adapter.start_scan(targeted_filter).await {
+            write_debug_log(&format!(
+                "Targeted BLE scan failed ({}); falling back to default scan filter",
+                scan_err
+            ));
+            adapter.start_scan(ScanFilter::default()).await?;
+        }
+    } else {
+        adapter.start_scan(ScanFilter::default()).await?;
+    }
 
     if debug_enabled {
         ui_tx
@@ -505,6 +558,11 @@ async fn setup_bluetooth_connections(
                     ))
                     .await
                     .map_err(|e| e.to_string())?;
+            }
+
+            if cfg!(target_os = "windows") {
+                let _ = p.disconnect().await;
+                time::sleep(Duration::from_millis(350)).await;
             }
 
             if let Err(e) = p.connect().await {
@@ -695,7 +753,11 @@ async fn initialize_mesh_link(
             "required bitchat characteristic {} was not found on {}. Available characteristics: {}",
             BITCHAT_CHARACTERISTIC_UUID,
             link_id,
-            if available.is_empty() { "none" } else { &available }
+            if available.is_empty() {
+                "none"
+            } else {
+                &available
+            }
         ));
     };
 
@@ -1009,7 +1071,8 @@ fn render_verify_qr(link: &str) -> Result<String, String> {
 }
 
 fn verification_link_noise_fingerprint(noise_key_hex: &str) -> Result<String, String> {
-    let noise_key_bytes = hex::decode(noise_key_hex).map_err(|_| "invalid noise hex".to_string())?;
+    let noise_key_bytes =
+        hex::decode(noise_key_hex).map_err(|_| "invalid noise hex".to_string())?;
     if noise_key_bytes.len() != 32 {
         return Err("noise must be 32-byte hex".to_string());
     }
@@ -1068,7 +1131,8 @@ fn verify_bitchat_verify_link(
         return Err("verification link expired".to_string());
     }
 
-    let noise_key_bytes = hex::decode(&noise_key_hex).map_err(|_| "invalid noise hex".to_string())?;
+    let noise_key_bytes =
+        hex::decode(&noise_key_hex).map_err(|_| "invalid noise hex".to_string())?;
     if noise_key_bytes.len() != 32 {
         return Err("noise must be 32-byte hex".to_string());
     }
@@ -1204,7 +1268,10 @@ fn build_remote_image_client() -> Option<reqwest::Client> {
 fn extract_first_http_url(content: &str) -> Option<String> {
     for token in content.split_whitespace() {
         let candidate = token.trim_matches(|ch: char| {
-            matches!(ch, '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';')
+            matches!(
+                ch,
+                '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';'
+            )
         });
         if !(candidate.starts_with("http://") || candidate.starts_with("https://")) {
             continue;
@@ -1363,10 +1430,7 @@ fn split_optional_epoch_and_content(raw: &str) -> (Option<String>, String) {
     }
 }
 
-async fn localize_image_content_if_url(
-    content: &str,
-    client: &reqwest::Client,
-) -> Option<String> {
+async fn localize_image_content_if_url(content: &str, client: &reqwest::Client) -> Option<String> {
     let trimmed = content.trim();
     if trimmed.starts_with("[image] ") {
         return None;
@@ -1375,7 +1439,10 @@ async fn localize_image_content_if_url(
     let local_path = match download_remote_image_to_incoming(client, &url).await {
         Ok(path) => path,
         Err(e) => {
-            write_debug_log(&format!("remote image auto-fetch skipped for {}: {}", url, e));
+            write_debug_log(&format!(
+                "remote image auto-fetch skipped for {}: {}",
+                url, e
+            ));
             return None;
         }
     };
@@ -1396,39 +1463,29 @@ async fn maybe_localize_structured_remote_image_message(
             return None;
         }
         let is_geohash = nostr_geo::is_geohash_channel(channel);
-        if is_geohash {
-            let (third, rest) = rest.split_once(':')?;
-            if nostr_geo::looks_like_dm_pubkey(third) || third.starts_with("npub") {
-                let (timestamp, rest) = rest.split_once(':')?;
-                let (epoch, content) = split_optional_epoch_and_content(rest);
-                let localized = localize_image_content_if_url(&content, client).await?;
-                return Some(if let Some(epoch) = epoch {
-                    format!(
-                        "__CHANNEL__:{}:{}:{}:{}:{}:{}",
-                        channel, sender, third, timestamp, epoch, localized
-                    )
-                } else {
-                    format!(
-                        "__CHANNEL__:{}:{}:{}:{}:{}",
-                        channel, sender, third, timestamp, localized
-                    )
-                });
-            }
+        if !is_geohash {
+            return None;
+        }
 
-            let timestamp = third;
+        let (third, rest) = rest.split_once(':')?;
+        if nostr_geo::looks_like_dm_pubkey(third) || third.starts_with("npub") {
+            let (timestamp, rest) = rest.split_once(':')?;
             let (epoch, content) = split_optional_epoch_and_content(rest);
             let localized = localize_image_content_if_url(&content, client).await?;
             return Some(if let Some(epoch) = epoch {
                 format!(
-                    "__CHANNEL__:{}:{}:{}:{}:{}",
-                    channel, sender, timestamp, epoch, localized
+                    "__CHANNEL__:{}:{}:{}:{}:{}:{}",
+                    channel, sender, third, timestamp, epoch, localized
                 )
             } else {
-                format!("__CHANNEL__:{}:{}:{}:{}", channel, sender, timestamp, localized)
+                format!(
+                    "__CHANNEL__:{}:{}:{}:{}:{}",
+                    channel, sender, third, timestamp, localized
+                )
             });
         }
 
-        let (timestamp, rest) = rest.split_once(':')?;
+        let timestamp = third;
         let (epoch, content) = split_optional_epoch_and_content(rest);
         let localized = localize_image_content_if_url(&content, client).await?;
         return Some(if let Some(epoch) = epoch {
@@ -1437,7 +1494,10 @@ async fn maybe_localize_structured_remote_image_message(
                 channel, sender, timestamp, epoch, localized
             )
         } else {
-            format!("__CHANNEL__:{}:{}:{}:{}", channel, sender, timestamp, localized)
+            format!(
+                "__CHANNEL__:{}:{}:{}:{}",
+                channel, sender, timestamp, localized
+            )
         });
     }
 
@@ -1750,6 +1810,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (ui_tx, mut ui_rx) = mpsc::channel::<String>(UI_EVENT_BUFFER_SIZE);
     let (mesh_notify_tx, mut mesh_notify_rx) =
         mpsc::channel::<MeshNotification>(UI_EVENT_BUFFER_SIZE);
+    let (peripheral_write_tx, mut peripheral_write_rx) =
+        mpsc::channel::<Vec<u8>>(UI_EVENT_BUFFER_SIZE);
 
     // Load saved state to get the nickname before initializing TUI
     let saved_state = load_state();
@@ -1772,7 +1834,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.update_verified_identities({
         let mut entries = Vec::new();
         for fp in &saved_state.favorites {
-            let short = if fp.len() > 10 { &fp[..10] } else { fp.as_str() };
+            let short = if fp.len() > 10 {
+                &fp[..10]
+            } else {
+                fp.as_str()
+            };
             if let Some(label) = saved_state.verified_labels.get(fp) {
                 entries.push(format!("{} ({})", label, short));
             } else {
@@ -1784,18 +1850,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.nostr_aliases = saved_state.nostr_aliases.clone();
     let nostr_geo_client =
         nostr_geo::NostrGeoClient::new(ui_tx.clone(), nostr_identity_seed.clone());
+    ble_peripheral::start_ble_peripheral_bridge(
+        ui_tx.clone(),
+        app.nickname.clone(),
+        peripheral_write_tx.clone(),
+    )
+    .await;
 
     // Spawn Bluetooth connection setup in the background
     let ui_tx_clone = ui_tx.clone();
-    let mut bt_handle = Some(spawn_bluetooth_scan(
-        ui_tx_clone,
-        "__CONNECTED__",
-        "__ERROR__",
-        HashSet::new(),
-        Duration::from_secs(15),
-        MESH_MULTI_LINK_GRACE,
-        true,
-    ));
+    let mut bt_handle = Some(spawn_primary_mesh_scan(ui_tx_clone));
 
     // State for after connection
     let mut peripheral: Option<Peripheral> = None;
@@ -1896,6 +1960,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_background_peripherals: Vec<Peripheral> = Vec::new();
     let mut last_background_mesh_refresh_at: Option<std::time::Instant> = None;
     let mut last_mesh_link_health_check_at: Option<std::time::Instant> = None;
+    let mut last_primary_mesh_retry_at: Option<std::time::Instant> =
+        Some(std::time::Instant::now());
+    let mut primary_retry_window_started_at = std::time::Instant::now();
+    let mut had_mesh_links_since_retry_window = false;
 
     let mut last_tick = std::time::Instant::now();
     let tick_rate = StdDuration::from_millis(100);
@@ -1944,6 +2012,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        if bt_handle
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(false)
+        {
+            if let Some(handle) = bt_handle.take() {
+                match handle.await {
+                    Ok(Ok(peripherals)) => {
+                        if mesh_links.is_empty() && !peripherals.is_empty() {
+                            pending_peripherals = peripherals;
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        if mesh_links.is_empty() {
+                            write_debug_log(&format!("Primary mesh scan task failed: {}", e));
+                        } else {
+                            write_debug_log(&format!(
+                                "Ignored completed primary mesh scan after link became active: {}",
+                                e
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        write_debug_log(&format!("Primary mesh scan join error: {}", e));
+                    }
+                }
+            }
+        }
+
+        if !mesh_links.is_empty() {
+            had_mesh_links_since_retry_window = true;
+        } else if had_mesh_links_since_retry_window {
+            had_mesh_links_since_retry_window = false;
+            primary_retry_window_started_at = std::time::Instant::now();
+            last_primary_mesh_retry_at = None;
+            write_debug_log("Mesh links dropped to zero; reset primary scan retry window");
+        }
+
+        let retry_interval = primary_retry_interval(primary_retry_window_started_at);
+        let should_primary_retry = mesh_links.is_empty()
+            && bt_handle.is_none()
+            && last_primary_mesh_retry_at
+                .map(|last| last.elapsed() >= retry_interval)
+                .unwrap_or(true);
+        if should_primary_retry {
+            last_primary_mesh_retry_at = Some(std::time::Instant::now());
+            if !matches!(app.phase, tui::app::TuiPhase::Connecting) {
+                app.mesh_status = "Scanning".to_string();
+            }
+            bt_handle = Some(spawn_primary_mesh_scan(ui_tx.clone()));
+            write_debug_log("Primary mesh scan retried automatically");
+        }
+
         if post_connect_initialized {
             let now = std::time::Instant::now();
             let should_health_check = last_mesh_link_health_check_at
@@ -1964,12 +2085,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let should_background_scan =
-                mesh_links.len() < MESH_MAX_CENTRAL_LINKS
-                    && background_mesh_refresh_handle.is_none()
-                    && last_background_mesh_refresh_at
-                        .map(|last| last.elapsed() >= MESH_BACKGROUND_SCAN_INTERVAL)
-                        .unwrap_or(true);
+            let should_background_scan = mesh_links.len() < MESH_MAX_CENTRAL_LINKS
+                && background_mesh_refresh_handle.is_none()
+                && last_background_mesh_refresh_at
+                    .map(|last| last.elapsed() >= MESH_BACKGROUND_SCAN_INTERVAL)
+                    .unwrap_or(true);
             if should_background_scan {
                 last_background_mesh_refresh_at = Some(now);
                 background_mesh_refresh_handle =
@@ -1987,10 +2107,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.transition_to_connected();
                 // Await the bt_handle to get the peripheral
                 if pending_peripherals.is_empty() && mesh_links.is_empty() {
-                    if let Ok(Ok(periphs)) = bt_handle.take().unwrap().await {
-                        pending_peripherals = periphs;
+                    if let Some(handle) = bt_handle.take() {
+                        if let Ok(Ok(periphs)) = handle.await {
+                            pending_peripherals = periphs;
+                        }
                     }
                 }
+                last_primary_mesh_retry_at = Some(std::time::Instant::now());
+                primary_retry_window_started_at = std::time::Instant::now();
             } else if msg == "__MESH_REFRESH_CONNECTED__" {
                 // The background refresh task is harvested outside the UI queue so
                 // existing mesh sends are not blocked while scanning.
@@ -1998,6 +2122,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let err = msg.trim_start_matches("__ERROR__").to_string();
                 app.connected = false;
                 app.mesh_status = "Offline".to_string();
+                primary_retry_window_started_at = std::time::Instant::now();
+                had_mesh_links_since_retry_window = false;
                 app.add_log_message(format!(
                     "system: Bluetooth mesh unavailable: {}. Nostr geohash channels remain available, for example /j #ws.",
                     err
@@ -2026,6 +2152,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             candidate_fps.push(fp);
                         }
+                        if let Some(fp) = peers
+                            .as_ref()
+                            .and_then(|peers| peers.try_lock().ok())
+                            .and_then(|guard| {
+                                guard.get(peer_id).and_then(|peer| peer.fingerprint.clone())
+                            })
+                        {
+                            candidate_fps.push(fp);
+                        }
                         for candidate_fp in candidate_fps {
                             if let Some(verified_fp) = verified_fingerprint_for_candidate(
                                 favorites.as_ref().unwrap(),
@@ -2045,7 +2180,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .unwrap()
                                         .insert(verified_fp.clone(), peer_name.to_string());
                                     {
-                                        let mut labels_guard = verified_labels_state.lock().unwrap();
+                                        let mut labels_guard =
+                                            verified_labels_state.lock().unwrap();
                                         *labels_guard = verified_labels.as_ref().unwrap().clone();
                                     }
                                     if let Some(state) = app_state.as_mut() {
@@ -2122,6 +2258,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
+                if let Some(handle) = bt_handle.take() {
+                    handle.abort();
+                    write_debug_log(
+                        "Aborted primary mesh scan after initial mesh link was installed",
+                    );
+                }
                 mesh_links = initialized_links;
                 peripheral = mesh_links.first().map(|link| link.peripheral.clone());
                 cmd_char = mesh_links.first().map(|link| link.cmd.clone());
@@ -2195,17 +2337,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Set up peer authentication callback (matching Swift implementation)
                 let auth_ui_tx = ui_tx.clone();
-                temp_noise_session_manager.set_on_peer_authenticated(move |peer_id, fingerprint| {
-                    debug_full_println!(
-                        "[NOISE] Peer authenticated: {} (fingerprint: {})",
-                        peer_id,
-                        &fingerprint[..16]
-                    );
-                    let _ = auth_ui_tx.try_send(format!(
-                        "__NOISE_AUTHENTICATED__:{}:{}",
-                        peer_id, fingerprint
-                    ));
-                });
+                temp_noise_session_manager.set_on_peer_authenticated(
+                    move |peer_id, fingerprint| {
+                        debug_full_println!(
+                            "[NOISE] Peer authenticated: {} (fingerprint: {})",
+                            peer_id,
+                            &fingerprint[..16]
+                        );
+                        let _ = auth_ui_tx.try_send(format!(
+                            "__NOISE_AUTHENTICATED__:{}:{}",
+                            peer_id, fingerprint
+                        ));
+                    },
+                );
 
                 // Set up handshake required callback (matching Swift implementation)
                 temp_noise_session_manager.set_on_handshake_required(|peer_id| {
@@ -2247,6 +2391,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if !refreshed_links.is_empty() {
+                if let Some(handle) = bt_handle.take() {
+                    handle.abort();
+                    write_debug_log("Aborted primary mesh scan after background mesh link refresh");
+                }
                 let changed = merge_mesh_links(&mut mesh_links, refreshed_links);
                 peripheral = mesh_links.first().map(|link| link.peripheral.clone());
                 cmd_char = mesh_links.first().map(|link| link.cmd.clone());
@@ -2276,15 +2424,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for _ in 0..64 {
                 let mesh_notification = match mesh_notify_rx.try_recv() {
                     Ok(notification) => notification,
-                    Err(_) => break,
+                    Err(_) => match peripheral_write_rx.try_recv() {
+                        Ok(value) => MeshNotification {
+                            link_id: "__ble_peripheral_write__".to_string(),
+                            value,
+                        },
+                        Err(_) => break,
+                    },
                 };
+                if mesh_links.is_empty() {
+                    write_debug_log("Dropped mesh packet because no active links are available");
+                    continue;
+                }
                 let Some(active_link) = mesh_links
                     .iter()
                     .find(|link| link.id == mesh_notification.link_id)
                     .or_else(|| mesh_links.first())
                     .cloned()
                 else {
-                    break;
+                    continue;
                 };
                 let mut peers_lock = peers.as_ref().unwrap().lock().await;
                 let ui_tx = ui_tx.clone();
@@ -2326,11 +2484,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     {
                                         last_background_mesh_refresh_at =
                                             Some(std::time::Instant::now());
-                                        background_mesh_refresh_handle =
-                                            Some(spawn_background_mesh_scan(
-                                                ui_tx.clone(),
-                                                &mesh_links,
-                                            ));
+                                        background_mesh_refresh_handle = Some(
+                                            spawn_background_mesh_scan(ui_tx.clone(), &mesh_links),
+                                        );
                                     }
                                 }
                                 handle_announce_message(&packet, &mut peers_lock, ui_tx.clone())
@@ -2570,9 +2726,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         packet.sender_id_str
                                     ));
                                     if let Some(noise_manager) = noise_session_manager.as_mut() {
-                                        if !noise_manager.has_established_session(
-                                            &packet.sender_id_str,
-                                        ) && !noise_manager.has_session(&packet.sender_id_str)
+                                        if !noise_manager
+                                            .has_established_session(&packet.sender_id_str)
+                                            && !noise_manager.has_session(&packet.sender_id_str)
                                         {
                                             send_handshake_request(
                                                 &packet.sender_id_str,
@@ -2605,7 +2761,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             sent
                                         ));
                                     } else {
-                                        write_debug_log("Ignoring expired transit RequestSync packet");
+                                        write_debug_log(
+                                            "Ignoring expired transit RequestSync packet",
+                                        );
                                     }
                                 }
                             }
@@ -2796,15 +2954,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Spawn new Bluetooth connection setup
             let ui_tx_clone = ui_tx.clone();
-            bt_handle = Some(spawn_bluetooth_scan(
-                ui_tx_clone,
-                "__CONNECTED__",
-                "__ERROR__",
-                HashSet::new(),
-                Duration::from_secs(15),
-                MESH_MULTI_LINK_GRACE,
-                true,
-            ));
+            bt_handle = Some(spawn_primary_mesh_scan(ui_tx_clone));
+            last_primary_mesh_retry_at = Some(std::time::Instant::now());
+            primary_retry_window_started_at = std::time::Instant::now();
+            had_mesh_links_since_retry_window = false;
         }
 
         if app.connected {
@@ -2848,32 +3001,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match parse_upload_path(&line) {
                 Ok(Some(path)) => {
-                    app.add_log_message(format!(
-                        "system: Uploading {} ...",
-                        crate::tui::app::compact_file_message(&path)
-                    ));
-                    let upload_path = std::path::Path::new(&path);
-                    match upload_share::upload_file(upload_path, &nostr_identity_seed).await {
-                        Ok(result) => {
-                            app.add_log_message(format!(
-                                "system: Uploaded {} ({} bytes)",
-                                crate::tui::app::compact_file_message(&result.file_name),
-                                result.file_size
-                            ));
-                            line = format!("{} {}", result.file_name, result.url);
-                            let is_mesh_dm = app.current_geohash_dm().is_none()
-                                && app
-                                    .current_conv
-                                    .as_ref()
-                                    .and_then(|(dm, _)| dm.as_ref())
-                                    .is_some();
-                            if app.current_geohash_dm().is_none() && !is_mesh_dm {
-                                app.add_sent_message(line.clone());
+                    if app.current_geohash_context_channel().is_none() {
+                        app.add_log_message(
+                            "system: /upload is only available in Nostr geohash conversations. Use /file <path> for Bluetooth mesh file transfer."
+                                .to_string(),
+                        );
+                        continue;
+                    } else {
+                        app.add_log_message(format!(
+                            "system: Uploading {} ...",
+                            crate::tui::app::compact_file_message(&path)
+                        ));
+                        let upload_path = std::path::Path::new(&path);
+                        match upload_share::upload_file(upload_path, &nostr_identity_seed).await {
+                            Ok(result) => {
+                                app.add_log_message(format!(
+                                    "system: Uploaded {} ({} bytes)",
+                                    crate::tui::app::compact_file_message(&result.file_name),
+                                    result.file_size
+                                ));
+                                line = format!("{} {}", result.file_name, result.url);
+                                let is_mesh_dm = app.current_geohash_dm().is_none()
+                                    && app
+                                        .current_conv
+                                        .as_ref()
+                                        .and_then(|(dm, _)| dm.as_ref())
+                                        .is_some();
+                                if app.current_geohash_dm().is_none() && !is_mesh_dm {
+                                    app.add_sent_message(line.clone());
+                                }
                             }
-                        }
-                        Err(e) => {
-                            app.add_log_message(format!("system: Upload failed: {}", e));
-                            continue;
+                            Err(e) => {
+                                app.add_log_message(format!("system: Upload failed: {}", e));
+                                continue;
+                            }
                         }
                     }
                 }
@@ -3233,17 +3394,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
 
-                    let fingerprint = match verification_link_noise_fingerprint(&payload.noise_key_hex)
-                    {
-                        Ok(fp) => fp,
-                        Err(err) => {
-                            app.add_log_message(format!(
-                                "system: Invalid verify link: {}",
-                                err
-                            ));
-                            continue;
-                        }
-                    };
+                    let fingerprint =
+                        match verification_link_noise_fingerprint(&payload.noise_key_hex) {
+                            Ok(fp) => fp,
+                            Err(err) => {
+                                app.add_log_message(format!(
+                                    "system: Invalid verify link: {}",
+                                    err
+                                ));
+                                continue;
+                            }
+                        };
 
                     let label = payload.nickname.trim().to_string();
                     favorites
@@ -3295,7 +3456,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         create_app_state.as_ref().unwrap(),
                         &nickname,
                     ) {
-                        app.add_log_message(format!("system: Warning: Could not save state: {}", e));
+                        app.add_log_message(format!(
+                            "system: Warning: Could not save state: {}",
+                            e
+                        ));
                     }
 
                     let mut verified_msg = format!(
@@ -3315,7 +3479,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(None) => {}
                 Err("usage") => {
-                    app.add_log_message("system: Usage: /verifylink <bitchat://verify?...>".to_string());
+                    app.add_log_message(
+                        "system: Usage: /verifylink <bitchat://verify?...>".to_string(),
+                    );
                     continue;
                 }
                 Err(_) => {}
@@ -4766,18 +4932,57 @@ async fn find_peripheral(
     adapter: &btleplug::platform::Adapter,
     skipped_peripherals: &HashSet<String>,
 ) -> Result<Option<Peripheral>, btleplug::Error> {
-    for p in adapter.peripherals().await? {
+    let allow_any_fallback = std::env::var("BITCHAT_SCAN_FALLBACK_ANY")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let mut fallback_candidate: Option<Peripheral> = None;
+
+    let peripherals = adapter.peripherals().await?;
+
+    for p in peripherals {
         let peripheral_id = format!("{:?}", p.id());
         if skipped_peripherals.contains(&peripheral_id) {
             continue;
         }
-        if let Ok(Some(properties)) = p.properties().await {
-            if properties.services.contains(&BITCHAT_SERVICE_UUID) {
-                return Ok(Some(p));
+
+        match p.properties().await {
+            Ok(Some(properties)) => {
+                let advertises_service = properties.services.contains(&BITCHAT_SERVICE_UUID)
+                    || properties.services.contains(&BITCHAT_TEST_SERVICE_UUID);
+                let has_matching_service_data =
+                    properties.service_data.contains_key(&BITCHAT_SERVICE_UUID)
+                        || properties
+                            .service_data
+                            .contains_key(&BITCHAT_TEST_SERVICE_UUID);
+                // Prefer devices that explicitly advertise the BitChat service UUID.
+                if advertises_service || has_matching_service_data {
+                    return Ok(Some(p));
+                }
+
+                let name_looks_bitchat = properties
+                    .local_name
+                    .as_deref()
+                    .map(|name| name.to_ascii_lowercase().contains("bitchat"))
+                    .unwrap_or(false);
+                if name_looks_bitchat {
+                    return Ok(Some(p));
+                }
+
+                if allow_any_fallback && fallback_candidate.is_none() {
+                    fallback_candidate = Some(p);
+                }
+            }
+            _ => {
+                // If properties are unavailable, still keep a fallback so discovery
+                // can proceed with connect+service discovery validation.
+                if allow_any_fallback && fallback_candidate.is_none() {
+                    fallback_candidate = Some(p);
+                }
             }
         }
     }
-    Ok(None)
+
+    Ok(fallback_candidate)
 }
 
 #[cfg(test)]

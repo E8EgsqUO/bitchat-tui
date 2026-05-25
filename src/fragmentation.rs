@@ -6,6 +6,8 @@ use rand::Rng;
 use std::time::Duration;
 use tokio::time;
 
+const IOS_FRAGMENT_PACKET_TYPE: u8 = 0x20;
+
 // Match Swift's fragment size limit: 500 bytes per fragment
 // This aligns with Swift's maxFragmentSize configuration.
 #[allow(dead_code)]
@@ -119,13 +121,11 @@ pub fn create_fragment_packet(sender_id: &str, fragment: Fragment) -> Vec<u8> {
     // Fragment data
     payload.extend_from_slice(&fragment.data);
 
-    let msg_type = match fragment.fragment_type {
-        FragmentType::Start => MessageType::FragmentStart,
-        FragmentType::Continue => MessageType::FragmentContinue,
-        FragmentType::End => MessageType::FragmentEnd,
-    };
-
-    create_bitchat_packet(sender_id, msg_type, payload)
+    let mut packet = create_bitchat_packet(sender_id, MessageType::FragmentStart, payload);
+    if packet.len() > 1 {
+        packet[1] = IOS_FRAGMENT_PACKET_TYPE;
+    }
+    packet
 }
 
 pub fn should_fragment(packet_data: &[u8]) -> bool {
@@ -186,14 +186,17 @@ pub async fn send_packet_with_fragmentation_as(
 
         // Send fragments with Swift's timing (20ms delay)
         for (index, chunk) in chunks.iter().enumerate() {
-            let fragment_type = match index {
-                0 => MessageType::FragmentStart,
-                n if n == chunks.len() - 1 => MessageType::FragmentEnd,
-                _ => MessageType::FragmentContinue,
+            let logical_fragment_type = match index {
+                0 => "start",
+                n if n == chunks.len() - 1 => "end",
+                _ => "continue",
             };
 
             debug_full_println!("[DEBUG] --- Fragment {}/{} ---", index + 1, total_fragments);
-            debug_full_println!("[DEBUG] Type: {:?}", fragment_type);
+            debug_full_println!(
+                "[DEBUG] Type: iOS unified fragment 0x20 ({})",
+                logical_fragment_type
+            );
             debug_full_println!("[DEBUG] Chunk size: {} bytes", chunk.len());
             debug_full_println!(
                 "[DEBUG] Chunk hex (first 32 bytes): {}",
@@ -265,8 +268,11 @@ pub async fn send_packet_with_fragmentation_as(
             );
 
             // Create fragment packet
-            let fragment_packet =
-                create_bitchat_packet(my_peer_id, fragment_type, fragment_payload);
+            let mut fragment_packet =
+                create_bitchat_packet(my_peer_id, MessageType::FragmentStart, fragment_payload);
+            if fragment_packet.len() > 1 {
+                fragment_packet[1] = IOS_FRAGMENT_PACKET_TYPE;
+            }
 
             debug_full_println!(
                 "[DEBUG] Final fragment packet size: {} bytes",
@@ -341,6 +347,7 @@ pub async fn send_packet_with_fragmentation_as(
                 )
                 .into());
             }
+            crate::ble_peripheral::queue_ble_peripheral_packet(&fragment_packet);
 
             debug_full_println!(
                 "[DEBUG] ✓ Fragment {}/{} sent successfully",
@@ -372,6 +379,7 @@ pub async fn send_packet_with_fragmentation_as(
         {
             return Err(format!("Failed to send {} byte packet", packet.len()).into());
         }
+        crate::ble_peripheral::queue_ble_peripheral_packet(&packet);
 
         Ok(())
     }

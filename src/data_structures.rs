@@ -56,6 +56,7 @@ macro_rules! debug_full_println {
 pub const VERSION: &str = "v1.0.0";
 
 pub const BITCHAT_SERVICE_UUID: Uuid = Uuid::from_u128(0xF47B5E2D_4A9E_4C5A_9B3F_8E1D2C3A4B5C);
+pub const BITCHAT_TEST_SERVICE_UUID: Uuid = Uuid::from_u128(0xF47B5E2D_4A9E_4C5A_9B3F_8E1D2C3A4B5A);
 
 pub const BITCHAT_CHARACTERISTIC_UUID: Uuid =
     Uuid::from_u128(0xA1B2C3D4_E5F6_4A5B_8C9D_0E1F2A3B4C5D);

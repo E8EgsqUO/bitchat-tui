@@ -100,8 +100,8 @@ If the Bluetooth mesh connection stalls or drops, press `r` on the error screen 
 - The receiver opens the same geohash DM and types `/receive` to accept the transfer.
 - The sender does not enter the Wormhole code manually.
 - Files are limited to 1 MiB on mesh transfer and are saved under `received_files/` on the receiving side.
-- `/upload <path>` uploads media files (image/audio/video) to a configurable endpoint and sends the returned URL as a normal chat message.
-- Dragging a local file into the terminal input box auto-fills `/upload <path>` for the first detected file.
+- `/upload <path>` uploads media files (image/audio/video) to a configurable endpoint and sends the returned URL as a normal Nostr/geohash chat message.
+- Dragging a local file into the terminal input box auto-fills `/file <path>` in mesh, or `/upload <path>` in a geohash conversation.
 - This is a TUI-only extension. iOS mesh clients still use their native image and voice-note transfers.
 - `/pass` has been removed from this fork.
 
@@ -154,7 +154,7 @@ Supported proxy formats:
 - `/public` switch to public chat
 - `/dm <name> [msg]` open a DM or send an initial message
 - `/file [@user] <path>` send a file over Bluetooth mesh, or create a Wormhole offer in a geohash DM
-- `/upload <path>` upload a media file (image/audio/video) and share the URL in the current conversation
+- `/upload <path>` upload a media file (image/audio/video) and share the URL in a geohash conversation
 - `/receive` accept the pending geohash DM file offer
 - `/reply` reply to the last private sender
 - `/j #channel` join a channel
@@ -182,7 +182,13 @@ The app can write debug logs in the project directory, including:
 - `send_debug.log`
 - `crash.log`
 
-To disable file logging, set:
+File logging is off by default. To enable it for troubleshooting, set:
+
+```bash
+BITCHAT_TUI_FILE_LOG=1
+```
+
+To force-disable file logging, set:
 
 ```bash
 BITCHAT_TUI_FILE_LOG=0
@@ -205,8 +211,8 @@ BITCHAT_DEBUG=1
 - If Bluetooth mesh is unavailable, geohash channels remain usable.
 - `r` is still useful as a recovery action when the Bluetooth scan needs to be restarted.
 - Proxy settings apply to Nostr relay traffic, not Bluetooth mesh traffic.
-- `/upload` also uses proxy env vars (`BITCHAT_TUI_NOSTR_PROXY`, `HTTP(S)_PROXY`, `ALL_PROXY`) when set.
-- Remote image URL localization also uses proxy env vars (`BITCHAT_TUI_NOSTR_PROXY`, `HTTP(S)_PROXY`, `ALL_PROXY`) when set.
+- `/upload` is a Nostr/geohash feature and also uses proxy env vars (`BITCHAT_TUI_NOSTR_PROXY`, `HTTP(S)_PROXY`, `ALL_PROXY`) when set.
+- Nostr/geohash remote image URL localization also uses proxy env vars (`BITCHAT_TUI_NOSTR_PROXY`, `HTTP(S)_PROXY`, `ALL_PROXY`) when set.
 - `/reply` is a Bluetooth mesh command. `/block` and `/unblock` are Nostr geohash commands for local message filtering by user name.
 - Upload now defaults to Blossom on `blossom.nostr.build` (Nostr-signed auth).
 - To force provider selection, use `BITCHAT_UPLOAD_PROVIDER`:

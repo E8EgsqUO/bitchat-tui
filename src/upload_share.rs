@@ -55,7 +55,10 @@ struct NostrAuthEvent {
     sig: String,
 }
 
-pub(crate) async fn upload_file(path: &Path, nostr_identity_seed: &[u8]) -> Result<UploadResult, String> {
+pub(crate) async fn upload_file(
+    path: &Path,
+    nostr_identity_seed: &[u8],
+) -> Result<UploadResult, String> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|e| format!("cannot read '{}': {}", path.display(), e))?;
@@ -147,9 +150,7 @@ async fn upload_to_target(
     let client = build_upload_client(timeout)?;
 
     let mut request = match target.method {
-        UploadMethod::RawPut => client
-            .put(&target.endpoint)
-            .body(file_bytes.to_vec()),
+        UploadMethod::RawPut => client.put(&target.endpoint).body(file_bytes.to_vec()),
         UploadMethod::MultipartPost => {
             let body = build_multipart_body(
                 &boundary,
@@ -170,8 +171,11 @@ async fn upload_to_target(
     };
 
     if let AuthMode::Blossom24242 = target.auth_mode {
-        let auth =
-            build_blossom_authorization(nostr_identity_seed, &sha256_hex, target.endpoint.as_str())?;
+        let auth = build_blossom_authorization(
+            nostr_identity_seed,
+            &sha256_hex,
+            target.endpoint.as_str(),
+        )?;
         request = request.header(reqwest::header::AUTHORIZATION, auth);
         request = request.header("X-SHA-256", sha256_hex.clone());
     }
@@ -192,7 +196,9 @@ async fn upload_to_target(
         .map_err(|e| format!("failed to read response body: {}", e))?;
 
     if !status.is_success() {
-        if matches!(target.method, UploadMethod::RawPut) && status == reqwest::StatusCode::BAD_REQUEST {
+        if matches!(target.method, UploadMethod::RawPut)
+            && status == reqwest::StatusCode::BAD_REQUEST
+        {
             if let Some(expected_type) = parse_expected_content_type(&body) {
                 if !expected_type.eq_ignore_ascii_case(mime_type) {
                     let retry_request = client
@@ -295,8 +301,11 @@ fn build_multipart_body(
     for (key, value) in extra_fields {
         body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
         body.extend_from_slice(
-            format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", key.replace('"', ""))
-                .as_bytes(),
+            format!(
+                "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                key.replace('"', "")
+            )
+            .as_bytes(),
         );
         body.extend_from_slice(value.as_bytes());
         body.extend_from_slice(b"\r\n");
@@ -437,9 +446,10 @@ fn calculate_event_id(
     tags: &[Vec<String>],
     content: &str,
 ) -> Result<String, String> {
-    let serialized =
-        serde_json::to_vec(&serde_json::json!([0, pubkey, created_at, kind, tags, content]))
-            .map_err(|e| e.to_string())?;
+    let serialized = serde_json::to_vec(&serde_json::json!([
+        0, pubkey, created_at, kind, tags, content
+    ]))
+    .map_err(|e| e.to_string())?;
     Ok(hex::encode(Sha256::digest(&serialized)))
 }
 

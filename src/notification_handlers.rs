@@ -7,7 +7,7 @@ use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -16,8 +16,9 @@ use std::io::Write;
 use uuid::Uuid;
 
 use crate::data_structures::{
-    BitchatMessage, BitchatPacket, DebugLevel, DeliveryAck, DeliveryTracker, FragmentCollector,
-    MessageType, Peer, BROADCAST_RECIPIENT, COVER_TRAFFIC_PREFIX, DEBUG_LEVEL,
+    calculate_fingerprint, BitchatMessage, BitchatPacket, DebugLevel, DeliveryAck, DeliveryTracker,
+    FragmentCollector, MessageType, Peer, PeerConnectionState, BROADCAST_RECIPIENT,
+    COVER_TRAFFIC_PREFIX, DEBUG_LEVEL,
 };
 use crate::encryption::EncryptionService;
 use crate::noise_protocol::NoiseError;
@@ -156,12 +157,43 @@ fn parse_announcement_nickname(payload: &[u8]) -> Option<String> {
     None
 }
 
+#[derive(Debug, Default)]
+struct AnnouncementIdentity {
+    nickname: Option<String>,
+    noise_public_key: Option<Vec<u8>>,
+    signing_public_key: Option<Vec<u8>>,
+}
+
+fn parse_announcement_identity(payload: &[u8]) -> AnnouncementIdentity {
+    let mut identity = AnnouncementIdentity::default();
+    let mut offset = 0;
+
+    while offset + 2 <= payload.len() {
+        let field_type = payload[offset];
+        let field_len = payload[offset + 1] as usize;
+        offset += 2;
+
+        if offset + field_len > payload.len() {
+            return identity;
+        }
+
+        let value = &payload[offset..offset + field_len];
+        match field_type {
+            0x01 => identity.nickname = String::from_utf8(value.to_vec()).ok(),
+            0x02 => identity.noise_public_key = Some(value.to_vec()),
+            0x03 => identity.signing_public_key = Some(value.to_vec()),
+            _ => {}
+        }
+
+        offset += field_len;
+    }
+
+    identity
+}
+
 fn looks_like_hex_identity(value: &str) -> bool {
     let trimmed = value.trim().trim_start_matches('@');
-    (trimmed.len() == 64 || trimmed.len() == 128)
-        && trimmed
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit())
+    (trimmed.len() == 64 || trimmed.len() == 128) && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn fallback_sender_name(peer_id: &str) -> String {
@@ -513,8 +545,17 @@ pub async fn handle_announce_message(
     peers_lock: &mut HashMap<String, Peer>,
     ui_tx: mpsc::Sender<String>,
 ) {
-    let peer_nickname = parse_announcement_nickname(&packet.payload)
+    let announcement = parse_announcement_identity(&packet.payload);
+    let peer_nickname = announcement
+        .nickname
+        .clone()
+        .or_else(|| parse_announcement_nickname(&packet.payload))
         .unwrap_or_else(|| String::from_utf8_lossy(&packet.payload).trim().to_string());
+    let noise_fingerprint = announcement
+        .noise_public_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .map(calculate_fingerprint);
 
     let previous_nickname = peers_lock
         .get(&packet.sender_id_str)
@@ -523,6 +564,26 @@ pub async fn handle_announce_message(
     let peer_entry = peers_lock.entry(packet.sender_id_str.clone()).or_default();
 
     peer_entry.nickname = Some(peer_nickname.clone());
+    peer_entry.fingerprint = noise_fingerprint.clone();
+    peer_entry.last_seen = Some(SystemTime::now());
+    peer_entry.connection_state = PeerConnectionState::Connected;
+
+    let signing_key_present = announcement
+        .signing_public_key
+        .as_ref()
+        .map(|key| !key.is_empty())
+        .unwrap_or(false);
+    if let Some(fingerprint) = &noise_fingerprint {
+        crate::write_debug_log(&format!(
+            "Bound mesh peer identity from Announce: peer_id={} nickname={} fingerprint={} signing_key_present={}",
+            packet.sender_id_str, peer_nickname, fingerprint, signing_key_present
+        ));
+    } else {
+        crate::write_debug_log(&format!(
+            "Announce from peer_id={} nickname={} did not include a Noise public key",
+            packet.sender_id_str, peer_nickname
+        ));
+    }
 
     if is_new_peer || previous_nickname.as_deref() != Some(peer_nickname.as_str()) {
         let _ = ui_tx
@@ -1181,10 +1242,8 @@ pub async fn handle_fragment_packet(
                             }
 
                             if is_private_message {
-                                chat_context.last_private_sender = Some((
-                                    reassembled.sender_id_str.clone(),
-                                    sender_nick,
-                                ));
+                                chat_context.last_private_sender =
+                                    Some((reassembled.sender_id_str.clone(), sender_nick));
                             }
                         }
                     } else if !is_private_message {
@@ -1882,13 +1941,13 @@ pub async fn handle_noise_handshake_resp(
 
             if let Some(response_data) = response {
                 // Wrap the Noise payload in a BitchatPacket.
-                            let response_packet = create_bitchat_packet_with_recipient(
-                                my_peer_id,
-                                Some(&packet.sender_id_str), // send it **only** to the peer that asked
-                                MessageType::NoiseHandshakeInit,
-                                response_data,
-                                None, // no signature
-                            );
+                let response_packet = create_bitchat_packet_with_recipient(
+                    my_peer_id,
+                    Some(&packet.sender_id_str), // send it **only** to the peer that asked
+                    MessageType::NoiseHandshakeInit,
+                    response_data,
+                    None, // no signature
+                );
 
                 write_noise_debug_log("[DEBUG] About to send handshake response");
                 match send_packet_to_mesh_targets(
@@ -2694,11 +2753,8 @@ async fn handle_decrypted_message(
 ) {
     if !bloom.check(&message.id) {
         bloom.set(&message.id);
-        let sender_nick = resolve_sender_display_name(
-            &message.sender,
-            &inner_packet.sender_id_str,
-            peers_lock,
-        );
+        let sender_nick =
+            resolve_sender_display_name(&message.sender, &inner_packet.sender_id_str, peers_lock);
 
         // Add the sender to peers list if not already there
         if !peers_lock.contains_key(&inner_packet.sender_id_str) {
@@ -3025,7 +3081,7 @@ pub async fn handle_handshake_request_message(
                                     my_peer_id,
                                     MessageType::NoiseHandshakeInit,
                                 )
-                                    .await
+                                .await
                                 {
                                     Ok(_) => {
                                         write_noise_debug_log(

@@ -93,7 +93,8 @@ fn render_image_preview_overlay(f: &mut Frame, app: &mut App) {
     match &mut preview.render_state {
         ImagePreviewRenderState::Ready(state) => {
             if inner.width > 2 && inner.height > 2 {
-                let image = StatefulImage::new(None).resize(Resize::Fit(Some(FilterType::Lanczos3)));
+                let image =
+                    StatefulImage::new(None).resize(Resize::Fit(Some(FilterType::Lanczos3)));
                 f.render_stateful_widget(image, inner, state);
             }
         }

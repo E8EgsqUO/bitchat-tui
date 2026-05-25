@@ -344,16 +344,16 @@ pub async fn handle_private_dm_message(
     )
     .await
     .map_err(|e| {
-            write_send_debug_log(&format!(
-                "dm noise encrypted write result: mode=fragmentation, result=Err({})",
-                e
-            ));
-            write_noise_debug_log(&format!(
-                "[DEBUG] Failed to send encrypted message via Bluetooth: {:?}",
-                e
-            ));
-            format!("Failed to send encrypted message: {}", e)
-        })?;
+        write_send_debug_log(&format!(
+            "dm noise encrypted write result: mode=fragmentation, result=Err({})",
+            e
+        ));
+        write_noise_debug_log(&format!(
+            "[DEBUG] Failed to send encrypted message via Bluetooth: {:?}",
+            e
+        ));
+        format!("Failed to send encrypted message: {}", e)
+    })?;
     write_send_debug_log(&format!(
         "dm noise encrypted write result: mode=fragmentation, result=Ok(())"
     ));

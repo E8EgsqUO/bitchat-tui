@@ -179,8 +179,11 @@ pub fn get_help_text() -> String {
         "[Messaging]".to_string(),
         cmd_line("/dm, /d <name> [msg]", "Start or send a direct message"),
         cmd_line("/reply", "Reply to last private message"),
-        cmd_line("/file, /f [@user] <path>", "Send a TUI-to-TUI mesh file"),
-        cmd_line("/upload, /up <path>", "Upload file and send share link"),
+        cmd_line(
+            "/file, /f [@user] <path>",
+            "Mesh file or geohash Wormhole offer",
+        ),
+        cmd_line("/upload, /up <path>", "Upload media in Nostr/geohash"),
         cmd_line("/search, /s <text>", "Search current conversation"),
         cmd_line("/export, /e [path]", "Export current conversation"),
         "".to_string(),
@@ -192,7 +195,10 @@ pub fn get_help_text() -> String {
         "[Privacy]".to_string(),
         cmd_line("/block, /b @user", "Block a user in Nostr geohash channels"),
         cmd_line("/block", "List blocked users"),
-        cmd_line("/unblock, /u @user", "Unblock a user in Nostr geohash channels"),
+        cmd_line(
+            "/unblock, /u @user",
+            "Unblock a user in Nostr geohash channels",
+        ),
         cmd_line("/fingerprint", "Show your mesh identity fingerprint"),
         cmd_line(
             "/verify <@user|fp> [label]",

@@ -72,14 +72,16 @@ pub fn handle_paste_event(app: &mut App, pasted: &str) {
 
     if app.input.value().trim().is_empty() {
         if let Some(paths) = detect_dragged_file_paths(pasted) {
-            let command = build_upload_command_from_paths(&paths);
+            let command = build_file_share_command_from_paths(app, &paths);
             app.focus_area = FocusArea::InputBox;
             app.input.reset();
             let _ = insert_text_into_input(&mut app.input, &command);
             if paths.len() > 1 {
+                let action = file_share_action_name(app);
                 app.add_log_message(format!(
-                    "system: Detected {} files from drag-and-drop. Prepared upload for the first one. Send it, then drag the next file.",
-                    paths.len()
+                    "system: Detected {} files from drag-and-drop. Prepared {} for the first one. Send it, then drag the next file.",
+                    paths.len(),
+                    action
                 ));
             }
             app.paste_keyburst_active = false;
@@ -141,7 +143,9 @@ fn looks_like_filename_token(value: &str) -> bool {
     }
     let has_ext = value
         .rsplit_once('.')
-        .map(|(base, ext)| !base.is_empty() && ext.chars().all(|ch| ch.is_ascii_alphanumeric()) && !ext.is_empty())
+        .map(|(base, ext)| {
+            !base.is_empty() && ext.chars().all(|ch| ch.is_ascii_alphanumeric()) && !ext.is_empty()
+        })
         .unwrap_or(false);
     has_ext
 }
@@ -180,12 +184,32 @@ fn quote_for_upload_command(path: &str) -> String {
     }
 }
 
-fn build_upload_command_from_paths(paths: &[String]) -> String {
-    let first = paths.first().map(String::as_str).unwrap_or("");
-    format!("/upload {}", quote_for_upload_command(first))
+fn file_share_command_prefix(app: &App) -> &'static str {
+    if app.current_geohash_context_channel().is_some() {
+        "/upload"
+    } else {
+        "/file"
+    }
 }
 
-fn upload_command_from_freeform_input(value: &str) -> Option<String> {
+fn file_share_action_name(app: &App) -> &'static str {
+    if app.current_geohash_context_channel().is_some() {
+        "upload"
+    } else {
+        "Bluetooth file transfer"
+    }
+}
+
+fn build_file_share_command_from_paths(app: &App, paths: &[String]) -> String {
+    let first = paths.first().map(String::as_str).unwrap_or("");
+    format!(
+        "{} {}",
+        file_share_command_prefix(app),
+        quote_for_upload_command(first)
+    )
+}
+
+fn file_share_command_from_freeform_input(app: &App, value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.contains('\n') {
         return None;
@@ -198,7 +222,11 @@ fn upload_command_from_freeform_input(value: &str) -> Option<String> {
     if !looks_like_upload_file_reference(unquoted) {
         return None;
     }
-    Some(format!("/upload {}", quote_for_upload_command(unquoted)))
+    Some(format!(
+        "{} {}",
+        file_share_command_prefix(app),
+        quote_for_upload_command(unquoted)
+    ))
 }
 
 pub fn handle_mouse_event(app: &mut App, mouse_event: MouseEvent) {
@@ -522,7 +550,8 @@ fn handle_input_events(app: &mut App, key_event: KeyEvent, input_tx: &mpsc::Send
             }
 
             let input_str = app.input.value().to_string();
-            let outgoing = upload_command_from_freeform_input(&input_str).unwrap_or(input_str.clone());
+            let outgoing = file_share_command_from_freeform_input(app, &input_str)
+                .unwrap_or(input_str.clone());
             if !input_str.is_empty() {
                 if input_tx.try_send(outgoing.clone()).is_ok() {
                     let is_mesh_dm = app.current_geohash_dm().is_none()
@@ -679,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_converts_windows_path_like_input_to_upload_command() {
+    fn enter_converts_windows_path_like_input_to_mesh_file_command() {
         let (input_tx, mut input_rx) = mpsc::channel(1);
         let mut app = App::new_with_nickname("me".to_string());
         app.focus_area = FocusArea::InputBox;
@@ -687,14 +716,28 @@ mod tests {
 
         handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
 
-        assert_eq!(input_rx.try_recv().unwrap(), "/upload D:\\test.png");
+        assert_eq!(input_rx.try_recv().unwrap(), "/file D:\\test.png");
     }
 
     #[test]
-    fn enter_converts_filename_token_to_upload_command() {
+    fn enter_converts_filename_token_to_mesh_file_command() {
         let (input_tx, mut input_rx) = mpsc::channel(1);
         let mut app = App::new_with_nickname("me".to_string());
         app.focus_area = FocusArea::InputBox;
+        handle_paste_event(&mut app, "photo.jpg");
+
+        handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
+
+        assert_eq!(input_rx.try_recv().unwrap(), "/file photo.jpg");
+    }
+
+    #[test]
+    fn enter_converts_path_to_upload_command_in_geohash() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let mut app = App::new_with_nickname("me".to_string());
+        app.focus_area = FocusArea::InputBox;
+        app.join_channel("#ws".to_string());
+        app.update_current_conversation();
         handle_paste_event(&mut app, "photo.jpg");
 
         handle_key_event(&mut app, key(KeyCode::Enter), &input_tx);
@@ -843,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn drag_and_drop_file_path_prefills_upload_command() {
+    fn drag_and_drop_file_path_prefills_mesh_file_command() {
         let mut app = App::new_with_nickname("me".to_string());
         let temp_dir = std::env::temp_dir();
         let path = temp_dir.join(format!("bitchat_upload_{}.txt", std::process::id()));
@@ -854,7 +897,7 @@ mod tests {
 
         assert_eq!(
             app.input.value(),
-            format!("/upload {}", quote_for_upload_command(&pasted))
+            format!("/file {}", quote_for_upload_command(&pasted))
         );
         let _ = std::fs::remove_file(path);
     }
@@ -893,7 +936,9 @@ mod tests {
         let path = temp_dir.join(format!(
             "bitchat_preview_{}_{}.png",
             std::process::id(),
-            chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
         ));
         let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]));
         image.save(&path).expect("save png");
@@ -917,7 +962,9 @@ mod tests {
         let path = temp_dir.join(format!(
             "bitchat_preview_{}_{}_2.png",
             std::process::id(),
-            chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()
+            chrono::Local::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
         ));
         let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255]));
         image.save(&path).expect("save png");

@@ -216,8 +216,7 @@ impl NostrGeoClient {
 
         let relays = resolve_relays(&geohash).await;
         let dm_relays = dm_relays();
-        let subscribe_relays =
-            build_subscribe_relays(&geohash, relays.clone(), dm_relays.clone());
+        let subscribe_relays = build_subscribe_relays(&geohash, relays.clone(), dm_relays.clone());
         write_nostr_debug_log(&format!(
             "joined geohash #{} public_relays={} dm_relays={} subscribe_relays={}",
             geohash,
@@ -1009,12 +1008,14 @@ async fn handle_private_text_event(
         let sanitized = sanitize_display_field(&nickname);
         update_known_person(inner, channel, &sender_pubkey, &sanitized).await;
         if is_pubkey_placeholder_name(&sanitized) {
-            schedule_metadata_lookup(inner.clone(), channel.to_string(), sender_pubkey.clone()).await;
+            schedule_metadata_lookup(inner.clone(), channel.to_string(), sender_pubkey.clone())
+                .await;
         }
         sanitized
     } else if let Some(name) = known_person_name(inner, &sender_pubkey).await {
         if is_pubkey_placeholder_name(&name) {
-            schedule_metadata_lookup(inner.clone(), channel.to_string(), sender_pubkey.clone()).await;
+            schedule_metadata_lookup(inner.clone(), channel.to_string(), sender_pubkey.clone())
+                .await;
         }
         name
     } else {

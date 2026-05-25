@@ -335,7 +335,6 @@ fn render_message_lines(
                 line_copy_targets.push(None);
             }
         }
-
     }
 
     (items, line_copy_targets, unseen_divider_line_index)
@@ -419,10 +418,15 @@ fn render_bubble_border_line(
     is_top: bool,
 ) -> ListItem<'static> {
     let horizontal = "─".repeat(bubble_inner_width.saturating_add(2));
-    let (left, right) = if is_top { ("╭", "╮") } else { ("╰", "╯") };
+    let (left, right) = if is_top {
+        ("╭", "╮")
+    } else {
+        ("╰", "╯")
+    };
     let line = format!("{left}{horizontal}{right}");
     let line_width = UnicodeWidthStr::width(line.as_str());
-    let bubble_total_width = max_bubble_total_width(available_width, content_indent).min(line_width);
+    let bubble_total_width =
+        max_bubble_total_width(available_width, content_indent).min(line_width);
     let leading = match role {
         MessageRole::System => available_width.saturating_sub(bubble_total_width) / 2,
         MessageRole::SelfUser => available_width
@@ -474,7 +478,8 @@ fn render_bubble_content_line(
     let text_width = UnicodeWidthStr::width(line.as_str());
     let trailing_pad = " ".repeat(bubble_inner_width.saturating_sub(text_width));
     let bubble_total_width = bubble_inner_width.saturating_add(4);
-    let bubble_total_width = max_bubble_total_width(available_width, content_indent).min(bubble_total_width);
+    let bubble_total_width =
+        max_bubble_total_width(available_width, content_indent).min(bubble_total_width);
     let leading = match role {
         MessageRole::System => available_width.saturating_sub(bubble_total_width) / 2,
         MessageRole::SelfUser => available_width
