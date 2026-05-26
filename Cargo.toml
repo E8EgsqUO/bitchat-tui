@@ -69,7 +69,9 @@ dbus = { version = "0.9", features = ["vendored"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Devices_Bluetooth",
+    "Devices_Bluetooth_Advertisement",
     "Devices_Bluetooth_GenericAttributeProfile",
+    "Devices_Enumeration",
     "Foundation",
     "Foundation_Collections",
     "Storage_Streams",

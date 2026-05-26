@@ -10,7 +10,8 @@ use futures::stream::StreamExt;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock as StdOnceLock};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
@@ -36,12 +37,338 @@ const MESH_BACKGROUND_SCAN_INTERVAL: StdDuration = StdDuration::from_secs(9);
 const MESH_BACKGROUND_SCAN_TIMEOUT: Duration = Duration::from_secs(4);
 const MESH_BACKGROUND_SCAN_GRACE: StdDuration = StdDuration::from_secs(1);
 const MESH_LINK_HEALTH_CHECK_INTERVAL: StdDuration = StdDuration::from_secs(10);
+const MESH_LINK_RX_GRACE: StdDuration = StdDuration::from_secs(18);
 const MESH_SCAN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MESH_PRIMARY_SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 const MESH_PRIMARY_SCAN_GRACE: StdDuration = StdDuration::from_secs(4);
 const MESH_PRIMARY_RETRY_FAST_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const MESH_PRIMARY_RETRY_SLOW_INTERVAL: StdDuration = StdDuration::from_secs(15);
 const MESH_PRIMARY_RETRY_FAST_WINDOW: StdDuration = StdDuration::from_secs(60);
+const REQUEST_SYNC_HANDSHAKE_RETRY_COOLDOWN: StdDuration = StdDuration::from_secs(4);
+const MESH_SPARSE_FALLBACK_DELAY: StdDuration = StdDuration::from_secs(4);
+const MESH_SPARSE_FALLBACK_DELAY_WINDOWS: StdDuration = StdDuration::from_secs(9);
+const MESH_UNRESPONSIVE_BLACKLIST_DURATION: StdDuration = StdDuration::from_secs(75);
+const BITCHAT_BLE_BEACON_PREFIX: &[u8] = b"BCT1";
+const BITCHAT_BLE_SERVICE_BEACON_PREFIX: &[u8] = b"BCT1";
+static ADAPTER_INFO_EMITTED: AtomicBool = AtomicBool::new(false);
+static WIN10_STABLE_PROBE_ON_MISS_EMITTED: AtomicBool = AtomicBool::new(false);
+static WIN10_BLE_MIN_RSSI_LOG_EMITTED: AtomicBool = AtomicBool::new(false);
+static TEMPORARY_PERIPHERAL_BLACKLIST: StdOnceLock<StdMutex<HashMap<String, std::time::Instant>>> =
+    StdOnceLock::new();
+static BLE_SCAN_LOGGED_CANDIDATES: StdOnceLock<StdMutex<HashSet<String>>> = StdOnceLock::new();
+static STABLE_SPARSE_OBSERVATION_COUNTS: StdOnceLock<StdMutex<HashMap<String, u8>>> =
+    StdOnceLock::new();
+
+fn local_ble_bridge_name(nickname: &str, local_peer_id: &str) -> String {
+    let base = nickname
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .take(12)
+        .collect::<String>();
+    let peer_suffix = local_peer_id.chars().take(6).collect::<String>();
+    match (base.is_empty(), peer_suffix.is_empty()) {
+        (true, true) => "bitchat-tui".to_string(),
+        (true, false) => format!("bitchat-{}", peer_suffix),
+        (false, true) => format!("bitchat-{}", base),
+        (false, false) => format!("bitchat-{}-{}", base, peer_suffix),
+    }
+}
+
+fn peripheral_summary(
+    peripheral_id: &str,
+    properties: Option<&btleplug::api::PeripheralProperties>,
+) -> String {
+    if let Some(props) = properties {
+        let name = props
+            .local_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("<no-name>");
+        format!("{} addr={} name={}", peripheral_id, props.address, name)
+    } else {
+        format!("{} addr=<unknown> name=<unknown>", peripheral_id)
+    }
+}
+
+fn peripheral_rssi(properties: Option<&btleplug::api::PeripheralProperties>) -> Option<i16> {
+    properties.and_then(|props| props.rssi)
+}
+
+fn rssi_or_floor(properties: Option<&btleplug::api::PeripheralProperties>) -> i16 {
+    peripheral_rssi(properties).unwrap_or(i16::MIN)
+}
+
+fn configured_ble_min_rssi() -> Option<i16> {
+    let raw = std::env::var("BITCHAT_BLE_MIN_RSSI").ok()?;
+    let parsed = raw.trim().parse::<i16>().ok()?;
+    Some(parsed.clamp(-127, 20))
+}
+
+fn normalize_ble_addr(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn configured_ble_target_addr() -> Option<String> {
+    std::env::var("BITCHAT_BLE_TARGET_ADDR")
+        .ok()
+        .map(|value| normalize_ble_addr(&value))
+        .filter(|value| value.len() == 12)
+}
+
+fn configured_ble_target_addrs() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(raw) = std::env::var("BITCHAT_BLE_TARGET_ADDRS") {
+        for part in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+            let normalized = normalize_ble_addr(part);
+            if normalized.len() == 12 && !out.iter().any(|existing| existing == &normalized) {
+                out.push(normalized);
+            }
+        }
+    }
+    if let Some(single) = configured_ble_target_addr() {
+        if !out.iter().any(|existing| existing == &single) {
+            out.push(single);
+        }
+    }
+    out
+}
+
+fn ble_target_hard_only() -> bool {
+    std::env::var("BITCHAT_BLE_TARGET_HARD_ONLY")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn peripheral_id_addr(peripheral_id: &str) -> Option<String> {
+    let inner = peripheral_id
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')').map(|(value, _)| value))?;
+    let normalized = normalize_ble_addr(inner);
+    (normalized.len() == 12).then_some(normalized)
+}
+
+fn peripheral_matches_target_addr(
+    peripheral_id: &str,
+    properties: Option<&btleplug::api::PeripheralProperties>,
+    target: &str,
+) -> bool {
+    let property_addr = properties
+        .map(|props| normalize_ble_addr(&props.address.to_string()))
+        .filter(|value| value.len() == 12);
+    let id_addr = peripheral_id_addr(peripheral_id);
+    property_addr.as_deref() == Some(target) || id_addr.as_deref() == Some(target)
+}
+
+fn peripheral_matches_any_target_addr(
+    peripheral_id: &str,
+    properties: Option<&btleplug::api::PeripheralProperties>,
+    targets: &[String],
+) -> Option<String> {
+    targets
+        .iter()
+        .find(|target| peripheral_matches_target_addr(peripheral_id, properties, target))
+        .cloned()
+}
+
+fn ble_scan_log_enabled(target_addr: Option<&str>) -> bool {
+    target_addr.is_some()
+        || std::env::var("BITCHAT_BLE_SCAN_LOG")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+}
+
+fn is_bitchat_ble_beacon_payload(payload: &[u8]) -> bool {
+    payload
+        .windows(BITCHAT_BLE_BEACON_PREFIX.len())
+        .any(|window| window == BITCHAT_BLE_BEACON_PREFIX)
+}
+
+fn has_bitchat_ble_beacon_in_manufacturer_data(
+    manufacturer_data: &HashMap<u16, Vec<u8>>,
+) -> bool {
+    manufacturer_data
+        .values()
+        .any(|payload| is_bitchat_ble_beacon_payload(payload))
+}
+
+fn has_bitchat_service_beacon_in_service_data(
+    service_data: &HashMap<Uuid, Vec<u8>>,
+) -> bool {
+    service_data
+        .values()
+        .any(|payload| {
+            payload
+                .windows(BITCHAT_BLE_SERVICE_BEACON_PREFIX.len())
+                .any(|window| window == BITCHAT_BLE_SERVICE_BEACON_PREFIX)
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn read_winrt_buffer_bytes(
+    buffer: &windows::Storage::Streams::IBuffer,
+) -> windows::core::Result<Vec<u8>> {
+    let reader = windows::Storage::Streams::DataReader::FromBuffer(buffer)?;
+    let size = reader.UnconsumedBufferLength()? as usize;
+    let mut payload = vec![0u8; size];
+    reader.ReadBytes(&mut payload)?;
+    Ok(payload)
+}
+
+fn log_ble_scan_candidate_once(
+    peripheral_id: &str,
+    properties: Option<&btleplug::api::PeripheralProperties>,
+    target_addr: Option<&str>,
+) {
+    if !ble_scan_log_enabled(target_addr) {
+        return;
+    }
+
+    let log_key = if let Some(target) = target_addr {
+        format!("target={}:{}", target, peripheral_id)
+    } else {
+        peripheral_id.to_string()
+    };
+    if let Ok(mut logged) = BLE_SCAN_LOGGED_CANDIDATES
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+    {
+        if !logged.insert(log_key) {
+            return;
+        }
+    }
+
+    let target_match = target_addr
+        .map(|target| peripheral_matches_target_addr(peripheral_id, properties, target))
+        .unwrap_or(false);
+    if let Some(props) = properties {
+        let name = props
+            .local_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("<no-name>");
+        let rssi = peripheral_rssi(Some(props))
+            .map(|value| format!("{}dBm", value))
+            .unwrap_or_else(|| "n/a".to_string());
+        write_debug_log(&format!(
+            "BLE scan candidate: {} addr={} name={} rssi={} services={} service_data={} manufacturer_data={} beacon_match={} service_beacon_match={} target_match={}",
+            peripheral_id,
+            props.address,
+            name,
+            rssi,
+            props.services.len(),
+            props.service_data.len(),
+            props.manufacturer_data.len(),
+            has_bitchat_ble_beacon_in_manufacturer_data(&props.manufacturer_data),
+            has_bitchat_service_beacon_in_service_data(&props.service_data),
+            target_match
+        ));
+    } else {
+        write_debug_log(&format!(
+            "BLE scan candidate: {} properties=<none> target_match={}",
+            peripheral_id, target_match
+        ));
+    }
+}
+
+fn temporary_peripheral_blacklist() -> &'static StdMutex<HashMap<String, std::time::Instant>> {
+    TEMPORARY_PERIPHERAL_BLACKLIST.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn cleanup_temporary_blacklist(now: std::time::Instant) {
+    if let Ok(mut guard) = temporary_peripheral_blacklist().lock() {
+        guard.retain(|_, expires_at| *expires_at > now);
+    }
+}
+
+fn is_temporarily_blacklisted_peripheral(id: &str, now: std::time::Instant) -> bool {
+    cleanup_temporary_blacklist(now);
+    if let Ok(guard) = temporary_peripheral_blacklist().lock() {
+        return guard.get(id).map(|expires_at| *expires_at > now).unwrap_or(false);
+    }
+    false
+}
+
+fn blacklist_peripheral_temporarily(id: &str, now: std::time::Instant) {
+    if let Ok(mut guard) = temporary_peripheral_blacklist().lock() {
+        guard.insert(id.to_string(), now + MESH_UNRESPONSIVE_BLACKLIST_DURATION);
+    }
+}
+
+fn stable_sparse_observation_counts() -> &'static StdMutex<HashMap<String, u8>> {
+    STABLE_SPARSE_OBSERVATION_COUNTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn stable_sparse_observation_increment(id: &str) -> u8 {
+    if let Ok(mut guard) = stable_sparse_observation_counts().lock() {
+        let entry = guard.entry(id.to_string()).or_insert(0);
+        let next = entry.saturating_add(1);
+        *entry = next;
+        return next;
+    }
+    1
+}
+
+fn win10_stable_scan_enabled() -> bool {
+    cfg!(target_os = "windows")
+        && std::env::var("BITCHAT_WIN10_STABLE_SCAN")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn win10_stable_scan_relax_on_miss_enabled() -> bool {
+    cfg!(target_os = "windows")
+        && std::env::var("BITCHAT_WIN10_STABLE_SCAN_RELAX_ON_MISS")
+            .map(|value| value.trim() != "0")
+            .unwrap_or(true)
+}
+
+fn win10_ble_self_check_only_enabled() -> bool {
+    cfg!(target_os = "windows")
+        && std::env::var("BITCHAT_WIN10_BLE_SELF_CHECK_ONLY")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+}
+
+fn mesh_require_bcid_identity() -> bool {
+    std::env::var("BITCHAT_REQUIRE_BCID")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn mesh_require_bcid_identity_strict() -> bool {
+    std::env::var("BITCHAT_REQUIRE_BCID_STRICT")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn win10_ble_self_check_enabled() -> bool {
+    cfg!(target_os = "windows")
+        && (win10_ble_self_check_only_enabled()
+            || std::env::var("BITCHAT_WIN10_BLE_SELF_CHECK")
+                .map(|value| value.trim() == "1")
+                .unwrap_or(false))
+}
 
 // Debug logging function
 pub(crate) fn write_debug_log(message: &str) {
@@ -138,6 +465,8 @@ struct MeshLink {
     id: String,
     peripheral: Peripheral,
     cmd: Characteristic,
+    established_at: std::time::Instant,
+    last_rx_at: Option<std::time::Instant>,
 }
 
 struct MeshNotification {
@@ -150,6 +479,10 @@ fn mesh_send_targets(mesh_links: &[MeshLink]) -> Vec<(Peripheral, Characteristic
         .iter()
         .map(|link| (link.peripheral.clone(), link.cmd.clone()))
         .collect()
+}
+
+fn mesh_transport_available(mesh_links: &[MeshLink]) -> bool {
+    !mesh_links.is_empty() || crate::ble_peripheral::ble_peripheral_transport_ready()
 }
 
 fn merge_mesh_links(mesh_links: &mut Vec<MeshLink>, new_links: Vec<MeshLink>) -> bool {
@@ -176,6 +509,8 @@ fn merge_mesh_links(mesh_links: &mut Vec<MeshLink>, new_links: Vec<MeshLink>) ->
 
 fn spawn_bluetooth_scan(
     ui_tx: mpsc::Sender<String>,
+    local_peer_id: String,
+    local_bridge_name: String,
     connected_signal: &'static str,
     error_prefix: &'static str,
     excluded_peripheral_ids: HashSet<String>,
@@ -186,6 +521,8 @@ fn spawn_bluetooth_scan(
     tokio::spawn(async move {
         match setup_bluetooth_connections(
             ui_tx.clone(),
+            local_peer_id,
+            local_bridge_name,
             excluded_peripheral_ids,
             timeout_duration,
             discovery_grace,
@@ -194,7 +531,9 @@ fn spawn_bluetooth_scan(
         .await
         {
             Ok(peripherals) => {
-                if !peripherals.is_empty() || connected_signal == "__CONNECTED__" {
+                let self_check_only = win10_ble_self_check_only_enabled();
+                if !peripherals.is_empty() || (connected_signal == "__CONNECTED__" && !self_check_only)
+                {
                     let _ = ui_tx.send(connected_signal.to_string()).await;
                 }
                 Ok(peripherals)
@@ -208,7 +547,9 @@ fn spawn_bluetooth_scan(
 }
 
 async fn relay_raw_packet_to_mesh_links(mesh_links: &[MeshLink], packet: &[u8]) -> usize {
-    let write_type = if cfg!(target_os = "windows") || packet.len() > 512 {
+    let preferred_write_type = if cfg!(target_os = "windows") {
+        WriteType::WithoutResponse
+    } else if packet.len() > 512 {
         WriteType::WithResponse
     } else {
         WriteType::WithoutResponse
@@ -216,16 +557,78 @@ async fn relay_raw_packet_to_mesh_links(mesh_links: &[MeshLink], packet: &[u8]) 
 
     let mut sent = 0usize;
     for link in mesh_links {
-        if link
-            .peripheral
-            .write(&link.cmd, packet, write_type)
+        if write_mesh_packet(&link.peripheral, &link.cmd, packet, preferred_write_type)
             .await
             .is_ok()
         {
             sent += 1;
         }
     }
+    if crate::ble_peripheral::ble_peripheral_transport_ready() {
+        crate::ble_peripheral::queue_ble_peripheral_packet(packet);
+        sent += 1;
+    }
     sent
+}
+
+async fn write_mesh_packet(
+    peripheral: &Peripheral,
+    cmd: &btleplug::api::Characteristic,
+    packet: &[u8],
+    preferred_write_type: WriteType,
+) -> Result<(), btleplug::Error> {
+    if cfg!(target_os = "windows") && preferred_write_type == WriteType::WithResponse {
+        match time::timeout(
+            Duration::from_millis(350),
+            peripheral.write(cmd, packet, preferred_write_type),
+        )
+        .await
+        {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(first_error)) => {
+                write_debug_log(&format!(
+                    "Mesh write with {:?} failed on {:?}: {}; retrying with {:?}",
+                    preferred_write_type,
+                    peripheral.id(),
+                    first_error,
+                    WriteType::WithoutResponse
+                ));
+                return peripheral
+                    .write(cmd, packet, WriteType::WithoutResponse)
+                    .await;
+            }
+            Err(_) => {
+                write_debug_log(&format!(
+                    "Mesh write with {:?} timed out on {:?}; retrying with {:?}",
+                    preferred_write_type,
+                    peripheral.id(),
+                    WriteType::WithoutResponse
+                ));
+                return peripheral
+                    .write(cmd, packet, WriteType::WithoutResponse)
+                    .await;
+            }
+        }
+    }
+
+    match peripheral.write(cmd, packet, preferred_write_type).await {
+        Ok(()) => Ok(()),
+        Err(first_error) if cfg!(target_os = "windows") => {
+            if preferred_write_type == WriteType::WithoutResponse {
+                return Err(first_error);
+            }
+            let fallback_write_type = WriteType::WithoutResponse;
+            write_debug_log(&format!(
+                "Mesh write with {:?} failed on {:?}: {}; retrying with {:?}",
+                preferred_write_type,
+                peripheral.id(),
+                first_error,
+                fallback_write_type
+            ));
+            peripheral.write(cmd, packet, fallback_write_type).await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn active_mesh_link_ids(mesh_links: &[MeshLink]) -> HashSet<String> {
@@ -234,10 +637,14 @@ fn active_mesh_link_ids(mesh_links: &[MeshLink]) -> HashSet<String> {
 
 fn spawn_background_mesh_scan(
     ui_tx: mpsc::Sender<String>,
+    local_peer_id: String,
+    local_bridge_name: String,
     mesh_links: &[MeshLink],
 ) -> tokio::task::JoinHandle<Result<Vec<Peripheral>, Box<dyn std::error::Error + Send + Sync>>> {
     spawn_bluetooth_scan(
         ui_tx,
+        local_peer_id,
+        local_bridge_name,
         "__MESH_REFRESH_CONNECTED__",
         "__MESH_REFRESH_ERROR__",
         active_mesh_link_ids(mesh_links),
@@ -249,9 +656,13 @@ fn spawn_background_mesh_scan(
 
 fn spawn_primary_mesh_scan(
     ui_tx: mpsc::Sender<String>,
+    local_peer_id: String,
+    local_bridge_name: String,
 ) -> tokio::task::JoinHandle<Result<Vec<Peripheral>, Box<dyn std::error::Error + Send + Sync>>> {
     spawn_bluetooth_scan(
         ui_tx,
+        local_peer_id,
+        local_bridge_name,
         "__CONNECTED__",
         "__ERROR__",
         HashSet::new(),
@@ -272,8 +683,25 @@ fn primary_retry_interval(window_started_at: std::time::Instant) -> StdDuration 
 async fn retain_connected_mesh_links(mesh_links: &mut Vec<MeshLink>) -> bool {
     let mut retained = Vec::with_capacity(mesh_links.len());
     let mut changed = false;
+    let enforce_inbound_grace = !(cfg!(target_os = "windows")
+        && std::env::var("BITCHAT_WIN10_SKIP_INBOUND_GRACE")
+            .map(|value| value.trim() != "0")
+            .unwrap_or(true));
 
     for link in mesh_links.drain(..) {
+        if enforce_inbound_grace
+            && link.last_rx_at.is_none()
+            && link.established_at.elapsed() >= MESH_LINK_RX_GRACE
+        {
+            changed = true;
+            write_debug_log(&format!(
+                "Dropping mesh link {}: no inbound packets within {:?}",
+                link.id, MESH_LINK_RX_GRACE
+            ));
+            blacklist_peripheral_temporarily(&link.id, std::time::Instant::now());
+            let _ = link.peripheral.disconnect().await;
+            continue;
+        }
         match link.peripheral.is_connected().await {
             Ok(true) => retained.push(link),
             Ok(false) => {
@@ -474,6 +902,8 @@ fn persist_runtime_state(
 // It still reads from stdin directly but sends user input over its own channel.
 async fn setup_bluetooth_connections(
     ui_tx: mpsc::Sender<String>,
+    local_peer_id: String,
+    local_bridge_name: String,
     excluded_peripheral_ids: HashSet<String>,
     timeout_duration: Duration,
     discovery_grace: StdDuration,
@@ -498,9 +928,18 @@ async fn setup_bluetooth_connections(
         }
     };
 
+    let stable_scan_mode = win10_stable_scan_enabled();
     let use_targeted_scan = std::env::var("BITCHAT_TARGETED_SCAN")
         .map(|value| value.trim() == "1")
         .unwrap_or(false);
+    if !ADAPTER_INFO_EMITTED.swap(true, Ordering::Relaxed) {
+        if let Ok(adapter_info) = adapter.adapter_info().await {
+            write_debug_log(&format!("Local Bluetooth adapter: {}", adapter_info));
+            let _ = ui_tx
+                .send(format!("system: Local Bluetooth adapter: {}", adapter_info))
+                .await;
+        }
+    }
     if use_targeted_scan {
         let targeted_filter = ScanFilter {
             services: vec![BITCHAT_SERVICE_UUID, BITCHAT_TEST_SERVICE_UUID],
@@ -514,6 +953,57 @@ async fn setup_bluetooth_connections(
         }
     } else {
         adapter.start_scan(ScanFilter::default()).await?;
+    }
+
+    if stable_scan_mode {
+        write_debug_log(
+            "Win10 stable scan mode enabled: strict service/name discovery with random fallback disabled (targeted scan is optional)",
+        );
+        let _ = ui_tx
+            .send(
+                "system: Win10 stable scan mode enabled (strict BLE discovery, fallback disabled; targeted filter off by default)"
+                    .to_string(),
+            )
+            .await;
+    }
+    let target_addrs = configured_ble_target_addrs();
+    if !target_addrs.is_empty() {
+        let target_hard_only = ble_target_hard_only();
+        if target_hard_only {
+            write_debug_log(&format!(
+                "BLE target mode: hard-only enabled for {}; non-matching candidates will be skipped",
+                target_addrs.join(",")
+            ));
+            let _ = ui_tx
+                .send(format!(
+                    "system: BLE target hard-only enabled ({})",
+                    target_addrs.join(", ")
+                ))
+                .await;
+        } else {
+            write_debug_log(&format!(
+                "BLE target mode: priority match for {} with candidate+feature fallback enabled",
+                target_addrs.join(",")
+            ));
+            let _ = ui_tx
+                .send(format!(
+                    "system: BLE target priority enabled ({}) with candidate+feature fallback",
+                    target_addrs.join(", ")
+                ))
+                .await;
+        }
+    }
+    if let Some(min_rssi) = configured_ble_min_rssi() {
+        write_debug_log(&format!(
+            "BLE minimum RSSI filter enabled: candidates below {}dBm will be ignored",
+            min_rssi
+        ));
+        let _ = ui_tx
+            .send(format!(
+                "system: BLE min RSSI filter enabled ({} dBm)",
+                min_rssi
+            ))
+            .await;
     }
 
     if debug_enabled {
@@ -532,21 +1022,117 @@ async fn setup_bluetooth_connections(
             .map_err(|e| e.to_string())?;
     }
 
+    #[cfg(target_os = "windows")]
+    let mut stable_scan_relaxed = false;
+    #[cfg(target_os = "windows")]
+    if win10_ble_self_check_enabled() {
+        let self_check_window_secs = env_u64("BITCHAT_WIN10_BLE_SELF_CHECK_SECS", 8).clamp(2, 30);
+        let self_check_window = Duration::from_secs(self_check_window_secs);
+        let summary = run_win10_ble_visibility_self_check(&adapter, &ui_tx, self_check_window).await?;
+        if summary.watcher_packets_seen == 0 {
+            let _ = ui_tx
+                .send(
+                    "system: BLE self-check saw 0 raw advertisement packets via WinRT watcher. This is likely an OS/driver/privacy scan issue."
+                        .to_string(),
+                )
+                .await;
+        }
+        if stable_scan_mode
+            && summary.bitchat_candidates_seen == 0
+            && (summary.total_candidates_seen > 0 || summary.watcher_packets_seen > 0)
+            && win10_stable_scan_relax_on_miss_enabled()
+        {
+            stable_scan_relaxed = true;
+            write_debug_log(
+                "Win10 stable scan auto-relax enabled after self-check miss: no BitChat signal visible",
+            );
+            let _ = ui_tx
+                .send(
+                    "system: Win10 stable scan auto-relaxed (no BitChat signal in advertisements; using controlled fallback)"
+                        .to_string(),
+                )
+                .await;
+        } else if stable_scan_mode
+            && summary.bitchat_candidates_seen == 0
+            && (summary.total_candidates_seen > 0 || summary.watcher_packets_seen > 0)
+            && !win10_stable_scan_relax_on_miss_enabled()
+        {
+            write_debug_log(
+                "Win10 stable scan auto-relax skipped because BITCHAT_WIN10_STABLE_SCAN_RELAX_ON_MISS=0",
+            );
+        }
+        if win10_ble_self_check_only_enabled() {
+            let _ = adapter.stop_scan().await;
+            let _ = ui_tx
+                .send(
+                    "system: BLE self-check only mode completed (no GATT connect attempted)."
+                        .to_string(),
+                )
+                .await;
+            return Ok(Vec::new());
+        }
+    }
+
     let start_time = std::time::Instant::now();
     let mut skipped_peripherals = excluded_peripheral_ids;
+    let require_bcid_identity = mesh_require_bcid_identity();
 
     let mut connected_peripherals = Vec::new();
     let mut first_valid_at: Option<std::time::Instant> = None;
 
     loop {
-        if let Some(p) = find_peripheral(&adapter, &skipped_peripherals).await? {
+        if let Some(p) = find_peripheral(
+            &adapter,
+            &skipped_peripherals,
+            start_time.elapsed(),
+            {
+                #[cfg(target_os = "windows")]
+                {
+                    stable_scan_relaxed
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    false
+                }
+            },
+        )
+        .await?
+        {
             let peripheral_id = format!("{:?}", p.id());
+            if is_temporarily_blacklisted_peripheral(&peripheral_id, std::time::Instant::now()) {
+                write_debug_log(&format!(
+                    "Skip candidate {}: temporarily blacklisted after unresponsive link",
+                    peripheral_id
+                ));
+                skipped_peripherals.insert(peripheral_id);
+                continue;
+            }
+            let candidate_properties = p.properties().await.ok().flatten();
+            if let Some(properties) = candidate_properties.as_ref() {
+                if let Some(remote_name) = properties.local_name.as_deref() {
+                    if remote_name.eq_ignore_ascii_case(&local_bridge_name) {
+                        write_debug_log(&format!(
+                            "Skip candidate {}: matched local bridge name '{}'",
+                            peripheral_id, local_bridge_name
+                        ));
+                        skipped_peripherals.insert(peripheral_id);
+                        continue;
+                    }
+                }
+            }
             if debug_enabled {
                 ui_tx
                     .send(
                         "\x1b[90m» Found candidate device. Validating BitChat service...\x1b[0m\n"
                             .to_string(),
                     )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                ui_tx
+                    .send(format!(
+                        "\x1b[90m» Candidate {}\x1b[0m\n",
+                        peripheral_summary(&peripheral_id, candidate_properties.as_ref())
+                    ))
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -566,6 +1152,11 @@ async fn setup_bluetooth_connections(
             }
 
             if let Err(e) = p.connect().await {
+                write_debug_log(&format!(
+                    "Skip candidate {}: connect failed ({})",
+                    peripheral_id, e
+                ));
+                blacklist_peripheral_temporarily(&peripheral_id, std::time::Instant::now());
                 if debug_enabled {
                     ui_tx
                         .send(format!(
@@ -592,6 +1183,10 @@ async fn setup_bluetooth_connections(
                         .join(", ");
                 }
                 Err(e) => {
+                    write_debug_log(&format!(
+                        "Skip candidate {}: discover services failed ({})",
+                        peripheral_id, e
+                    ));
                     if debug_enabled {
                         ui_tx
                             .send(format!(
@@ -605,11 +1200,86 @@ async fn setup_bluetooth_connections(
             }
 
             if is_valid_bitchat {
+                let mut identity_verified = false;
+                if let Some(cmd_char) = p
+                    .characteristics()
+                    .iter()
+                    .find(|c| c.uuid == BITCHAT_CHARACTERISTIC_UUID)
+                    .cloned()
+                {
+                    if let Ok(identity_payload) = p.read(&cmd_char).await {
+                        write_debug_log(&format!(
+                            "Candidate {} identity payload: {}",
+                            peripheral_id,
+                            String::from_utf8_lossy(&identity_payload)
+                        ));
+                        if let Some(peer_id_bytes) = identity_payload.strip_prefix(b"BCID:") {
+                            if let Ok(advertised_peer_id) = std::str::from_utf8(peer_id_bytes) {
+                                if !advertised_peer_id.trim().is_empty() {
+                                    identity_verified = true;
+                                }
+                                if advertised_peer_id.trim() == local_peer_id {
+                                    write_debug_log(&format!(
+                                        "Skip candidate {}: self-bridge identity {}",
+                                        peripheral_id, local_peer_id
+                                    ));
+                                    let _ = p.disconnect().await;
+                                    skipped_peripherals.insert(peripheral_id);
+                                    continue;
+                                }
+                            }
+                        }
+                    } else {
+                        write_debug_log(&format!(
+                            "Candidate {} identity read failed before announce check",
+                            peripheral_id
+                        ));
+                    }
+                }
+
+                if require_bcid_identity && !identity_verified {
+                    if mesh_require_bcid_identity_strict() {
+                        write_debug_log(&format!(
+                            "Skip candidate {}: BCID identity required but unavailable",
+                            peripheral_id
+                        ));
+                        if debug_enabled {
+                            let _ = ui_tx
+                                .send(format!(
+                                    "\x1b[90m» Skip candidate {}: BCID identity required but unavailable\x1b[0m\n",
+                                    peripheral_id
+                                ))
+                                .await;
+                        }
+                        blacklist_peripheral_temporarily(&peripheral_id, std::time::Instant::now());
+                        let _ = p.disconnect().await;
+                        skipped_peripherals.insert(peripheral_id);
+                        continue;
+                    } else {
+                        write_debug_log(&format!(
+                            "Candidate {} BCID identity unavailable; accepting non-strict fallback link",
+                            peripheral_id
+                        ));
+                        if debug_enabled {
+                            let _ = ui_tx
+                                .send(format!(
+                                    "\x1b[90m» Candidate {} has BitChat characteristic but no BCID; continuing (non-strict mode).\x1b[0m\n",
+                                    peripheral_id
+                                ))
+                                .await;
+                        }
+                    }
+                }
+
+                write_debug_log(&format!(
+                    "BitChat characteristic confirmed on {}",
+                    peripheral_summary(&peripheral_id, candidate_properties.as_ref())
+                ));
                 if debug_enabled {
                     ui_tx
                         .send(format!(
                             "\x1b[90m» BitChat characteristic confirmed on {}.\x1b[0m\n",
-                            peripheral_id
+                            peripheral_summary(&peripheral_id, candidate_properties.as_ref())
                         ))
                         .await
                         .map_err(|e| e.to_string())?;
@@ -620,12 +1290,33 @@ async fn setup_bluetooth_connections(
                 skipped_peripherals.insert(peripheral_id);
                 connected_peripherals.push(p);
 
-                if connected_peripherals.len() >= MESH_MAX_CENTRAL_LINKS {
+                // Windows GATT peripheral handles can become stale if we keep scanning
+                // after validation. Initialize the first confirmed link immediately;
+                // background refresh can add more links later.
+                if cfg!(target_os = "windows")
+                    || connected_peripherals.len() >= MESH_MAX_CENTRAL_LINKS
+                {
+                    if let Err(e) = adapter.stop_scan().await {
+                        write_debug_log(&format!(
+                            "Failed to stop BLE scan after confirmed BitChat characteristic: {}",
+                            e
+                        ));
+                    }
                     break;
                 }
                 continue;
             }
 
+            write_debug_log(&format!(
+                "Skip candidate {}: missing BitChat characteristic {} (available: {})",
+                peripheral_id,
+                BITCHAT_CHARACTERISTIC_UUID,
+                if available_characteristics.is_empty() {
+                    "none"
+                } else {
+                    &available_characteristics
+                }
+            ));
             if debug_enabled {
                 ui_tx
                     .send(format!(
@@ -642,6 +1333,7 @@ async fn setup_bluetooth_connections(
                     .map_err(|e| e.to_string())?;
             }
             let _ = p.disconnect().await;
+            blacklist_peripheral_temporarily(&peripheral_id, std::time::Instant::now());
             skipped_peripherals.insert(peripheral_id);
         }
 
@@ -713,14 +1405,15 @@ async fn send_mesh_announce(
         announce_timestamp,
     );
     let announce_write_type = if cfg!(target_os = "windows") {
-        WriteType::WithResponse
+        WriteType::WithoutResponse
     } else {
         WriteType::WithoutResponse
     };
-    peripheral
-        .write(cmd, &announce_packet, announce_write_type)
-        .await
-        .map_err(|e| e.into())
+    write_mesh_packet(peripheral, cmd, &announce_packet, announce_write_type).await?;
+    if crate::ble_peripheral::ble_peripheral_transport_ready() {
+        crate::ble_peripheral::queue_ble_peripheral_packet(&announce_packet);
+    }
+    Ok(())
 }
 
 async fn initialize_mesh_link(
@@ -732,76 +1425,127 @@ async fn initialize_mesh_link(
     encryption: &EncryptionService,
 ) -> Result<MeshLink, String> {
     let link_id = format!("{:?}", peripheral.id());
-
-    peripheral
-        .discover_services()
-        .await
-        .map_err(|e| format!("service discovery failed on {}: {}", link_id, e))?;
-
-    let chars = peripheral.characteristics();
-    let Some(cmd) = chars
-        .iter()
-        .find(|c| c.uuid == BITCHAT_CHARACTERISTIC_UUID)
-        .cloned()
-    else {
-        let available = chars
-            .iter()
-            .map(|c| c.uuid.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "required bitchat characteristic {} was not found on {}. Available characteristics: {}",
-            BITCHAT_CHARACTERISTIC_UUID,
-            link_id,
-            if available.is_empty() {
-                "none"
-            } else {
-                &available
-            }
-        ));
+    let link_descriptor = match peripheral.properties().await {
+        Ok(Some(properties)) => peripheral_summary(&link_id, Some(&properties)),
+        _ => peripheral_summary(&link_id, None),
     };
+    let max_attempts = if cfg!(target_os = "windows") { 3 } else { 1 };
+    let mut last_error = None;
 
-    peripheral
-        .subscribe(&cmd)
-        .await
-        .map_err(|e| format!("failed to subscribe on {}: {}", link_id, e))?;
-
-    let mut notifications = peripheral
-        .notifications()
-        .await
-        .map_err(|e| format!("failed to open notifications on {}: {}", link_id, e))?;
-
-    let notify_link_id = link_id.clone();
-    tokio::spawn(async move {
-        while let Some(notification) = notifications.next().await {
-            if mesh_notify_tx
-                .send(MeshNotification {
-                    link_id: notify_link_id.clone(),
-                    value: notification.value,
-                })
+    for attempt in 1..=max_attempts {
+        if attempt > 1 {
+            let _ = peripheral.disconnect().await;
+            time::sleep(Duration::from_millis(450 * attempt as u64)).await;
+            peripheral
+                .connect()
                 .await
-                .is_err()
-            {
-                break;
-            }
+                .map_err(|e| format!("failed to reconnect on {}: {}", link_id, e))?;
+            write_debug_log(&format!(
+                "Retrying mesh link initialization on {} (attempt {}/{})",
+                link_id, attempt, max_attempts
+            ));
         }
-    });
 
-    send_mesh_announce(&peripheral, &cmd, nickname, my_peer_id, encryption, &[])
-        .await
-        .map_err(|e| format!("failed to announce on {}: {}", link_id, e))?;
+        let init_result: Result<Characteristic, String> = async {
+            peripheral
+                .discover_services()
+                .await
+                .map_err(|e| format!("service discovery failed on {}: {}", link_id, e))?;
 
-    if crate::tui::app::bitchat_debug_enabled() {
-        let _ = ui_tx
-            .send(format!("system: Bluetooth mesh link ready: {}", link_id))
-            .await;
+            let chars = peripheral.characteristics();
+            let Some(cmd) = chars
+                .iter()
+                .find(|c| c.uuid == BITCHAT_CHARACTERISTIC_UUID)
+                .cloned()
+            else {
+                let available = chars
+                    .iter()
+                    .map(|c| c.uuid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "required bitchat characteristic {} was not found on {}. Available characteristics: {}",
+                    BITCHAT_CHARACTERISTIC_UUID,
+                    link_id,
+                    if available.is_empty() {
+                        "none"
+                    } else {
+                        &available
+                    }
+                ));
+            };
+
+            peripheral
+                .subscribe(&cmd)
+                .await
+                .map_err(|e| format!("failed to subscribe on {}: {}", link_id, e))?;
+
+            send_mesh_announce(&peripheral, &cmd, nickname, my_peer_id, encryption, &[])
+                .await
+                .map_err(|e| format!("failed to announce on {}: {}", link_id, e))?;
+
+            Ok(cmd)
+        }
+        .await;
+
+        let cmd = match init_result {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                write_debug_log(&format!(
+                    "Mesh link initialization attempt {}/{} failed on {}: {}",
+                    attempt, max_attempts, link_id, e
+                ));
+                last_error = Some(e);
+                continue;
+            }
+        };
+
+        let mut notifications = match peripheral.notifications().await {
+            Ok(notifications) => notifications,
+            Err(e) => {
+                let err = format!("failed to open notifications on {}: {}", link_id, e);
+                write_debug_log(&format!(
+                    "Mesh link initialization attempt {}/{} failed on {}: {}",
+                    attempt, max_attempts, link_id, err
+                ));
+                last_error = Some(err);
+                continue;
+            }
+        };
+
+        let notify_link_id = link_id.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = notifications.next().await {
+                if mesh_notify_tx
+                    .send(MeshNotification {
+                        link_id: notify_link_id.clone(),
+                        value: notification.value,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        write_debug_log(&format!("Bluetooth mesh link ready: {}", link_descriptor));
+        if crate::tui::app::bitchat_debug_enabled() {
+            let _ = ui_tx
+                .send(format!("system: Bluetooth mesh link ready: {}", link_descriptor))
+                .await;
+        }
+
+        return Ok(MeshLink {
+            id: link_id,
+            peripheral,
+            cmd,
+            established_at: std::time::Instant::now(),
+            last_rx_at: None,
+        });
     }
 
-    Ok(MeshLink {
-        id: link_id,
-        peripheral,
-        cmd,
-    })
+    Err(last_error.unwrap_or_else(|| format!("failed to initialize mesh link on {}", link_id)))
 }
 
 fn parse_dm_command(line: &str) -> Option<(String, Option<String>)> {
@@ -1850,16 +2594,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.nostr_aliases = saved_state.nostr_aliases.clone();
     let nostr_geo_client =
         nostr_geo::NostrGeoClient::new(ui_tx.clone(), nostr_identity_seed.clone());
+    let encryption = Arc::new(EncryptionService::new_with_persistent_keys(
+        saved_state.noise_static_key.as_deref(),
+        saved_state.identity_key.as_deref(),
+    ));
+    let my_peer_id = encryption.derive_peer_id();
+    let local_bridge_name = local_ble_bridge_name(&app.nickname, &my_peer_id);
     ble_peripheral::start_ble_peripheral_bridge(
         ui_tx.clone(),
         app.nickname.clone(),
         peripheral_write_tx.clone(),
+        my_peer_id.clone(),
     )
     .await;
 
     // Spawn Bluetooth connection setup in the background
     let ui_tx_clone = ui_tx.clone();
-    let mut bt_handle = Some(spawn_primary_mesh_scan(ui_tx_clone));
+    let mut bt_handle = Some(spawn_primary_mesh_scan(
+        ui_tx_clone,
+        my_peer_id.clone(),
+        local_bridge_name.clone(),
+    ));
 
     // State for after connection
     let mut peripheral: Option<Peripheral> = None;
@@ -1868,11 +2623,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut _characteristics: Option<Vec<Characteristic>> = None;
     let mut cmd_char = None;
     let mut post_connect_initialized = false;
-    let encryption = Arc::new(EncryptionService::new_with_persistent_keys(
-        saved_state.noise_static_key.as_deref(),
-        saved_state.identity_key.as_deref(),
-    ));
-    let my_peer_id = encryption.derive_peer_id();
     let mut app_state: Option<persistence::AppState> = Some(saved_state.clone());
     let mut nickname = saved_nickname_clone.clone();
     let mut encryption_service = Some(encryption);
@@ -1964,6 +2714,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(std::time::Instant::now());
     let mut primary_retry_window_started_at = std::time::Instant::now();
     let mut had_mesh_links_since_retry_window = false;
+    let mut last_requestsync_handshake_at: HashMap<String, std::time::Instant> = HashMap::new();
 
     let mut last_tick = std::time::Instant::now();
     let tick_rate = StdDuration::from_millis(100);
@@ -2053,6 +2804,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let retry_interval = primary_retry_interval(primary_retry_window_started_at);
         let should_primary_retry = mesh_links.is_empty()
             && bt_handle.is_none()
+            && background_mesh_refresh_handle.is_none()
+            && pending_peripherals.is_empty()
+            && pending_background_peripherals.is_empty()
             && last_primary_mesh_retry_at
                 .map(|last| last.elapsed() >= retry_interval)
                 .unwrap_or(true);
@@ -2061,7 +2815,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !matches!(app.phase, tui::app::TuiPhase::Connecting) {
                 app.mesh_status = "Scanning".to_string();
             }
-            bt_handle = Some(spawn_primary_mesh_scan(ui_tx.clone()));
+            bt_handle = Some(spawn_primary_mesh_scan(
+                ui_tx.clone(),
+                my_peer_id.clone(),
+                local_bridge_name.clone(),
+            ));
             write_debug_log("Primary mesh scan retried automatically");
         }
 
@@ -2087,13 +2845,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let should_background_scan = mesh_links.len() < MESH_MAX_CENTRAL_LINKS
                 && background_mesh_refresh_handle.is_none()
+                && bt_handle.is_none()
+                && pending_background_peripherals.is_empty()
+                && pending_peripherals.is_empty()
+                && !cfg!(target_os = "windows")
                 && last_background_mesh_refresh_at
                     .map(|last| last.elapsed() >= MESH_BACKGROUND_SCAN_INTERVAL)
                     .unwrap_or(true);
             if should_background_scan {
                 last_background_mesh_refresh_at = Some(now);
-                background_mesh_refresh_handle =
-                    Some(spawn_background_mesh_scan(ui_tx.clone(), &mesh_links));
+                background_mesh_refresh_handle = Some(spawn_background_mesh_scan(
+                    ui_tx.clone(),
+                    my_peer_id.clone(),
+                    local_bridge_name.clone(),
+                    &mesh_links,
+                ));
             }
         }
 
@@ -2224,6 +2990,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Post-connection initialization (only once)
+        if !post_connect_initialized
+            && pending_peripherals.is_empty()
+            && mesh_links.is_empty()
+            && crate::ble_peripheral::ble_peripheral_active()
+        {
+            app.connected = true;
+            app.mesh_status = "Peripheral".to_string();
+            _chat_messages = Some(HashMap::new());
+            post_connect_initialized = true;
+
+            let static_secret =
+                if let Some(noise_key_bytes) = &app_state.as_ref().unwrap().noise_static_key {
+                    let key_array: [u8; 32] = noise_key_bytes.as_slice().try_into().unwrap();
+                    StaticSecret::from(key_array)
+                } else {
+                    StaticSecret::random_from_rng(&mut rand::thread_rng())
+                };
+
+            let mut temp_noise_session_manager = NoiseSessionManager::new(static_secret);
+            temp_noise_session_manager.set_on_session_established(|peer_id, remote_static_key| {
+                debug_full_println!(
+                    "[NOISE] Session established with {} (remote key: {:?})",
+                    peer_id,
+                    &remote_static_key.to_bytes()[..8]
+                );
+            });
+            temp_noise_session_manager.set_on_session_failed(|peer_id, error| {
+                debug_full_println!("[NOISE] Session failed with {}: {:?}", peer_id, error);
+            });
+            let auth_ui_tx = ui_tx.clone();
+            temp_noise_session_manager.set_on_peer_authenticated(move |peer_id, fingerprint| {
+                debug_full_println!(
+                    "[NOISE] Peer authenticated: {} (fingerprint: {})",
+                    peer_id,
+                    &fingerprint[..16]
+                );
+                let _ = auth_ui_tx.try_send(format!(
+                    "__NOISE_AUTHENTICATED__:{}:{}",
+                    peer_id, fingerprint
+                ));
+            });
+            temp_noise_session_manager.set_on_handshake_required(|peer_id| {
+                debug_full_println!("[NOISE] Handshake required for peer: {}", peer_id);
+            });
+            if let Some(known_verified) = favorites.as_ref() {
+                temp_noise_session_manager.load_verified_fingerprints(known_verified.clone());
+            }
+            noise_session_manager = Some(temp_noise_session_manager);
+            write_debug_log("Initialized mesh receive path for BLE peripheral-only mode");
+        }
+
         if !post_connect_initialized && matches!(app.phase, tui::app::TuiPhase::Connected) {
             if !pending_peripherals.is_empty() {
                 let mut initialized_links = Vec::new();
@@ -2371,10 +3188,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if !pending_background_peripherals.is_empty() && post_connect_initialized {
+        if post_connect_initialized
+            && (!pending_background_peripherals.is_empty() || !pending_peripherals.is_empty())
+        {
             let mut refreshed_links = Vec::new();
             let mut init_errors = Vec::new();
-            for periph in pending_background_peripherals.drain(..) {
+            let mut refresh_candidates = Vec::new();
+            refresh_candidates.extend(pending_background_peripherals.drain(..));
+            refresh_candidates.extend(pending_peripherals.drain(..));
+            for periph in refresh_candidates {
                 match initialize_mesh_link(
                     periph,
                     ui_tx.clone(),
@@ -2432,18 +3254,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(_) => break,
                     },
                 };
-                if mesh_links.is_empty() {
-                    write_debug_log("Dropped mesh packet because no active links are available");
-                    continue;
+                if mesh_notification.link_id != "__ble_peripheral_write__" {
+                    if let Some(link) = mesh_links
+                        .iter_mut()
+                        .find(|link| link.id == mesh_notification.link_id)
+                    {
+                        link.last_rx_at = Some(std::time::Instant::now());
+                    }
+                } else if !mesh_links.is_empty() {
+                    let now = std::time::Instant::now();
+                    for link in mesh_links.iter_mut() {
+                        link.last_rx_at = Some(now);
+                    }
                 }
-                let Some(active_link) = mesh_links
+                let active_link = mesh_links
                     .iter()
                     .find(|link| link.id == mesh_notification.link_id)
                     .or_else(|| mesh_links.first())
-                    .cloned()
-                else {
-                    continue;
-                };
+                    .cloned();
                 let mut peers_lock = peers.as_ref().unwrap().lock().await;
                 let ui_tx = ui_tx.clone();
 
@@ -2485,7 +3313,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         last_background_mesh_refresh_at =
                                             Some(std::time::Instant::now());
                                         background_mesh_refresh_handle = Some(
-                                            spawn_background_mesh_scan(ui_tx.clone(), &mesh_links),
+                                            spawn_background_mesh_scan(
+                                                ui_tx.clone(),
+                                                my_peer_id.clone(),
+                                                local_bridge_name.clone(),
+                                                &mesh_links,
+                                            ),
                                         );
                                     }
                                 }
@@ -2494,62 +3327,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             MessageType::Message => {
                                 write_debug_log("Processing Message packet");
-                                handle_message_packet(
-                                    &packet,
-                                    &mesh_notification.value,
-                                    &mut peers_lock,
-                                    bloom.as_mut().unwrap(),
-                                    discovered_channels.as_mut().unwrap(),
-                                    password_protected_channels.as_mut().unwrap(),
-                                    channel_keys.as_mut().unwrap(),
-                                    chat_context.as_mut().unwrap(),
-                                    delivery_tracker.as_mut().unwrap(),
-                                    encryption_service.as_ref().unwrap(),
-                                    noise_session_manager.as_mut().unwrap(),
-                                    &active_link.peripheral,
-                                    &active_link.cmd,
-                                    &nickname,
-                                    &my_peer_id,
-                                    blocked_peers.as_ref().unwrap(),
-                                    ui_tx.clone(),
-                                )
-                                .await;
+                                let message_link = active_link.as_ref().or_else(|| mesh_links.first());
+                                if let Some(link) = message_link {
+                                    handle_message_packet(
+                                        &packet,
+                                        &mesh_notification.value,
+                                        &mut peers_lock,
+                                        bloom.as_mut().unwrap(),
+                                        discovered_channels.as_mut().unwrap(),
+                                        password_protected_channels.as_mut().unwrap(),
+                                        channel_keys.as_mut().unwrap(),
+                                        chat_context.as_mut().unwrap(),
+                                        delivery_tracker.as_mut().unwrap(),
+                                        encryption_service.as_ref().unwrap(),
+                                        noise_session_manager.as_mut().unwrap(),
+                                        &link.peripheral,
+                                        &link.cmd,
+                                        &nickname,
+                                        &my_peer_id,
+                                        blocked_peers.as_ref().unwrap(),
+                                        ui_tx.clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    write_debug_log(
+                                        "Skipping Message packet handling because no mesh link is available",
+                                    );
+                                }
                             }
                             MessageType::FragmentStart
                             | MessageType::FragmentContinue
                             | MessageType::FragmentEnd => {
                                 write_debug_log("Processing Fragment packet");
-                                handle_fragment_packet(
-                                    &packet,
-                                    &mesh_notification.value,
-                                    fragment_collector.as_mut().unwrap(),
-                                    &mut peers_lock,
-                                    bloom.as_mut().unwrap(),
-                                    discovered_channels.as_mut().unwrap(),
-                                    password_protected_channels.as_mut().unwrap(),
-                                    chat_context.as_mut().unwrap(),
-                                    encryption_service.as_ref().unwrap(),
-                                    &active_link.peripheral,
-                                    &active_link.cmd,
-                                    &nickname,
-                                    &my_peer_id,
-                                    blocked_peers.as_ref().unwrap(),
-                                    ui_tx.clone(),
-                                )
-                                .await;
+                                if let Some(active_link) = active_link.as_ref() {
+                                    handle_fragment_packet(
+                                        &packet,
+                                        &mesh_notification.value,
+                                        fragment_collector.as_mut().unwrap(),
+                                        &mut peers_lock,
+                                        bloom.as_mut().unwrap(),
+                                        discovered_channels.as_mut().unwrap(),
+                                        password_protected_channels.as_mut().unwrap(),
+                                        chat_context.as_mut().unwrap(),
+                                        encryption_service.as_ref().unwrap(),
+                                        &active_link.peripheral,
+                                        &active_link.cmd,
+                                        &nickname,
+                                        &my_peer_id,
+                                        blocked_peers.as_ref().unwrap(),
+                                        ui_tx.clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    write_debug_log(
+                                        "Skipping Fragment packet: no central mesh link available for reassembly relay",
+                                    );
+                                }
                             }
                             MessageType::KeyExchange => {
                                 write_debug_log("Processing KeyExchange packet");
-                                handle_key_exchange_message(
-                                    &packet,
-                                    &mut peers_lock,
-                                    encryption_service.as_ref().unwrap(),
-                                    &active_link.peripheral,
-                                    &active_link.cmd,
-                                    &my_peer_id,
-                                    ui_tx.clone(),
-                                )
-                                .await;
+                                if let Some(active_link) = active_link.as_ref() {
+                                    handle_key_exchange_message(
+                                        &packet,
+                                        &mut peers_lock,
+                                        encryption_service.as_ref().unwrap(),
+                                        &active_link.peripheral,
+                                        &active_link.cmd,
+                                        &my_peer_id,
+                                        ui_tx.clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    write_debug_log(
+                                        "Skipping KeyExchange packet: no central mesh link available for response",
+                                    );
+                                }
                             }
                             MessageType::Leave => {
                                 write_debug_log("Processing Leave packet");
@@ -2598,17 +3450,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             MessageType::DeliveryAck => {
                                 write_debug_log("Processing DeliveryAck packet");
-                                handle_delivery_ack_message(
-                                    &packet,
-                                    &mesh_notification.value,
-                                    encryption_service.as_ref().unwrap(),
-                                    delivery_tracker.as_mut().unwrap(),
-                                    &active_link.peripheral,
-                                    &active_link.cmd,
-                                    &my_peer_id,
-                                    ui_tx.clone(),
-                                )
-                                .await;
+                                if let Some(active_link) = active_link.as_ref() {
+                                    handle_delivery_ack_message(
+                                        &packet,
+                                        &mesh_notification.value,
+                                        encryption_service.as_ref().unwrap(),
+                                        delivery_tracker.as_mut().unwrap(),
+                                        &active_link.peripheral,
+                                        &active_link.cmd,
+                                        &my_peer_id,
+                                        ui_tx.clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    write_debug_log(
+                                        "Skipping DeliveryAck packet: no central mesh link available",
+                                    );
+                                }
                             }
                             MessageType::DeliveryStatusRequest => {
                                 write_debug_log("Processing DeliveryStatusRequest packet");
@@ -2621,31 +3479,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             MessageType::NoiseHandshakeInit => {
                                 write_debug_log("Processing NoiseHandshakeInit packet");
-                                handle_noise_handshake_init(
-                                    &packet,
-                                    &mesh_notification.value,
-                                    noise_session_manager.as_mut().unwrap(),
-                                    &active_link.peripheral,
-                                    &active_link.cmd,
-                                    &mesh_send_targets(&mesh_links),
-                                    &my_peer_id,
-                                    ui_tx.clone(),
-                                )
-                                .await;
+                                if let Some(active_link) = active_link.as_ref() {
+                                    handle_noise_handshake_init(
+                                        &packet,
+                                        &mesh_notification.value,
+                                        noise_session_manager.as_mut().unwrap(),
+                                        &active_link.peripheral,
+                                        &active_link.cmd,
+                                        &mesh_send_targets(&mesh_links),
+                                        &my_peer_id,
+                                        ui_tx.clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    write_debug_log(
+                                        "Skipping NoiseHandshakeInit packet: no central mesh link available for response",
+                                    );
+                                }
                             }
                             MessageType::NoiseHandshakeResp => {
                                 write_debug_log("Processing NoiseHandshakeResp packet");
-                                handle_noise_handshake_resp(
-                                    &packet,
-                                    &mesh_notification.value,
-                                    noise_session_manager.as_mut().unwrap(),
-                                    &active_link.peripheral,
-                                    &active_link.cmd,
-                                    &mesh_send_targets(&mesh_links),
-                                    &my_peer_id,
-                                    ui_tx.clone(),
-                                )
-                                .await;
+                                if let Some(active_link) = active_link.as_ref() {
+                                    handle_noise_handshake_resp(
+                                        &packet,
+                                        &mesh_notification.value,
+                                        noise_session_manager.as_mut().unwrap(),
+                                        &active_link.peripheral,
+                                        &active_link.cmd,
+                                        &mesh_send_targets(&mesh_links),
+                                        &my_peer_id,
+                                        ui_tx.clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    write_debug_log(
+                                        "Skipping NoiseHandshakeResp packet: no central mesh link available for response",
+                                    );
+                                }
                             }
                             MessageType::NoiseEncrypted => {
                                 write_debug_log(&format!(
@@ -2660,27 +3530,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "Packet first 16 bytes: {:?}",
                                     &packet.payload[..std::cmp::min(16, packet.payload.len())]
                                 ));
-                                handle_noise_encrypted_message(
-                                    &packet,
-                                    &mesh_notification.value,
-                                    noise_session_manager.as_mut().unwrap(),
-                                    &mut peers_lock,
-                                    bloom.as_mut().unwrap(),
-                                    discovered_channels.as_mut().unwrap(),
-                                    password_protected_channels.as_mut().unwrap(),
-                                    channel_keys.as_mut().unwrap(),
-                                    chat_context.as_mut().unwrap(),
-                                    delivery_tracker.as_mut().unwrap(),
-                                    encryption_service.as_ref().unwrap(),
-                                    &active_link.peripheral,
-                                    &active_link.cmd,
-                                    &mesh_send_targets(&mesh_links),
-                                    &nickname,
-                                    &my_peer_id,
-                                    blocked_peers.as_ref().unwrap(),
-                                    ui_tx.clone(),
-                                )
-                                .await;
+                                if let Some(active_link) = active_link.as_ref() {
+                                    handle_noise_encrypted_message(
+                                        &packet,
+                                        &mesh_notification.value,
+                                        noise_session_manager.as_mut().unwrap(),
+                                        &mut peers_lock,
+                                        bloom.as_mut().unwrap(),
+                                        discovered_channels.as_mut().unwrap(),
+                                        password_protected_channels.as_mut().unwrap(),
+                                        channel_keys.as_mut().unwrap(),
+                                        chat_context.as_mut().unwrap(),
+                                        delivery_tracker.as_mut().unwrap(),
+                                        encryption_service.as_ref().unwrap(),
+                                        &active_link.peripheral,
+                                        &active_link.cmd,
+                                        &mesh_send_targets(&mesh_links),
+                                        &nickname,
+                                        &my_peer_id,
+                                        blocked_peers.as_ref().unwrap(),
+                                        ui_tx.clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    write_debug_log(
+                                        "Skipping NoiseEncrypted packet: no central mesh link available for ACK/relay",
+                                    );
+                                }
                             }
                             MessageType::NoiseIdentityAnnounce => {
                                 write_debug_log(&format!(
@@ -2697,16 +3573,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             MessageType::HandshakeRequest => {
                                 write_debug_log("Processing HandshakeRequest packet");
-                                handle_handshake_request_message(
-                                    &packet,
-                                    noise_session_manager.as_mut().unwrap(),
-                                    &active_link.peripheral,
-                                    &active_link.cmd,
-                                    &mesh_send_targets(&mesh_links),
-                                    &my_peer_id,
-                                    ui_tx.clone(),
-                                )
-                                .await;
+                                if let Some(active_link) = active_link.as_ref() {
+                                    handle_handshake_request_message(
+                                        &packet,
+                                        noise_session_manager.as_mut().unwrap(),
+                                        &active_link.peripheral,
+                                        &active_link.cmd,
+                                        &mesh_send_targets(&mesh_links),
+                                        &my_peer_id,
+                                        ui_tx.clone(),
+                                    )
+                                    .await;
+                                } else {
+                                    write_debug_log(
+                                        "Skipping HandshakeRequest packet: no central mesh link available for response",
+                                    );
+                                }
                             }
                             MessageType::FileTransfer => {
                                 write_debug_log("Processing FileTransfer packet");
@@ -2726,21 +3608,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         packet.sender_id_str
                                     ));
                                     if let Some(noise_manager) = noise_session_manager.as_mut() {
-                                        if !noise_manager
-                                            .has_established_session(&packet.sender_id_str)
-                                            && !noise_manager.has_session(&packet.sender_id_str)
-                                        {
-                                            send_handshake_request(
-                                                &packet.sender_id_str,
-                                                0,
-                                                &my_peer_id,
-                                                &nickname,
-                                                &active_link.peripheral,
-                                                &active_link.cmd,
-                                                &mesh_send_targets(&mesh_links),
-                                                ui_tx.clone(),
-                                            )
-                                            .await;
+                                        let peer_id = packet.sender_id_str.clone();
+                                        if !noise_manager.has_established_session(&peer_id) {
+                                            let now = std::time::Instant::now();
+                                            let cooldown_passed = last_requestsync_handshake_at
+                                                .get(&peer_id)
+                                                .map(|last| {
+                                                    now.duration_since(*last)
+                                                        >= REQUEST_SYNC_HANDSHAKE_RETRY_COOLDOWN
+                                                })
+                                                .unwrap_or(true);
+                                            if cooldown_passed {
+                                                if let Some(active_link) = active_link.as_ref() {
+                                                    write_debug_log(&format!(
+                                                        "RequestSync-triggered handshake request to {} (session_exists={})",
+                                                        peer_id,
+                                                        noise_manager.has_session(&peer_id)
+                                                    ));
+                                                    send_handshake_request(
+                                                        &peer_id,
+                                                        0,
+                                                        &my_peer_id,
+                                                        &nickname,
+                                                        &active_link.peripheral,
+                                                        &active_link.cmd,
+                                                        &mesh_send_targets(&mesh_links),
+                                                        ui_tx.clone(),
+                                                    )
+                                                    .await;
+                                                    last_requestsync_handshake_at
+                                                        .insert(peer_id.clone(), now);
+                                                } else {
+                                                    write_debug_log(
+                                                        "Skipping RequestSync-triggered handshake: no central mesh link available",
+                                                    );
+                                                }
+                                            } else {
+                                                write_debug_log(&format!(
+                                                    "Skipping RequestSync-triggered handshake to {}: cooldown active",
+                                                    peer_id
+                                                ));
+                                            }
                                         }
                                     }
                                 } else {
@@ -2954,7 +3862,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Spawn new Bluetooth connection setup
             let ui_tx_clone = ui_tx.clone();
-            bt_handle = Some(spawn_primary_mesh_scan(ui_tx_clone));
+            bt_handle = Some(spawn_primary_mesh_scan(
+                ui_tx_clone,
+                my_peer_id.clone(),
+                local_bridge_name.clone(),
+            ));
             last_primary_mesh_retry_at = Some(std::time::Instant::now());
             primary_retry_window_started_at = std::time::Instant::now();
             had_mesh_links_since_retry_window = false;
@@ -3767,7 +4679,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
 
-                    if !app.connected {
+                    if !mesh_transport_available(&mesh_links) {
                         app.add_log_message(format!(
                             "system: Bluetooth mesh is offline, so channel {} is unavailable. Use a geohash channel such as /j #ws for Nostr.",
                             channel_name
@@ -3853,6 +4765,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if line == "/status" {
                 let peer_count = peers.as_ref().unwrap().lock().await.len();
+                let ble_peripheral_active = crate::ble_peripheral::ble_peripheral_active();
+                let ble_peripheral_subscribers =
+                    crate::ble_peripheral::ble_peripheral_subscriber_count();
                 let channel_count = chat_context
                     .as_ref()
                     .unwrap()
@@ -3872,6 +4787,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "▶ Mesh".to_string(),
                     format!("  Status: {}", app.mesh_status),
                     format!("  Connected peers: {}", peer_count),
+                    format!(
+                        "  BLE Peripheral: active={}/subscribers={}",
+                        if ble_peripheral_active { "yes" } else { "no" },
+                        ble_peripheral_subscribers
+                    ),
                     format!("  Active mesh channels: {}", channel_count),
                     "▶ Nostr".to_string(),
                     format!("  Geohash channels this session: {}", geohash_count),
@@ -3884,6 +4804,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 for line in status_lines {
                     app.add_log_message(format!("system: {}", line));
+                }
+                for line in crate::ble_peripheral::ble_peripheral_status_lines() {
+                    app.add_log_message(format!("system:   BLE {}", line));
                 }
                 continue;
             }
@@ -4431,7 +5354,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            if !app.connected && !line.starts_with('/') {
+            if !mesh_transport_available(&mesh_links) && !line.starts_with('/') {
                 if let Some((channel, target_nickname, recipient_pubkey)) = app.current_geohash_dm()
                 {
                     queue_geohash_dm_send(
@@ -4491,7 +5414,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Check if we're connected before handling commands that require connection
-            if !app.connected
+            if !mesh_transport_available(&mesh_links)
                 && !line.starts_with("/help")
                 && !line.starts_with("/j ")
                 && line != "/public"
@@ -4654,6 +5577,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for line in status_lines {
                     app.add_log_message(format!("system: {}", line));
                 }
+                for line in crate::ble_peripheral::ble_peripheral_status_lines() {
+                    app.add_log_message(format!("system:   BLE {}", line));
+                }
                 continue;
             }
             if handle_leave_command(
@@ -4808,7 +5734,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Check if we're connected before handling Bluetooth mesh messages
-            if !app.connected {
+            if !mesh_transport_available(&mesh_links) {
                 app.add_log_message("system: Bluetooth mesh is offline. Join a Nostr geohash channel such as /j #ws, or wait for mesh discovery to finish.".to_string());
                 continue;
             }
@@ -4818,12 +5744,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 peer_id: target_peer_id,
             } = &chat_context.as_ref().unwrap().current_mode
             {
+                let dm_link = peripheral
+                    .as_ref()
+                    .zip(cmd_char.as_ref())
+                    .or_else(|| mesh_links.first().map(|link| (&link.peripheral, &link.cmd)));
+                let Some((dm_peripheral, dm_cmd_char)) = dm_link else {
+                    app.add_log_message(
+                        "system: No active Bluetooth link available for DM send.".to_string(),
+                    );
+                    continue;
+                };
                 match handle_private_dm_message(
                     &line,
                     target_peer_id,
                     &mut noise_session_manager,
-                    peripheral.as_ref().unwrap(),
-                    cmd_char.as_ref().unwrap(),
+                    dm_peripheral,
+                    dm_cmd_char,
                     &mesh_send_targets(&mesh_links),
                     &my_peer_id,
                     ui_tx.clone(),
@@ -4847,6 +5783,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             let outgoing_chunks = split_outgoing_message_chunks(&line);
+            let regular_link = peripheral
+                .as_ref()
+                .zip(cmd_char.as_ref())
+                .or_else(|| mesh_links.first().map(|link| (&link.peripheral, &link.cmd)));
+            let Some((regular_peripheral, regular_cmd_char)) = regular_link else {
+                app.add_log_message(
+                    "system: No active Bluetooth link available for message send.".to_string(),
+                );
+                continue;
+            };
 
             let chunk_total = outgoing_chunks.len();
             for (idx, chunk) in outgoing_chunks.into_iter().enumerate() {
@@ -4859,8 +5805,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     channel_keys.as_mut().unwrap(),
                     encryption_service.as_ref().unwrap(),
                     delivery_tracker.as_mut().unwrap(),
-                    peripheral.as_ref().unwrap(),
-                    cmd_char.as_ref().unwrap(),
+                    regular_peripheral,
+                    regular_cmd_char,
                     &mesh_send_targets(&mesh_links),
                     ui_tx.clone(),
                     &mut app,
@@ -4931,11 +5877,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn find_peripheral(
     adapter: &btleplug::platform::Adapter,
     skipped_peripherals: &HashSet<String>,
+    scan_elapsed: StdDuration,
+    stable_scan_relaxed: bool,
 ) -> Result<Option<Peripheral>, btleplug::Error> {
-    let allow_any_fallback = std::env::var("BITCHAT_SCAN_FALLBACK_ANY")
+    let stable_scan_mode = win10_stable_scan_enabled() && !stable_scan_relaxed;
+    let target_addrs = configured_ble_target_addrs();
+    let target_addr = target_addrs.first().cloned();
+    let target_hard_only = ble_target_hard_only();
+    let min_rssi = configured_ble_min_rssi();
+    let win10_probe_on_miss_enabled = cfg!(target_os = "windows")
+        && std::env::var("BITCHAT_WIN10_STABLE_SCAN_PROBE_ON_MISS")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+    let win10_probe_delay = StdDuration::from_secs(env_u64(
+        "BITCHAT_WIN10_STABLE_SCAN_PROBE_DELAY_SECS",
+        12,
+    ));
+    let win10_probe_on_miss = stable_scan_mode
+        && win10_probe_on_miss_enabled
+        && scan_elapsed >= win10_probe_delay;
+    let win10_probe_min_observations =
+        env_u64("BITCHAT_WIN10_STABLE_SCAN_PROBE_MIN_OBSERVATIONS", 2).clamp(1, 8) as u8;
+    let sparse_fallback_env = std::env::var("BITCHAT_SCAN_SPARSE_FALLBACK")
+        .ok()
+        .map(|v| v.trim() == "1");
+    let allow_any_fallback = !stable_scan_mode
+        && !stable_scan_relaxed
+        && std::env::var("BITCHAT_SCAN_FALLBACK_ANY")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
-    let mut fallback_candidate: Option<Peripheral> = None;
+    let default_sparse_delay = if cfg!(target_os = "windows") {
+        MESH_SPARSE_FALLBACK_DELAY_WINDOWS.as_secs()
+    } else {
+        MESH_SPARSE_FALLBACK_DELAY.as_secs()
+    };
+    let sparse_delay = StdDuration::from_secs(env_u64(
+        "BITCHAT_SCAN_SPARSE_FALLBACK_DELAY_SECS",
+        default_sparse_delay,
+    ));
+    let allow_sparse_fallback = if stable_scan_mode {
+        win10_probe_on_miss
+            || sparse_fallback_env.unwrap_or(false)
+    } else if let Some(enabled) = sparse_fallback_env {
+        enabled
+    } else if cfg!(target_os = "windows") {
+        false
+    } else {
+        scan_elapsed >= sparse_delay
+    };
+    let mut best_service_candidate: Option<(Peripheral, i16)> = None;
+    let mut service_candidate_count: usize = 0;
+    let mut best_service_beacon_candidate: Option<(Peripheral, i16)> = None;
+    let mut service_beacon_candidate_count: usize = 0;
+    let mut best_beacon_candidate: Option<(Peripheral, i16)> = None;
+    let mut beacon_candidate_count: usize = 0;
+    let mut best_name_candidate: Option<(Peripheral, i16)> = None;
+    let mut name_candidate_count: usize = 0;
+    let mut sparse_props_candidate: Option<(Peripheral, i16)> = None;
+    let mut any_fallback_candidate: Option<(Peripheral, i16)> = None;
+    let win10_probe_connect_enabled = cfg!(target_os = "windows")
+        && std::env::var("BITCHAT_WIN10_STABLE_PROBE_CONNECT_ON_MISS")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+    let win10_probe_connect_delay = StdDuration::from_secs(env_u64(
+        "BITCHAT_WIN10_STABLE_PROBE_CONNECT_DELAY_SECS",
+        10,
+    ));
+    let win10_probe_connect_on_miss =
+        stable_scan_mode && win10_probe_connect_enabled && scan_elapsed >= win10_probe_connect_delay;
+    let mut probe_connect_candidate: Option<(Peripheral, i16)> = None;
+    if stable_scan_relaxed {
+        if allow_sparse_fallback {
+            write_debug_log(
+                "find_peripheral: Win10 stable scan relaxed; sparse fallback explicitly enabled",
+            );
+        } else {
+            write_debug_log(
+                "find_peripheral: Win10 stable scan relaxed; sparse fallback remains disabled",
+            );
+        }
+    } else if win10_probe_on_miss
+        && !WIN10_STABLE_PROBE_ON_MISS_EMITTED.swap(true, Ordering::Relaxed)
+    {
+        write_debug_log(&format!(
+            "find_peripheral: Win10 stable scan probe-on-miss enabled after {:?} (controlled sparse probe)",
+            win10_probe_delay
+        ));
+    } else if cfg!(target_os = "windows")
+        && min_rssi.is_some()
+        && scan_elapsed < StdDuration::from_secs(2)
+        && std::env::var("BITCHAT_BLE_SCAN_LOG")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+        && !WIN10_BLE_MIN_RSSI_LOG_EMITTED.swap(true, Ordering::Relaxed)
+    {
+        write_debug_log("find_peripheral: min RSSI configured");
+    }
 
     let peripherals = adapter.peripherals().await?;
 
@@ -4947,6 +5984,23 @@ async fn find_peripheral(
 
         match p.properties().await {
             Ok(Some(properties)) => {
+                log_ble_scan_candidate_once(&peripheral_id, Some(&properties), target_addr.as_deref());
+                if !target_addrs.is_empty() {
+                    if let Some(matched_target) =
+                        peripheral_matches_any_target_addr(&peripheral_id, Some(&properties), &target_addrs)
+                    {
+                        write_debug_log(&format!(
+                            "find_peripheral: selected {} via target address {}",
+                            peripheral_summary(&peripheral_id, Some(&properties)),
+                            matched_target
+                        ));
+                        return Ok(Some(p));
+                    }
+                    if target_hard_only {
+                        continue;
+                    }
+                }
+
                 let advertises_service = properties.services.contains(&BITCHAT_SERVICE_UUID)
                     || properties.services.contains(&BITCHAT_TEST_SERVICE_UUID);
                 let has_matching_service_data =
@@ -4954,35 +6008,839 @@ async fn find_peripheral(
                         || properties
                             .service_data
                             .contains_key(&BITCHAT_TEST_SERVICE_UUID);
-                // Prefer devices that explicitly advertise the BitChat service UUID.
-                if advertises_service || has_matching_service_data {
-                    return Ok(Some(p));
-                }
-
+                let has_matching_service_beacon =
+                    has_bitchat_service_beacon_in_service_data(&properties.service_data);
+                let has_matching_beacon =
+                    has_bitchat_ble_beacon_in_manufacturer_data(&properties.manufacturer_data);
                 let name_looks_bitchat = properties
                     .local_name
                     .as_deref()
                     .map(|name| name.to_ascii_lowercase().contains("bitchat"))
                     .unwrap_or(false);
-                if name_looks_bitchat {
-                    return Ok(Some(p));
+                let strong_bitchat_signal = advertises_service
+                    || has_matching_service_data
+                    || has_matching_service_beacon
+                    || has_matching_beacon
+                    || name_looks_bitchat;
+                if let (Some(min_rssi), Some(rssi)) = (min_rssi, peripheral_rssi(Some(&properties)))
+                {
+                    if rssi < min_rssi && !strong_bitchat_signal {
+                        continue;
+                    }
+                }
+                let rssi = rssi_or_floor(Some(&properties));
+                // Prefer devices that explicitly advertise the BitChat service UUID.
+                if advertises_service || has_matching_service_data {
+                    service_candidate_count += 1;
+                    let replace = best_service_candidate
+                        .as_ref()
+                        .map(|(_, current_rssi)| rssi > *current_rssi)
+                        .unwrap_or(true);
+                    if replace {
+                        best_service_candidate = Some((p.clone(), rssi));
+                    }
+                    continue;
+                }
+                if has_matching_service_beacon {
+                    service_beacon_candidate_count += 1;
+                    let replace = best_service_beacon_candidate
+                        .as_ref()
+                        .map(|(_, current_rssi)| rssi > *current_rssi)
+                        .unwrap_or(true);
+                    if replace {
+                        best_service_beacon_candidate = Some((p.clone(), rssi));
+                    }
+                    continue;
+                }
+                if has_matching_beacon {
+                    beacon_candidate_count += 1;
+                    let replace = best_beacon_candidate
+                        .as_ref()
+                        .map(|(_, current_rssi)| rssi > *current_rssi)
+                        .unwrap_or(true);
+                    if replace {
+                        best_beacon_candidate = Some((p.clone(), rssi));
+                    }
+                    continue;
                 }
 
-                if allow_any_fallback && fallback_candidate.is_none() {
-                    fallback_candidate = Some(p);
+                if name_looks_bitchat {
+                    name_candidate_count += 1;
+                    let replace = best_name_candidate
+                        .as_ref()
+                        .map(|(_, current_rssi)| rssi > *current_rssi)
+                        .unwrap_or(true);
+                    if replace {
+                        best_name_candidate = Some((p.clone(), rssi));
+                    }
+                    continue;
+                }
+                if win10_probe_connect_on_miss
+                    && (properties.manufacturer_data.len() > 0
+                        || properties.service_data.len() > 0
+                        || !properties.services.is_empty())
+                {
+                    let seen = stable_sparse_observation_increment(&peripheral_id);
+                    if seen >= 2 {
+                        let replace = probe_connect_candidate
+                            .as_ref()
+                            .map(|(_, current_rssi)| rssi > *current_rssi)
+                            .unwrap_or(true);
+                        if replace {
+                            probe_connect_candidate = Some((p.clone(), rssi));
+                        }
+                    }
+                }
+
+                if stable_scan_mode && !allow_sparse_fallback {
+                    continue;
+                }
+
+                // Keep sparse-property devices as better fallback than random peripherals.
+                if allow_sparse_fallback
+                    && properties.services.is_empty()
+                    && properties.service_data.is_empty()
+                {
+                    if stable_scan_mode {
+                        let seen = stable_sparse_observation_increment(&peripheral_id);
+                        if seen < win10_probe_min_observations {
+                            continue;
+                        }
+                    }
+                    let replace = sparse_props_candidate
+                        .as_ref()
+                        .map(|(_, current_rssi)| rssi > *current_rssi)
+                        .unwrap_or(true);
+                    if replace {
+                        sparse_props_candidate = Some((p.clone(), rssi));
+                    }
+                }
+                if allow_any_fallback {
+                    let replace = any_fallback_candidate
+                        .as_ref()
+                        .map(|(_, current_rssi)| rssi > *current_rssi)
+                        .unwrap_or(true);
+                    if replace {
+                        any_fallback_candidate = Some((p, rssi));
+                    }
                 }
             }
             _ => {
+                log_ble_scan_candidate_once(&peripheral_id, None, target_addr.as_deref());
+                if !target_addrs.is_empty() {
+                    if let Some(matched_target) =
+                        peripheral_matches_any_target_addr(&peripheral_id, None, &target_addrs)
+                    {
+                        write_debug_log(&format!(
+                            "find_peripheral: selected {} via target address {} without properties",
+                            peripheral_id, matched_target
+                        ));
+                        return Ok(Some(p));
+                    }
+                    if target_hard_only {
+                        continue;
+                    }
+                }
+                // If a minimum RSSI is configured but properties/RSSI are unavailable,
+                // skip this candidate instead of blind fallback connects.
+                if min_rssi.is_some() {
+                    continue;
+                }
+                if stable_scan_mode {
+                    continue;
+                }
                 // If properties are unavailable, still keep a fallback so discovery
                 // can proceed with connect+service discovery validation.
-                if allow_any_fallback && fallback_candidate.is_none() {
-                    fallback_candidate = Some(p);
+                if allow_sparse_fallback && sparse_props_candidate.is_none() {
+                    sparse_props_candidate = Some((p.clone(), i16::MIN));
+                }
+                if allow_any_fallback && any_fallback_candidate.is_none() {
+                    any_fallback_candidate = Some((p, i16::MIN));
                 }
             }
         }
     }
 
-    Ok(fallback_candidate)
+    if !target_addrs.is_empty() && target_hard_only {
+        write_debug_log(&format!(
+            "find_peripheral: target hard-only mode active, no configured target found this round: {}",
+            target_addrs.join(",")
+        ));
+        return Ok(None);
+    }
+
+    if let Some((candidate, rssi)) = best_service_candidate {
+        let candidate_id = format!("{:?}", candidate.id());
+        let properties = candidate.properties().await.ok().flatten();
+        write_debug_log(&format!(
+            "find_peripheral: selected {} via advertised BitChat service UUID (best RSSI={}dBm among {} candidates)",
+            peripheral_summary(&candidate_id, properties.as_ref()),
+            rssi,
+            service_candidate_count
+        ));
+        return Ok(Some(candidate));
+    }
+
+    if let Some((candidate, rssi)) = best_name_candidate {
+        let candidate_id = format!("{:?}", candidate.id());
+        let properties = candidate.properties().await.ok().flatten();
+        write_debug_log(&format!(
+            "find_peripheral: selected {} via local_name hint (best RSSI={}dBm among {} candidates)",
+            peripheral_summary(&candidate_id, properties.as_ref()),
+            rssi,
+            name_candidate_count
+        ));
+        return Ok(Some(candidate));
+    }
+    if let Some((candidate, rssi)) = best_service_beacon_candidate {
+        let candidate_id = format!("{:?}", candidate.id());
+        let properties = candidate.properties().await.ok().flatten();
+        write_debug_log(&format!(
+            "find_peripheral: selected {} via service-data beacon (best RSSI={}dBm among {} candidates)",
+            peripheral_summary(&candidate_id, properties.as_ref()),
+            rssi,
+            service_beacon_candidate_count
+        ));
+        return Ok(Some(candidate));
+    }
+    if let Some((candidate, rssi)) = best_beacon_candidate {
+        let candidate_id = format!("{:?}", candidate.id());
+        let properties = candidate.properties().await.ok().flatten();
+        write_debug_log(&format!(
+            "find_peripheral: selected {} via manufacturer beacon (best RSSI={}dBm among {} candidates)",
+            peripheral_summary(&candidate_id, properties.as_ref()),
+            rssi,
+            beacon_candidate_count
+        ));
+        return Ok(Some(candidate));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(candidate) =
+            find_peripheral_via_winrt_gatt_selector(adapter, skipped_peripherals).await
+        {
+            write_debug_log(&format!(
+                "find_peripheral: selected {:?} via WinRT GATT-selector fallback",
+                candidate.id()
+            ));
+            return Ok(Some(candidate));
+        }
+        if let Some((candidate, rssi)) = probe_connect_candidate {
+            let candidate_id = format!("{:?}", candidate.id());
+            let properties = candidate.properties().await.ok().flatten();
+            write_debug_log(&format!(
+                "find_peripheral: selected {} via Win10 probe-connect fallback after {:?} (rssi={}dBm)",
+                peripheral_summary(&candidate_id, properties.as_ref()),
+                win10_probe_connect_delay,
+                rssi
+            ));
+            return Ok(Some(candidate));
+        }
+        if let Some(candidate) =
+            find_peripheral_via_winrt_watcher(adapter, skipped_peripherals, stable_scan_mode).await
+        {
+            write_debug_log(&format!(
+                "find_peripheral: selected {:?} via WinRT watcher fallback",
+                candidate.id()
+            ));
+            return Ok(Some(candidate));
+        }
+    }
+
+    if allow_sparse_fallback && sparse_props_candidate.is_some() {
+        if let Some((candidate, rssi)) = sparse_props_candidate.as_ref() {
+            write_debug_log(&format!(
+                "find_peripheral: selected {:?} via sparse-properties fallback (best RSSI={}dBm, stable_mode={})",
+                candidate.id(),
+                rssi,
+                stable_scan_mode
+            ));
+        }
+        return Ok(sparse_props_candidate.map(|(candidate, _)| candidate));
+    }
+    if let Some((candidate, rssi)) = any_fallback_candidate.as_ref() {
+        write_debug_log(&format!(
+            "find_peripheral: selected {:?} via any-device fallback (best RSSI={}dBm)",
+            candidate.id(),
+            rssi
+        ));
+    }
+    Ok(any_fallback_candidate.map(|(candidate, _)| candidate))
+}
+
+#[cfg(target_os = "windows")]
+struct Win10BleSelfCheckSummary {
+    total_candidates_seen: usize,
+    bitchat_candidates_seen: usize,
+    watcher_packets_seen: usize,
+    watcher_bitchat_hits: usize,
+}
+
+#[cfg(target_os = "windows")]
+async fn run_win10_winrt_watcher_probe(window: Duration) -> (usize, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use windows::Devices::Bluetooth::Advertisement::{
+        BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementWatcher,
+        BluetoothLEScanningMode,
+    };
+    use windows::Foundation::TypedEventHandler;
+
+    let watcher = match BluetoothLEAdvertisementWatcher::new() {
+        Ok(w) => w,
+        Err(_) => return (0, 0),
+    };
+    let _ = watcher.SetScanningMode(BluetoothLEScanningMode::Active);
+
+    let total_packets = Arc::new(AtomicUsize::new(0));
+    let bitchat_hits = Arc::new(AtomicUsize::new(0));
+    let total_packets_for_event = Arc::clone(&total_packets);
+    let bitchat_hits_for_event = Arc::clone(&bitchat_hits);
+
+    let service_uuid = windows::core::GUID::from_u128(BITCHAT_SERVICE_UUID.as_u128());
+    let test_service_uuid = windows::core::GUID::from_u128(BITCHAT_TEST_SERVICE_UUID.as_u128());
+
+    let token = match watcher.Received(&TypedEventHandler::new(
+        move |_: &Option<BluetoothLEAdvertisementWatcher>,
+              args: &Option<BluetoothLEAdvertisementReceivedEventArgs>| {
+            total_packets_for_event.fetch_add(1, Ordering::Relaxed);
+            let Some(args) = args else {
+                return Ok(());
+            };
+            let Ok(advertisement) = args.Advertisement() else {
+                return Ok(());
+            };
+
+            let mut hit = false;
+            if let Ok(service_uuids) = advertisement.ServiceUuids() {
+                if let Ok(size) = service_uuids.Size() {
+                    for idx in 0..size {
+                        if let Ok(uuid) = service_uuids.GetAt(idx) {
+                            if uuid == service_uuid || uuid == test_service_uuid {
+                                hit = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(local_name) = advertisement.LocalName() {
+                if local_name
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("bitchat")
+                {
+                    hit = true;
+                }
+            }
+            if let Ok(manufacturer_data) = advertisement.ManufacturerData() {
+                if let Ok(size) = manufacturer_data.Size() {
+                    for idx in 0..size {
+                        let Ok(entry) = manufacturer_data.GetAt(idx) else {
+                            continue;
+                        };
+                        let Ok(buffer) = entry.Data() else {
+                            continue;
+                        };
+                        let Ok(payload) = read_winrt_buffer_bytes(&buffer) else {
+                            continue;
+                        };
+                        if is_bitchat_ble_beacon_payload(&payload) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if hit {
+                bitchat_hits_for_event.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        },
+    )) {
+        Ok(t) => t,
+        Err(_) => return (0, 0),
+    };
+
+    if watcher.Start().is_err() {
+        let _ = watcher.RemoveReceived(token);
+        return (0, 0);
+    }
+
+    time::sleep(window).await;
+    let _ = watcher.Stop();
+    let _ = watcher.RemoveReceived(token);
+
+    (
+        total_packets.load(Ordering::Relaxed),
+        bitchat_hits.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(target_os = "windows")]
+async fn run_win10_ble_visibility_self_check(
+    adapter: &btleplug::platform::Adapter,
+    ui_tx: &mpsc::Sender<String>,
+    window: Duration,
+) -> Result<Win10BleSelfCheckSummary, btleplug::Error> {
+    use std::collections::HashSet as StdHashSet;
+
+    let _ = ui_tx
+        .send(format!(
+            "system: BLE self-check running for {}s (scan/advertisement visibility only)",
+            window.as_secs()
+        ))
+        .await;
+    write_debug_log(&format!(
+        "BLE self-check start: window={}ms",
+        window.as_millis()
+    ));
+
+    let start = std::time::Instant::now();
+    let mut all_seen = StdHashSet::<String>::new();
+    let mut seen = StdHashSet::<String>::new();
+    let (watcher_packets_seen, watcher_bitchat_hits) = run_win10_winrt_watcher_probe(window).await;
+    while start.elapsed() < window {
+        let peripherals = adapter.peripherals().await?;
+        for p in peripherals {
+            let id = format!("{:?}", p.id());
+            all_seen.insert(id.clone());
+            if let Ok(Some(props)) = p.properties().await {
+                let advertised_service = props.services.contains(&BITCHAT_SERVICE_UUID)
+                    || props.services.contains(&BITCHAT_TEST_SERVICE_UUID)
+                    || props.service_data.contains_key(&BITCHAT_SERVICE_UUID)
+                    || props.service_data.contains_key(&BITCHAT_TEST_SERVICE_UUID);
+                let beacon_match =
+                    has_bitchat_ble_beacon_in_manufacturer_data(&props.manufacturer_data);
+                let service_beacon_match =
+                    has_bitchat_service_beacon_in_service_data(&props.service_data);
+                let name_looks_bitchat = props
+                    .local_name
+                    .as_deref()
+                    .map(|name| name.to_ascii_lowercase().contains("bitchat"))
+                    .unwrap_or(false);
+                if advertised_service || name_looks_bitchat || beacon_match || service_beacon_match
+                {
+                    seen.insert(format!("{} {}", id, peripheral_summary(&id, Some(&props))));
+                }
+            }
+        }
+        time::sleep(Duration::from_millis(300)).await;
+    }
+
+    write_debug_log(&format!(
+        "BLE self-check summary: visible_candidates={} visible_bitchat_candidates={} watcher_packets={} watcher_bitchat_hits={}",
+        all_seen.len(),
+        seen.len(),
+        watcher_packets_seen,
+        watcher_bitchat_hits
+    ));
+    let mut samples: Vec<String> = seen.into_iter().collect();
+    samples.sort();
+    let bitchat_count = samples.len();
+    if samples.is_empty() {
+        let _ = ui_tx
+            .send(
+                "system: BLE self-check found no visible BitChat advertisers in this window."
+                    .to_string(),
+            )
+            .await;
+    } else {
+        let visible_count = samples.len();
+        let preview = samples.into_iter().take(3).collect::<Vec<_>>().join(" | ");
+        let _ = ui_tx
+            .send(format!(
+                "system: BLE self-check visible candidates={} [{}]",
+                visible_count,
+                preview
+            ))
+            .await;
+    }
+    Ok(Win10BleSelfCheckSummary {
+        total_candidates_seen: all_seen.len(),
+        bitchat_candidates_seen: bitchat_count,
+        watcher_packets_seen,
+        watcher_bitchat_hits,
+    })
+}
+
+#[cfg(target_os = "windows")]
+async fn find_peripheral_via_winrt_watcher(
+    adapter: &btleplug::platform::Adapter,
+    skipped_peripherals: &HashSet<String>,
+    stable_scan_mode: bool,
+) -> Option<Peripheral> {
+    use std::collections::HashSet as StdHashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use windows::Devices::Bluetooth::Advertisement::{
+        BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementWatcher,
+        BluetoothLEScanningMode,
+    };
+    use windows::Foundation::TypedEventHandler;
+
+    let enabled = std::env::var("BITCHAT_WINRT_WATCHER_SCAN")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+
+    let watcher = BluetoothLEAdvertisementWatcher::new().ok()?;
+    let _ = watcher.SetScanningMode(BluetoothLEScanningMode::Active);
+
+    let saw_bitchat_signal = Arc::new(AtomicBool::new(false));
+    let seen_names = Arc::new(StdMutex::new(StdHashSet::<String>::new()));
+    let seen_addresses = Arc::new(StdMutex::new(StdHashSet::<String>::new()));
+    let signal_for_event = Arc::clone(&saw_bitchat_signal);
+    let names_for_event = Arc::clone(&seen_names);
+    let addresses_for_event = Arc::clone(&seen_addresses);
+
+    let service_uuid = windows::core::GUID::from_u128(BITCHAT_SERVICE_UUID.as_u128());
+    let test_service_uuid = windows::core::GUID::from_u128(BITCHAT_TEST_SERVICE_UUID.as_u128());
+
+    let token = watcher
+        .Received(&TypedEventHandler::new(
+            move |_: &Option<BluetoothLEAdvertisementWatcher>,
+                  args: &Option<BluetoothLEAdvertisementReceivedEventArgs>| {
+                let Some(args) = args else {
+                    return Ok(());
+                };
+                let Ok(advertisement) = args.Advertisement() else {
+                    return Ok(());
+                };
+
+                let mut hit = false;
+                if let Ok(service_uuids) = advertisement.ServiceUuids() {
+                    if let Ok(size) = service_uuids.Size() {
+                        for idx in 0..size {
+                            if let Ok(uuid) = service_uuids.GetAt(idx) {
+                                if uuid == service_uuid || uuid == test_service_uuid {
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Ok(local_name) = advertisement.LocalName() {
+                    let local_name = local_name.to_string();
+                    if !local_name.is_empty() && local_name.to_ascii_lowercase().contains("bitchat")
+                    {
+                        hit = true;
+                    }
+                    if hit {
+                        if let Ok(mut guard) = names_for_event.lock() {
+                            guard.insert(local_name.to_ascii_lowercase());
+                        }
+                    }
+                }
+                if let Ok(manufacturer_data) = advertisement.ManufacturerData() {
+                    if let Ok(size) = manufacturer_data.Size() {
+                        for idx in 0..size {
+                            let Ok(entry) = manufacturer_data.GetAt(idx) else {
+                                continue;
+                            };
+                            let Ok(buffer) = entry.Data() else {
+                                continue;
+                            };
+                            let Ok(payload) = read_winrt_buffer_bytes(&buffer) else {
+                                continue;
+                            };
+                            if is_bitchat_ble_beacon_payload(&payload) {
+                                hit = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if hit {
+                    if let Ok(address) = args.BluetoothAddress() {
+                        let canonical = format!("{:012x}", address & 0x0000_FFFF_FFFF_FFFF);
+                        if let Ok(mut guard) = addresses_for_event.lock() {
+                            guard.insert(canonical);
+                        }
+                    }
+                    signal_for_event.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            },
+        ))
+        .ok()?;
+
+    if watcher.Start().is_err() {
+        let _ = watcher.RemoveReceived(token);
+        return None;
+    }
+
+    time::sleep(Duration::from_millis(900)).await;
+    let _ = watcher.Stop();
+    let _ = watcher.RemoveReceived(token);
+
+    let hit = saw_bitchat_signal.load(Ordering::Relaxed);
+    let names = seen_names
+        .lock()
+        .ok()
+        .map(|set| set.clone())
+        .unwrap_or_default();
+    let addresses = seen_addresses
+        .lock()
+        .ok()
+        .map(|set| set.clone())
+        .unwrap_or_default();
+    if hit || std::env::var("BITCHAT_WINRT_WATCHER_VERBOSE")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+    {
+        write_debug_log(&format!(
+            "WinRT watcher summary: hit={}, names={}, addresses={}",
+            hit,
+            names.len(),
+            addresses.len()
+        ));
+    }
+    if !hit && names.is_empty() {
+        return None;
+    }
+
+    fn normalize_id_hex(id: &str) -> Option<String> {
+        let inner = id
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')').map(|(value, _)| value))?;
+        let normalized = inner
+            .chars()
+            .filter(|ch| ch.is_ascii_hexdigit())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if normalized.len() == 12 {
+            Some(normalized)
+        } else {
+            None
+        }
+    }
+
+    fn reverse_hex_pairs(value: &str) -> Option<String> {
+        if value.len() != 12 {
+            return None;
+        }
+        let mut chunks = (0..6)
+            .map(|i| value[i * 2..i * 2 + 2].to_string())
+            .collect::<Vec<_>>();
+        chunks.reverse();
+        Some(chunks.concat())
+    }
+
+    let peripherals = adapter.peripherals().await.ok()?;
+    let min_rssi = configured_ble_min_rssi();
+    for p in peripherals {
+        let peripheral_id = format!("{:?}", p.id());
+        if skipped_peripherals.contains(&peripheral_id) {
+            continue;
+        }
+        if !addresses.is_empty() {
+            if let Some(id_hex) = normalize_id_hex(&peripheral_id) {
+                if addresses.contains(&id_hex)
+                    || reverse_hex_pairs(&id_hex)
+                        .map(|reversed| addresses.contains(&reversed))
+                        .unwrap_or(false)
+                {
+                    return Some(p);
+                }
+            }
+        }
+        if let Ok(Some(properties)) = p.properties().await {
+            let advertised_service = properties.services.contains(&BITCHAT_SERVICE_UUID)
+                || properties.services.contains(&BITCHAT_TEST_SERVICE_UUID)
+                || properties.service_data.contains_key(&BITCHAT_SERVICE_UUID)
+                || properties
+                    .service_data
+                    .contains_key(&BITCHAT_TEST_SERVICE_UUID);
+            let beacon_match =
+                has_bitchat_ble_beacon_in_manufacturer_data(&properties.manufacturer_data);
+            let service_beacon_match =
+                has_bitchat_service_beacon_in_service_data(&properties.service_data);
+            let name_looks_bitchat = properties
+                .local_name
+                .as_deref()
+                .map(|name| name.to_ascii_lowercase().contains("bitchat"))
+                .unwrap_or(false);
+            if let (Some(min_rssi), Some(rssi)) = (min_rssi, peripheral_rssi(Some(&properties))) {
+                if rssi < min_rssi
+                    && !(advertised_service || beacon_match || service_beacon_match || name_looks_bitchat)
+                {
+                    continue;
+                }
+            }
+            if advertised_service || beacon_match || service_beacon_match {
+                return Some(p);
+            }
+            if let Some(local_name) = properties.local_name.as_deref() {
+                let normalized = local_name.to_ascii_lowercase();
+                if normalized.contains("bitchat") || names.contains(&normalized) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+async fn find_peripheral_via_winrt_gatt_selector(
+    adapter: &btleplug::platform::Adapter,
+    skipped_peripherals: &HashSet<String>,
+) -> Option<Peripheral> {
+    use std::collections::HashSet as StdHashSet;
+    use windows::Devices::Bluetooth::BluetoothLEDevice;
+    use windows::Devices::Bluetooth::GenericAttributeProfile::GattDeviceService;
+
+    let enabled = std::env::var("BITCHAT_WINRT_GATT_SELECTOR_SCAN")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+
+    let mut service_addrs = StdHashSet::<String>::new();
+    let mut service_names = StdHashSet::<String>::new();
+    let mut error_samples: Vec<String> = Vec::new();
+    let service_uuids = [BITCHAT_SERVICE_UUID, BITCHAT_TEST_SERVICE_UUID];
+
+    for service_uuid in service_uuids {
+        let selector = match GattDeviceService::GetDeviceSelectorFromUuid(
+            windows::core::GUID::from_u128(service_uuid.as_u128()),
+        ) {
+            Ok(value) => value,
+            Err(e) => {
+                if error_samples.len() < 4 {
+                    error_samples.push(format!("GetDeviceSelectorFromUuid({service_uuid}) failed: {e}"));
+                }
+                continue;
+            }
+        };
+        let collection = match windows::Devices::Enumeration::DeviceInformation::FindAllAsyncAqsFilter(
+            &selector,
+        ) {
+            Ok(op) => match op.get() {
+                Ok(value) => value,
+                Err(e) => {
+                    if error_samples.len() < 4 {
+                        error_samples.push(format!(
+                            "FindAllAsyncAqsFilter get({service_uuid}) failed: {e}"
+                        ));
+                    }
+                    continue;
+                }
+            },
+            Err(e) => {
+                if error_samples.len() < 4 {
+                    error_samples.push(format!(
+                        "FindAllAsyncAqsFilter({service_uuid}) failed: {e}"
+                    ));
+                }
+                continue;
+            }
+        };
+        let size = match collection.Size() {
+            Ok(value) => value,
+            Err(e) => {
+                if error_samples.len() < 4 {
+                    error_samples.push(format!("collection.Size({service_uuid}) failed: {e}"));
+                }
+                continue;
+            }
+        };
+        for idx in 0..size {
+            let Ok(info) = collection.GetAt(idx) else {
+                continue;
+            };
+            if let Ok(name) = info.Name() {
+                let normalized = name.to_string().trim().to_ascii_lowercase();
+                if !normalized.is_empty() {
+                    service_names.insert(normalized);
+                }
+            }
+            let Ok(id) = info.Id() else {
+                continue;
+            };
+            let Ok(op) = BluetoothLEDevice::FromIdAsync(&id) else {
+                if error_samples.len() < 4 {
+                    error_samples.push("BluetoothLEDevice::FromIdAsync failed".to_string());
+                }
+                continue;
+            };
+            let Ok(device) = op.get() else {
+                if error_samples.len() < 4 {
+                    error_samples.push("BluetoothLEDevice::FromIdAsync get failed".to_string());
+                }
+                continue;
+            };
+            if let Ok(address) = device.BluetoothAddress() {
+                service_addrs.insert(format!("{:012X}", address & 0x0000_FFFF_FFFF_FFFF));
+            }
+            if let Ok(name) = device.Name() {
+                let normalized = name.to_string().trim().to_ascii_lowercase();
+                if !normalized.is_empty() {
+                    service_names.insert(normalized);
+                }
+            }
+        }
+    }
+
+    write_debug_log(&format!(
+        "WinRT GATT selector summary: service_addrs={} service_names={} errors={}",
+        service_addrs.len(),
+        service_names.len(),
+        if error_samples.is_empty() {
+            "none".to_string()
+        } else {
+            error_samples.join(" | ")
+        }
+    ));
+
+    if service_addrs.is_empty() && service_names.is_empty() {
+        return None;
+    }
+
+    let peripherals = adapter.peripherals().await.ok()?;
+    for p in peripherals {
+        let peripheral_id = format!("{:?}", p.id());
+        if skipped_peripherals.contains(&peripheral_id) {
+            continue;
+        }
+        let properties = p.properties().await.ok().flatten();
+
+        let addr_match = service_addrs.iter().any(|addr| {
+            peripheral_matches_target_addr(&peripheral_id, properties.as_ref(), addr)
+        });
+        if addr_match {
+            write_debug_log(&format!(
+                "WinRT GATT selector picked {} via address match",
+                peripheral_summary(&peripheral_id, properties.as_ref())
+            ));
+            return Some(p);
+        }
+
+        if let Some(props) = properties.as_ref() {
+            let local_name = props
+                .local_name
+                .as_deref()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if !local_name.is_empty() && service_names.contains(&local_name) {
+                write_debug_log(&format!(
+                    "WinRT GATT selector picked {} via name match",
+                    peripheral_summary(&peripheral_id, properties.as_ref())
+                ));
+                return Some(p);
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ mod windows_impl {
     use super::*;
     use crate::data_structures::{BITCHAT_CHARACTERISTIC_UUID, BITCHAT_SERVICE_UUID};
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
     use windows::core::{IInspectable, GUID};
     use windows::{
@@ -15,12 +16,17 @@ mod windows_impl {
     };
 
     static OUTBOUND_TX: OnceLock<mpsc::UnboundedSender<Vec<u8>>> = OnceLock::new();
+    static BRIDGE_ACTIVE: AtomicBool = AtomicBool::new(false);
+    static SUBSCRIBER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     fn peripheral_bridge_enabled() -> bool {
-        match std::env::var("BITCHAT_BLE_PERIPHERAL") {
-            Ok(value) => value.trim() == "1",
-            Err(_) => false, // Default OFF to avoid degrading central scan stability on Win10.
+        if let Ok(value) = std::env::var("BITCHAT_BLE_PERIPHERAL_DISABLE") {
+            return !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            );
         }
+        true
     }
 
     fn peripheral_bridge_verbose() -> bool {
@@ -29,16 +35,18 @@ mod windows_impl {
             .unwrap_or(false)
     }
 
-    fn bridge_device_name(nickname: &str) -> String {
+    fn bridge_device_name(nickname: &str, local_peer_id: &str) -> String {
         let base = nickname
             .chars()
             .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-            .take(18)
+            .take(12)
             .collect::<String>();
-        if base.is_empty() {
-            "bitchat-tui".to_string()
-        } else {
-            format!("bitchat-{}", base)
+        let peer_suffix = local_peer_id.chars().take(6).collect::<String>();
+        match (base.is_empty(), peer_suffix.is_empty()) {
+            (true, true) => "bitchat-tui".to_string(),
+            (true, false) => format!("bitchat-{}", peer_suffix),
+            (false, true) => format!("bitchat-{}", base),
+            (false, false) => format!("bitchat-{}-{}", base, peer_suffix),
         }
     }
 
@@ -68,6 +76,7 @@ mod windows_impl {
         ui_tx: mpsc::Sender<String>,
         nickname: String,
         inbound_tx: mpsc::Sender<Vec<u8>>,
+        local_peer_id: String,
     ) {
         if OUTBOUND_TX.get().is_some() {
             return;
@@ -75,12 +84,12 @@ mod windows_impl {
 
         if !peripheral_bridge_enabled() {
             crate::write_debug_log(
-                "BLE peripheral bridge disabled. Set BITCHAT_BLE_PERIPHERAL=1 to enable.",
+                "BLE peripheral bridge disabled by BITCHAT_BLE_PERIPHERAL_DISABLE=1.",
             );
             return;
         }
 
-        let device_name = bridge_device_name(&nickname);
+        let device_name = bridge_device_name(&nickname, &local_peer_id);
         let service_guid = GUID::from_u128(BITCHAT_SERVICE_UUID.as_u128());
         let characteristic_guid = GUID::from_u128(BITCHAT_CHARACTERISTIC_UUID.as_u128());
 
@@ -248,6 +257,7 @@ mod windows_impl {
                         if let Ok(mut guard) = subscribers_for_event.lock() {
                             *guard = updated;
                         }
+                        SUBSCRIBER_COUNT.store(count, Ordering::Relaxed);
                         crate::write_debug_log(&format!(
                             "BLE peripheral subscribers={} ({})",
                             count, device_name_for_subscribers
@@ -360,6 +370,7 @@ mod windows_impl {
             "BLE peripheral bridge active: name='{}' service={} characteristic={}",
             device_name, BITCHAT_SERVICE_UUID, BITCHAT_CHARACTERISTIC_UUID
         ));
+        BRIDGE_ACTIVE.store(true, Ordering::Relaxed);
 
         // Keep provider, characteristic and tokens alive in this task.
         let _provider_guard = service_provider;
@@ -404,6 +415,26 @@ mod windows_impl {
             let _ = tx.send(packet.to_vec());
         }
     }
+
+    pub fn peripheral_active() -> bool {
+        BRIDGE_ACTIVE.load(Ordering::Relaxed)
+    }
+
+    pub fn subscriber_count() -> usize {
+        SUBSCRIBER_COUNT.load(Ordering::Relaxed)
+    }
+
+    pub fn transport_ready() -> bool {
+        peripheral_active() && subscriber_count() > 0
+    }
+
+    pub fn status_lines() -> Vec<String> {
+        vec![format!(
+            "BLE Peripheral: active={} subscribers={}",
+            if peripheral_active() { "yes" } else { "no" },
+            subscriber_count()
+        )]
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -414,20 +445,54 @@ mod windows_impl {
         _ui_tx: mpsc::Sender<String>,
         _nickname: String,
         _inbound_tx: mpsc::Sender<Vec<u8>>,
+        _local_peer_id: String,
     ) {
     }
 
     pub fn queue_outbound_packet(_packet: &[u8]) {}
+
+    pub fn peripheral_active() -> bool {
+        false
+    }
+
+    pub fn subscriber_count() -> usize {
+        0
+    }
+
+    pub fn transport_ready() -> bool {
+        false
+    }
+
+    pub fn status_lines() -> Vec<String> {
+        vec!["BLE Peripheral: active=no subscribers=0".to_string()]
+    }
 }
 
 pub async fn start_ble_peripheral_bridge(
     ui_tx: mpsc::Sender<String>,
     nickname: String,
     inbound_tx: mpsc::Sender<Vec<u8>>,
+    local_peer_id: String,
 ) {
-    windows_impl::start_bridge(ui_tx, nickname, inbound_tx).await;
+    windows_impl::start_bridge(ui_tx, nickname, inbound_tx, local_peer_id).await;
 }
 
 pub fn queue_ble_peripheral_packet(packet: &[u8]) {
     windows_impl::queue_outbound_packet(packet);
+}
+
+pub fn ble_peripheral_active() -> bool {
+    windows_impl::peripheral_active()
+}
+
+pub fn ble_peripheral_subscriber_count() -> usize {
+    windows_impl::subscriber_count()
+}
+
+pub fn ble_peripheral_transport_ready() -> bool {
+    windows_impl::transport_ready()
+}
+
+pub fn ble_peripheral_status_lines() -> Vec<String> {
+    windows_impl::status_lines()
 }
