@@ -175,7 +175,8 @@ mod windows_impl {
         let _ = char_params.SetWriteProtectionLevel(GattProtectionLevel::Plain);
         let _ =
             char_params.SetUserDescription(&windows::core::HSTRING::from("BitChat packet stream"));
-        if let Ok(initial_value) = create_buffer(b"Ready") {
+        let bcid_value = format!("BCID:{}", local_peer_id);
+        if let Ok(initial_value) = create_buffer(bcid_value.as_bytes()) {
             let _ = char_params.SetStaticValue(&initial_value);
         }
 

@@ -48,12 +48,18 @@ const REQUEST_SYNC_HANDSHAKE_RETRY_COOLDOWN: StdDuration = StdDuration::from_sec
 const MESH_SPARSE_FALLBACK_DELAY: StdDuration = StdDuration::from_secs(4);
 const MESH_SPARSE_FALLBACK_DELAY_WINDOWS: StdDuration = StdDuration::from_secs(9);
 const MESH_UNRESPONSIVE_BLACKLIST_DURATION: StdDuration = StdDuration::from_secs(75);
+const MESH_NON_BITCHAT_CACHE_DURATION: StdDuration = StdDuration::from_secs(15 * 60);
+const MESH_KNOWN_BITCHAT_CACHE_DURATION: StdDuration = StdDuration::from_secs(20 * 60);
 const BITCHAT_BLE_BEACON_PREFIX: &[u8] = b"BCT1";
 const BITCHAT_BLE_SERVICE_BEACON_PREFIX: &[u8] = b"BCT1";
 static ADAPTER_INFO_EMITTED: AtomicBool = AtomicBool::new(false);
 static WIN10_STABLE_PROBE_ON_MISS_EMITTED: AtomicBool = AtomicBool::new(false);
 static WIN10_BLE_MIN_RSSI_LOG_EMITTED: AtomicBool = AtomicBool::new(false);
 static TEMPORARY_PERIPHERAL_BLACKLIST: StdOnceLock<StdMutex<HashMap<String, std::time::Instant>>> =
+    StdOnceLock::new();
+static NON_BITCHAT_PERIPHERAL_CACHE: StdOnceLock<StdMutex<HashMap<String, std::time::Instant>>> =
+    StdOnceLock::new();
+static KNOWN_BITCHAT_PERIPHERAL_CACHE: StdOnceLock<StdMutex<HashMap<String, std::time::Instant>>> =
     StdOnceLock::new();
 static BLE_SCAN_LOGGED_CANDIDATES: StdOnceLock<StdMutex<HashSet<String>>> = StdOnceLock::new();
 static STABLE_SPARSE_OBSERVATION_COUNTS: StdOnceLock<StdMutex<HashMap<String, u8>>> =
@@ -301,6 +307,56 @@ fn blacklist_peripheral_temporarily(id: &str, now: std::time::Instant) {
     if let Ok(mut guard) = temporary_peripheral_blacklist().lock() {
         guard.insert(id.to_string(), now + MESH_UNRESPONSIVE_BLACKLIST_DURATION);
     }
+}
+
+fn non_bitchat_peripheral_cache() -> &'static StdMutex<HashMap<String, std::time::Instant>> {
+    NON_BITCHAT_PERIPHERAL_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn known_bitchat_peripheral_cache() -> &'static StdMutex<HashMap<String, std::time::Instant>> {
+    KNOWN_BITCHAT_PERIPHERAL_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn cleanup_candidate_caches(now: std::time::Instant) {
+    if let Ok(mut guard) = non_bitchat_peripheral_cache().lock() {
+        guard.retain(|_, expires_at| *expires_at > now);
+    }
+    if let Ok(mut guard) = known_bitchat_peripheral_cache().lock() {
+        guard.retain(|_, expires_at| *expires_at > now);
+    }
+}
+
+fn mark_non_bitchat_candidate(id: &str, now: std::time::Instant) {
+    cleanup_candidate_caches(now);
+    if let Ok(mut guard) = non_bitchat_peripheral_cache().lock() {
+        guard.insert(id.to_string(), now + MESH_NON_BITCHAT_CACHE_DURATION);
+    }
+}
+
+fn is_recent_non_bitchat_candidate(id: &str, now: std::time::Instant) -> bool {
+    cleanup_candidate_caches(now);
+    if let Ok(guard) = non_bitchat_peripheral_cache().lock() {
+        return guard.get(id).map(|expires_at| *expires_at > now).unwrap_or(false);
+    }
+    false
+}
+
+fn mark_known_bitchat_candidate(id: &str, now: std::time::Instant) {
+    cleanup_candidate_caches(now);
+    if let Ok(mut known_guard) = known_bitchat_peripheral_cache().lock() {
+        known_guard.insert(id.to_string(), now + MESH_KNOWN_BITCHAT_CACHE_DURATION);
+    }
+    if let Ok(mut bad_guard) = non_bitchat_peripheral_cache().lock() {
+        bad_guard.remove(id);
+    }
+}
+
+fn is_recent_known_bitchat_candidate(id: &str, now: std::time::Instant) -> bool {
+    cleanup_candidate_caches(now);
+    if let Ok(guard) = known_bitchat_peripheral_cache().lock() {
+        return guard.get(id).map(|expires_at| *expires_at > now).unwrap_or(false);
+    }
+    false
 }
 
 fn stable_sparse_observation_counts() -> &'static StdMutex<HashMap<String, u8>> {
@@ -935,9 +991,11 @@ async fn setup_bluetooth_connections(
     if !ADAPTER_INFO_EMITTED.swap(true, Ordering::Relaxed) {
         if let Ok(adapter_info) = adapter.adapter_info().await {
             write_debug_log(&format!("Local Bluetooth adapter: {}", adapter_info));
-            let _ = ui_tx
-                .send(format!("system: Local Bluetooth adapter: {}", adapter_info))
-                .await;
+            if debug_enabled {
+                let _ = ui_tx
+                    .send(format!("system: Local Bluetooth adapter: {}", adapter_info))
+                    .await;
+            }
         }
     }
     if use_targeted_scan {
@@ -1275,6 +1333,7 @@ async fn setup_bluetooth_connections(
                     "BitChat characteristic confirmed on {}",
                     peripheral_summary(&peripheral_id, candidate_properties.as_ref())
                 ));
+                mark_known_bitchat_candidate(&peripheral_id, std::time::Instant::now());
                 if debug_enabled {
                     ui_tx
                         .send(format!(
@@ -1331,6 +1390,9 @@ async fn setup_bluetooth_connections(
                     ))
                     .await
                     .map_err(|e| e.to_string())?;
+            }
+            if !available_characteristics.is_empty() {
+                mark_non_bitchat_candidate(&peripheral_id, std::time::Instant::now());
             }
             let _ = p.disconnect().await;
             blacklist_peripheral_temporarily(&peripheral_id, std::time::Instant::now());
@@ -1968,6 +2030,13 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
         .unwrap_or(default)
 }
 
@@ -5933,6 +6002,8 @@ async fn find_peripheral(
     let mut beacon_candidate_count: usize = 0;
     let mut best_name_candidate: Option<(Peripheral, i16)> = None;
     let mut name_candidate_count: usize = 0;
+    let mut best_known_bitchat_candidate: Option<(Peripheral, i16)> = None;
+    let mut known_bitchat_candidate_count: usize = 0;
     let mut sparse_props_candidate: Option<(Peripheral, i16)> = None;
     let mut any_fallback_candidate: Option<(Peripheral, i16)> = None;
     let win10_probe_connect_enabled = cfg!(target_os = "windows")
@@ -5943,6 +6014,8 @@ async fn find_peripheral(
         "BITCHAT_WIN10_STABLE_PROBE_CONNECT_DELAY_SECS",
         10,
     ));
+    let win10_probe_connect_min_rssi = env_i64("BITCHAT_WIN10_STABLE_PROBE_CONNECT_MIN_RSSI", -65)
+        .clamp(-120, 20) as i16;
     let win10_probe_connect_on_miss =
         stable_scan_mode && win10_probe_connect_enabled && scan_elapsed >= win10_probe_connect_delay;
     let mut probe_connect_candidate: Option<(Peripheral, i16)> = None;
@@ -5979,6 +6052,10 @@ async fn find_peripheral(
     for p in peripherals {
         let peripheral_id = format!("{:?}", p.id());
         if skipped_peripherals.contains(&peripheral_id) {
+            continue;
+        }
+        let now = std::time::Instant::now();
+        if is_recent_non_bitchat_candidate(&peripheral_id, now) {
             continue;
         }
 
@@ -6029,6 +6106,17 @@ async fn find_peripheral(
                     }
                 }
                 let rssi = rssi_or_floor(Some(&properties));
+                if is_recent_known_bitchat_candidate(&peripheral_id, now) {
+                    known_bitchat_candidate_count += 1;
+                    let replace = best_known_bitchat_candidate
+                        .as_ref()
+                        .map(|(_, current_rssi)| rssi > *current_rssi)
+                        .unwrap_or(true);
+                    if replace {
+                        best_known_bitchat_candidate = Some((p.clone(), rssi));
+                    }
+                    continue;
+                }
                 // Prefer devices that explicitly advertise the BitChat service UUID.
                 if advertises_service || has_matching_service_data {
                     service_candidate_count += 1;
@@ -6076,6 +6164,7 @@ async fn find_peripheral(
                     continue;
                 }
                 if win10_probe_connect_on_miss
+                    && rssi >= win10_probe_connect_min_rssi
                     && (properties.manufacturer_data.len() > 0
                         || properties.service_data.len() > 0
                         || !properties.services.is_empty())
@@ -6146,6 +6235,13 @@ async fn find_peripheral(
                 if min_rssi.is_some() {
                     continue;
                 }
+                if is_recent_known_bitchat_candidate(&peripheral_id, now) {
+                    known_bitchat_candidate_count += 1;
+                    if best_known_bitchat_candidate.is_none() {
+                        best_known_bitchat_candidate = Some((p.clone(), i16::MIN));
+                    }
+                    continue;
+                }
                 if stable_scan_mode {
                     continue;
                 }
@@ -6177,6 +6273,18 @@ async fn find_peripheral(
             peripheral_summary(&candidate_id, properties.as_ref()),
             rssi,
             service_candidate_count
+        ));
+        return Ok(Some(candidate));
+    }
+
+    if let Some((candidate, rssi)) = best_known_bitchat_candidate {
+        let candidate_id = format!("{:?}", candidate.id());
+        let properties = candidate.properties().await.ok().flatten();
+        write_debug_log(&format!(
+            "find_peripheral: selected {} via known-bitchat cache (best RSSI={}dBm among {} candidates)",
+            peripheral_summary(&candidate_id, properties.as_ref()),
+            rssi,
+            known_bitchat_candidate_count
         ));
         return Ok(Some(candidate));
     }
