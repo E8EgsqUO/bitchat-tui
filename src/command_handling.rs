@@ -971,8 +971,8 @@ pub async fn handle_dm_command(
     my_peer_id: &str,
     delivery_tracker: &mut DeliveryTracker,
     _encryption_service: &EncryptionService,
-    peripheral: &Peripheral,
-    cmd_char: &btleplug::api::Characteristic,
+    fallback_peripheral: Option<&Peripheral>,
+    fallback_cmd_char: Option<&btleplug::api::Characteristic>,
     mesh_targets: &[(Peripheral, Characteristic)],
     ui_tx: mpsc::Sender<String>,
     app: &mut crate::tui::app::App,
@@ -1038,7 +1038,10 @@ pub async fn handle_dm_command(
         if let Some(target_peer_id) = peer_id {
             chat_context.enter_dm_mode(target_lookup, &target_peer_id);
             let owned_targets = if mesh_targets.is_empty() {
-                vec![(peripheral.clone(), cmd_char.clone())]
+                fallback_peripheral
+                    .zip(fallback_cmd_char)
+                    .map(|(peripheral, cmd_char)| vec![(peripheral.clone(), cmd_char.clone())])
+                    .unwrap_or_default()
             } else {
                 mesh_targets.to_vec()
             };

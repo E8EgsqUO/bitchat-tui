@@ -5729,39 +5729,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_ref()
                 .zip(cmd_char.as_ref())
                 .or_else(|| mesh_links.first().map(|link| (&link.peripheral, &link.cmd)));
-            if let Some((dm_peripheral, dm_cmd_char)) = dm_link {
-                if handle_dm_command(
-                    &line,
-                    chat_context.as_mut().unwrap(),
-                    peers.as_ref().unwrap(),
-                    &nickname,
-                    &my_peer_id,
-                    delivery_tracker.as_mut().unwrap(),
-                    encryption_service.as_ref().unwrap(),
-                    dm_peripheral,
-                    dm_cmd_char,
-                    &mesh_send_targets(&mesh_links),
-                    ui_tx.clone(),
-                    &mut app,
-                    noise_session_manager.as_mut().unwrap(),
-                )
-                .await
+            let dm_fallback_peripheral = dm_link.map(|(peripheral, _)| peripheral);
+            let dm_fallback_cmd_char = dm_link.map(|(_, cmd_char)| cmd_char);
+            if handle_dm_command(
+                &line,
+                chat_context.as_mut().unwrap(),
+                peers.as_ref().unwrap(),
+                &nickname,
+                &my_peer_id,
+                delivery_tracker.as_mut().unwrap(),
+                encryption_service.as_ref().unwrap(),
+                dm_fallback_peripheral,
+                dm_fallback_cmd_char,
+                &mesh_send_targets(&mesh_links),
+                ui_tx.clone(),
+                &mut app,
+                noise_session_manager.as_mut().unwrap(),
+            )
+            .await
+            {
+                // Update TUI to reflect DM mode if we entered DM mode
+                if let ChatMode::PrivateDM {
+                    nickname: target_nickname,
+                    ..
+                } = &chat_context.as_ref().unwrap().current_mode
                 {
-                    // Update TUI to reflect DM mode if we entered DM mode
-                    if let ChatMode::PrivateDM {
-                        nickname: target_nickname,
-                        ..
-                    } = &chat_context.as_ref().unwrap().current_mode
-                    {
-                        app.switch_to_dm(target_nickname.clone());
-                    }
-                    continue;
+                    app.switch_to_dm(target_nickname.clone());
                 }
-            } else if line.starts_with("/dm ") {
-                app.add_log_message(
-                    "system: No active Bluetooth link available for /dm. Wait for mesh discovery or run /r."
-                        .to_string(),
-                );
                 continue;
             }
             if let Some((file_peripheral, file_cmd_char)) = dm_link {
@@ -5994,18 +5988,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_ref()
                     .zip(cmd_char.as_ref())
                     .or_else(|| mesh_links.first().map(|link| (&link.peripheral, &link.cmd)));
-                let Some((dm_peripheral, dm_cmd_char)) = dm_link else {
-                    app.add_log_message(
-                        "system: No active Bluetooth link available for DM send.".to_string(),
-                    );
-                    continue;
-                };
                 match handle_private_dm_message(
                     &line,
                     target_peer_id,
                     &mut noise_session_manager,
-                    dm_peripheral,
-                    dm_cmd_char,
+                    dm_link.map(|(peripheral, _)| peripheral),
+                    dm_link.map(|(_, cmd_char)| cmd_char),
                     &mesh_send_targets(&mesh_links),
                     &my_peer_id,
                     ui_tx.clone(),
@@ -6042,12 +6030,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_ref()
                 .zip(cmd_char.as_ref())
                 .or_else(|| mesh_links.first().map(|link| (&link.peripheral, &link.cmd)));
-            let Some((regular_peripheral, regular_cmd_char)) = regular_link else {
-                app.add_log_message(
-                    "system: No active Bluetooth link available for message send.".to_string(),
-                );
-                continue;
-            };
 
             let chunk_total = outgoing_chunks.len();
             for (idx, chunk) in outgoing_chunks.into_iter().enumerate() {
@@ -6060,8 +6042,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     channel_keys.as_mut().unwrap(),
                     encryption_service.as_ref().unwrap(),
                     delivery_tracker.as_mut().unwrap(),
-                    regular_peripheral,
-                    regular_cmd_char,
+                    regular_link.map(|(peripheral, _)| peripheral),
+                    regular_link.map(|(_, cmd_char)| cmd_char),
                     &mesh_send_targets(&mesh_links),
                     ui_tx.clone(),
                     &mut app,

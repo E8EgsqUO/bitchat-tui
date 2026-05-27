@@ -139,8 +139,8 @@ pub async fn handle_private_dm_message(
     message: &str,
     target_peer_id: &str,
     noise_session_manager: &mut Option<NoiseSessionManager>,
-    peripheral: &PlatformPeripheral,
-    cmd_char: &btleplug::api::Characteristic,
+    fallback_peripheral: Option<&PlatformPeripheral>,
+    fallback_cmd_char: Option<&btleplug::api::Characteristic>,
     mesh_targets: &[(PlatformPeripheral, Characteristic)],
     my_peer_id: &str,
     ui_tx: mpsc::Sender<String>,
@@ -223,7 +223,12 @@ pub async fn handle_private_dm_message(
 
                                 write_noise_debug_log("[DEBUG] About to send handshake packet");
                                 let owned_targets = if mesh_targets.is_empty() {
-                                    vec![(peripheral.clone(), cmd_char.clone())]
+                                    fallback_peripheral
+                                        .zip(fallback_cmd_char)
+                                        .map(|(peripheral, cmd_char)| {
+                                            vec![(peripheral.clone(), cmd_char.clone())]
+                                        })
+                                        .unwrap_or_default()
                                 } else {
                                     mesh_targets.to_vec()
                                 };
@@ -358,7 +363,10 @@ pub async fn handle_private_dm_message(
         encrypted_packet.len()
     ));
     let owned_targets = if mesh_targets.is_empty() {
-        vec![(peripheral.clone(), cmd_char.clone())]
+        fallback_peripheral
+            .zip(fallback_cmd_char)
+            .map(|(peripheral, cmd_char)| vec![(peripheral.clone(), cmd_char.clone())])
+            .unwrap_or_default()
     } else {
         mesh_targets.to_vec()
     };
@@ -572,8 +580,8 @@ pub async fn handle_regular_message(
     channel_keys: &mut HashMap<String, [u8; 32]>,
     encryption_service: &EncryptionService,
     delivery_tracker: &mut DeliveryTracker,
-    peripheral: &PlatformPeripheral,
-    cmd_char: &btleplug::api::Characteristic,
+    fallback_peripheral: Option<&PlatformPeripheral>,
+    fallback_cmd_char: Option<&btleplug::api::Characteristic>,
     mesh_targets: &[(PlatformPeripheral, Characteristic)],
     ui_tx: mpsc::Sender<String>,
     app: &mut crate::tui::app::App,
@@ -690,7 +698,10 @@ pub async fn handle_regular_message(
     ));
 
     let owned_targets = if mesh_targets.is_empty() {
-        vec![(peripheral.clone(), cmd_char.clone())]
+        fallback_peripheral
+            .zip(fallback_cmd_char)
+            .map(|(peripheral, cmd_char)| vec![(peripheral.clone(), cmd_char.clone())])
+            .unwrap_or_default()
     } else {
         mesh_targets.to_vec()
     };
