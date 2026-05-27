@@ -67,7 +67,11 @@ async fn send_packet_to_mesh_targets(
     original_msg_type: MessageType,
 ) -> Result<(), String> {
     let owned_targets = if mesh_targets.is_empty() {
-        vec![(fallback_peripheral.clone(), fallback_cmd_char.clone())]
+        if crate::ble_peripheral::ble_peripheral_transport_ready() {
+            Vec::new()
+        } else {
+            vec![(fallback_peripheral.clone(), fallback_cmd_char.clone())]
+        }
     } else {
         mesh_targets.to_vec()
     };
@@ -89,6 +93,13 @@ async fn send_packet_to_mesh_targets(
         }
     }
 
+    if crate::ble_peripheral::ble_peripheral_transport_ready() {
+        crate::ble_peripheral::queue_ble_peripheral_packet(&packet);
+        // Peripheral transport means we have at least one notify subscriber.
+        // Treat queueing as success even when central links fail.
+        sent_any = true;
+    }
+
     if sent_any {
         Ok(())
     } else {
@@ -104,12 +115,18 @@ async fn relay_packet_to_mesh_targets(
     label: &str,
 ) -> Result<usize, String> {
     let owned_targets = if mesh_targets.is_empty() {
-        vec![(fallback_peripheral.clone(), fallback_cmd_char.clone())]
+        if crate::ble_peripheral::ble_peripheral_transport_ready() {
+            Vec::new()
+        } else {
+            vec![(fallback_peripheral.clone(), fallback_cmd_char.clone())]
+        }
     } else {
         mesh_targets.to_vec()
     };
 
-    let write_type = if cfg!(target_os = "windows") || packet.len() > 512 {
+    let write_type = if cfg!(target_os = "windows") {
+        WriteType::WithoutResponse
+    } else if packet.len() > 512 {
         WriteType::WithResponse
     } else {
         WriteType::WithoutResponse
@@ -122,6 +139,11 @@ async fn relay_packet_to_mesh_targets(
             Ok(()) => sent_count += 1,
             Err(e) => errors.push(format!("link {}: {}", idx + 1, e)),
         }
+    }
+
+    if crate::ble_peripheral::ble_peripheral_transport_ready() {
+        crate::ble_peripheral::queue_ble_peripheral_packet(&packet);
+        sent_count += 1;
     }
 
     if sent_count > 0 {
@@ -218,6 +240,12 @@ fn resolve_sender_display_name(
 
     if looks_like_hex_identity(sender_trimmed) || sender_trimmed.starts_with("npub") {
         return peer_name.unwrap_or_else(|| fallback_sender_name(sender_peer_id));
+    }
+
+    if sender_trimmed.to_ascii_lowercase().starts_with("anon") {
+        if let Some(name) = peer_name {
+            return name;
+        }
     }
 
     sender_trimmed.to_string()

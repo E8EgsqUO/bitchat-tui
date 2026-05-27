@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use btleplug::api::{
-    Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
+    Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
 };
 use btleplug::platform::{Manager, Peripheral};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -36,8 +36,9 @@ const MESH_BACKGROUND_REFRESH_COOLDOWN: StdDuration = StdDuration::from_secs(3);
 const MESH_BACKGROUND_SCAN_INTERVAL: StdDuration = StdDuration::from_secs(9);
 const MESH_BACKGROUND_SCAN_TIMEOUT: Duration = Duration::from_secs(4);
 const MESH_BACKGROUND_SCAN_GRACE: StdDuration = StdDuration::from_secs(1);
-const MESH_LINK_HEALTH_CHECK_INTERVAL: StdDuration = StdDuration::from_secs(10);
+const MESH_LINK_HEALTH_CHECK_INTERVAL: StdDuration = StdDuration::from_secs(4);
 const MESH_LINK_RX_GRACE: StdDuration = StdDuration::from_secs(18);
+const MESH_LINK_STALE_TIMEOUT: StdDuration = StdDuration::from_secs(14);
 const MESH_SCAN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MESH_PRIMARY_SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 const MESH_PRIMARY_SCAN_GRACE: StdDuration = StdDuration::from_secs(4);
@@ -47,7 +48,7 @@ const MESH_PRIMARY_RETRY_FAST_WINDOW: StdDuration = StdDuration::from_secs(60);
 const REQUEST_SYNC_HANDSHAKE_RETRY_COOLDOWN: StdDuration = StdDuration::from_secs(4);
 const MESH_SPARSE_FALLBACK_DELAY: StdDuration = StdDuration::from_secs(4);
 const MESH_SPARSE_FALLBACK_DELAY_WINDOWS: StdDuration = StdDuration::from_secs(9);
-const MESH_UNRESPONSIVE_BLACKLIST_DURATION: StdDuration = StdDuration::from_secs(75);
+const MESH_UNRESPONSIVE_BLACKLIST_DURATION: StdDuration = StdDuration::from_secs(12);
 const MESH_NON_BITCHAT_CACHE_DURATION: StdDuration = StdDuration::from_secs(15 * 60);
 const MESH_KNOWN_BITCHAT_CACHE_DURATION: StdDuration = StdDuration::from_secs(20 * 60);
 const BITCHAT_BLE_BEACON_PREFIX: &[u8] = b"BCT1";
@@ -527,6 +528,7 @@ struct MeshLink {
 
 struct MeshNotification {
     link_id: String,
+    char_uuid: Option<Uuid>,
     value: Vec<u8>,
 }
 
@@ -539,6 +541,47 @@ fn mesh_send_targets(mesh_links: &[MeshLink]) -> Vec<(Peripheral, Characteristic
 
 fn mesh_transport_available(mesh_links: &[MeshLink]) -> bool {
     !mesh_links.is_empty() || crate::ble_peripheral::ble_peripheral_transport_ready()
+}
+
+fn refresh_mesh_runtime_status(
+    app: &mut App,
+    mesh_links: &[MeshLink],
+    bt_handle_active: bool,
+    pending_peripherals: bool,
+    pending_background_peripherals: bool,
+) {
+    let peripheral_subscribers = crate::ble_peripheral::ble_peripheral_subscriber_count();
+    let has_central_links = !mesh_links.is_empty();
+    let has_peripheral_links = peripheral_subscribers > 0;
+
+    app.connected = has_central_links || has_peripheral_links;
+    app.mesh_status = if has_central_links {
+        if mesh_links.len() > 1 {
+            format!("Connected ({} links)", mesh_links.len())
+        } else {
+            "Connected".to_string()
+        }
+    } else if has_peripheral_links {
+        if peripheral_subscribers > 1 {
+            format!("Connected ({} peripheral)", peripheral_subscribers)
+        } else {
+            "Connected (peripheral)".to_string()
+        }
+    } else if bt_handle_active || pending_peripherals || pending_background_peripherals {
+        "Scanning".to_string()
+    } else {
+        "Offline".to_string()
+    };
+}
+
+fn is_mesh_write_failure(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    error_text.contains("0x80000013")
+        || error_text.contains("对象已关闭")
+        || error_text.contains("0x80650003")
+        || error_text.contains("无法写入属性")
+        || (lower.contains("object") && lower.contains("closed"))
+        || (lower.contains("write") && lower.contains("failed"))
 }
 
 fn merge_mesh_links(mesh_links: &mut Vec<MeshLink>, new_links: Vec<MeshLink>) -> bool {
@@ -757,6 +800,18 @@ async fn retain_connected_mesh_links(mesh_links: &mut Vec<MeshLink>) -> bool {
             blacklist_peripheral_temporarily(&link.id, std::time::Instant::now());
             let _ = link.peripheral.disconnect().await;
             continue;
+        }
+        if let Some(last_rx_at) = link.last_rx_at {
+            if last_rx_at.elapsed() >= MESH_LINK_STALE_TIMEOUT {
+                changed = true;
+                write_debug_log(&format!(
+                    "Dropping stale mesh link {}: no inbound packets for {:?}",
+                    link.id, MESH_LINK_STALE_TIMEOUT
+                ));
+                blacklist_peripheral_temporarily(&link.id, std::time::Instant::now());
+                let _ = link.peripheral.disconnect().await;
+                continue;
+            }
         }
         match link.peripheral.is_connected().await {
             Ok(true) => retained.push(link),
@@ -1017,12 +1072,6 @@ async fn setup_bluetooth_connections(
         write_debug_log(
             "Win10 stable scan mode enabled: strict service/name discovery with random fallback disabled (targeted scan is optional)",
         );
-        let _ = ui_tx
-            .send(
-                "system: Win10 stable scan mode enabled (strict BLE discovery, fallback disabled; targeted filter off by default)"
-                    .to_string(),
-            )
-            .await;
     }
     let target_addrs = configured_ble_target_addrs();
     if !target_addrs.is_empty() {
@@ -1032,23 +1081,11 @@ async fn setup_bluetooth_connections(
                 "BLE target mode: hard-only enabled for {}; non-matching candidates will be skipped",
                 target_addrs.join(",")
             ));
-            let _ = ui_tx
-                .send(format!(
-                    "system: BLE target hard-only enabled ({})",
-                    target_addrs.join(", ")
-                ))
-                .await;
         } else {
             write_debug_log(&format!(
                 "BLE target mode: priority match for {} with candidate+feature fallback enabled",
                 target_addrs.join(",")
             ));
-            let _ = ui_tx
-                .send(format!(
-                    "system: BLE target priority enabled ({}) with candidate+feature fallback",
-                    target_addrs.join(", ")
-                ))
-                .await;
         }
     }
     if let Some(min_rssi) = configured_ble_min_rssi() {
@@ -1056,12 +1093,6 @@ async fn setup_bluetooth_connections(
             "BLE minimum RSSI filter enabled: candidates below {}dBm will be ignored",
             min_rssi
         ));
-        let _ = ui_tx
-            .send(format!(
-                "system: BLE min RSSI filter enabled ({} dBm)",
-                min_rssi
-            ))
-            .await;
     }
 
     if debug_enabled {
@@ -1162,7 +1193,6 @@ async fn setup_bluetooth_connections(
                     "Skip candidate {}: temporarily blacklisted after unresponsive link",
                     peripheral_id
                 ));
-                skipped_peripherals.insert(peripheral_id);
                 continue;
             }
             let candidate_properties = p.properties().await.ok().flatten();
@@ -1471,11 +1501,22 @@ async fn send_mesh_announce(
     } else {
         WriteType::WithoutResponse
     };
-    write_mesh_packet(peripheral, cmd, &announce_packet, announce_write_type).await?;
-    if crate::ble_peripheral::ble_peripheral_transport_ready() {
-        crate::ble_peripheral::queue_ble_peripheral_packet(&announce_packet);
+    match write_mesh_packet(peripheral, cmd, &announce_packet, announce_write_type).await {
+        Ok(()) => {
+            if crate::ble_peripheral::ble_peripheral_transport_ready() {
+                crate::ble_peripheral::queue_ble_peripheral_packet(&announce_packet);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            write_debug_log(&format!(
+                "Mesh announce write failed on {:?}: {}",
+                peripheral.id(),
+                e
+            ));
+            Err(Box::new(e))
+        }
     }
-    Ok(())
 }
 
 async fn initialize_mesh_link(
@@ -1537,10 +1578,37 @@ async fn initialize_mesh_link(
                 ));
             };
 
+            // Subscribe to the primary command characteristic first.
             peripheral
                 .subscribe(&cmd)
                 .await
                 .map_err(|e| format!("failed to subscribe on {}: {}", link_id, e))?;
+
+            // iOS/macOS variants may emit packets on a sibling notify characteristic
+            // under the same service. Subscribe those too so phone->PC traffic
+            // is not lost when characteristic layout differs.
+            for extra_char in chars.iter().filter(|candidate| {
+                candidate.service_uuid == BITCHAT_SERVICE_UUID
+                    && candidate.uuid != cmd.uuid
+                    && candidate
+                        .properties
+                        .intersects(CharPropFlags::NOTIFY | CharPropFlags::INDICATE)
+            }) {
+                match peripheral.subscribe(extra_char).await {
+                    Ok(()) => {
+                        write_debug_log(&format!(
+                            "Subscribed additional BitChat notify characteristic on {}: {}",
+                            link_id, extra_char.uuid
+                        ));
+                    }
+                    Err(e) => {
+                        write_debug_log(&format!(
+                            "Failed subscribing additional BitChat notify characteristic on {}: {} ({})",
+                            link_id, extra_char.uuid, e
+                        ));
+                    }
+                }
+            }
 
             send_mesh_announce(&peripheral, &cmd, nickname, my_peer_id, encryption, &[])
                 .await
@@ -1581,6 +1649,7 @@ async fn initialize_mesh_link(
                 if mesh_notify_tx
                     .send(MeshNotification {
                         link_id: notify_link_id.clone(),
+                        char_uuid: Some(notification.uuid),
                         value: notification.value,
                     })
                     .await
@@ -2784,6 +2853,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut primary_retry_window_started_at = std::time::Instant::now();
     let mut had_mesh_links_since_retry_window = false;
     let mut last_requestsync_handshake_at: HashMap<String, std::time::Instant> = HashMap::new();
+    // Fairly interleave central notifications and local peripheral writes.
+    // Without this, busy central links can starve phone->PC writes.
+    let mut prefer_peripheral_rx = false;
 
     let mut last_tick = std::time::Instant::now();
     let tick_rate = StdDuration::from_millis(100);
@@ -3310,30 +3382,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        refresh_mesh_runtime_status(
+            &mut app,
+            &mesh_links,
+            bt_handle.is_some(),
+            !pending_peripherals.is_empty(),
+            !pending_background_peripherals.is_empty(),
+        );
+
         // 2. Handle Bluetooth notifications (async)
         if post_connect_initialized {
             for _ in 0..64 {
-                let mesh_notification = match mesh_notify_rx.try_recv() {
-                    Ok(notification) => notification,
-                    Err(_) => match peripheral_write_rx.try_recv() {
+                let mesh_notification = if prefer_peripheral_rx {
+                    match peripheral_write_rx.try_recv() {
                         Ok(value) => MeshNotification {
                             link_id: "__ble_peripheral_write__".to_string(),
+                            char_uuid: None,
                             value,
                         },
-                        Err(_) => break,
-                    },
+                        Err(_) => match mesh_notify_rx.try_recv() {
+                            Ok(notification) => notification,
+                            Err(_) => break,
+                        },
+                    }
+                } else {
+                    match mesh_notify_rx.try_recv() {
+                        Ok(notification) => notification,
+                        Err(_) => match peripheral_write_rx.try_recv() {
+                            Ok(value) => MeshNotification {
+                                link_id: "__ble_peripheral_write__".to_string(),
+                                char_uuid: None,
+                                value,
+                            },
+                            Err(_) => break,
+                        },
+                    }
                 };
+                prefer_peripheral_rx = !prefer_peripheral_rx;
                 if mesh_notification.link_id != "__ble_peripheral_write__" {
                     if let Some(link) = mesh_links
                         .iter_mut()
                         .find(|link| link.id == mesh_notification.link_id)
                     {
                         link.last_rx_at = Some(std::time::Instant::now());
-                    }
-                } else if !mesh_links.is_empty() {
-                    let now = std::time::Instant::now();
-                    for link in mesh_links.iter_mut() {
-                        link.last_rx_at = Some(now);
                     }
                 }
                 let active_link = mesh_links
@@ -3345,7 +3436,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ui_tx = ui_tx.clone();
 
                 // Process notification
-                write_debug_log(&format!("Processing notification from characteristic"));
+                if let Some(char_uuid) = mesh_notification.char_uuid {
+                    write_debug_log(&format!(
+                        "Processing notification from characteristic {}",
+                        char_uuid
+                    ));
+                } else {
+                    write_debug_log("Processing notification from peripheral write bridge");
+                }
                 write_debug_log(&format!(
                     "Raw notification data: {} bytes",
                     mesh_notification.value.len()
@@ -3941,7 +4039,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             had_mesh_links_since_retry_window = false;
         }
 
-        if app.connected {
+        if app.connected || crate::ble_peripheral::ble_peripheral_transport_ready() {
             if let Some(encryption) = encryption_service.as_ref() {
                 let should_announce = last_mesh_announce_at
                     .map(|last| last.elapsed() >= MESH_ANNOUNCE_INTERVAL)
@@ -3953,8 +4051,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Vec::new()
                     };
                     let mut sent_any = false;
+                    let mut failed_link_ids: Vec<String> = Vec::new();
                     for link in &mesh_links {
-                        if send_mesh_announce(
+                        match send_mesh_announce(
                             &link.peripheral,
                             &link.cmd,
                             &nickname,
@@ -3963,14 +4062,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &neighbor_peer_ids,
                         )
                         .await
-                        .is_ok()
                         {
-                            sent_any = true;
+                            Ok(()) => sent_any = true,
+                            Err(e) => {
+                                if is_mesh_write_failure(&e.to_string()) {
+                                    failed_link_ids.push(link.id.clone());
+                                }
+                            }
                         }
                     }
-                    if sent_any {
-                        last_mesh_announce_at = Some(std::time::Instant::now());
+                    if !failed_link_ids.is_empty() {
+                        let before = mesh_links.len();
+                        let failed: HashSet<String> = failed_link_ids.into_iter().collect();
+                        mesh_links.retain(|link| !failed.contains(&link.id));
+                        let after = mesh_links.len();
+                        if before != after {
+                            write_debug_log(&format!(
+                                "Removed {} stale mesh link(s) after announce failures",
+                                before.saturating_sub(after)
+                            ));
+                            peripheral = mesh_links.first().map(|link| link.peripheral.clone());
+                            cmd_char = mesh_links.first().map(|link| link.cmd.clone());
+                            app.trigger_connection_retry();
+                        }
                     }
+                    if !sent_any && crate::ble_peripheral::ble_peripheral_transport_ready() {
+                        let noise_public_key = encryption.get_static_public_key_data();
+                        let signing_public_key = encryption.get_signing_public_key_data();
+                        let announce_payload = create_announcement_payload_with_neighbors(
+                            &nickname,
+                            &noise_public_key,
+                            &signing_public_key,
+                            &neighbor_peer_ids,
+                        )
+                        .unwrap_or_else(|| nickname.as_bytes().to_vec());
+                        let announce_timestamp = current_timestamp_ms();
+                        let announce_signature_payload = create_bitchat_packet_for_signing_at(
+                            &my_peer_id,
+                            None,
+                            MessageType::Announce,
+                            &announce_payload,
+                            announce_timestamp,
+                        );
+                        let announce_signature = encryption.sign(&announce_signature_payload);
+                        let announce_packet = create_bitchat_packet_with_signature_at(
+                            &my_peer_id,
+                            MessageType::Announce,
+                            announce_payload,
+                            Some(announce_signature),
+                            announce_timestamp,
+                        );
+                        crate::ble_peripheral::queue_ble_peripheral_packet(&announce_packet);
+                        sent_any = true;
+                    }
+                    // Also advance the announce timer on failures so we don't spin every tick.
+                    last_mesh_announce_at = Some(std::time::Instant::now());
                 }
             }
         }
@@ -5579,47 +5725,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 continue;
             }
-            if handle_dm_command(
-                &line,
-                chat_context.as_mut().unwrap(),
-                peers.as_ref().unwrap(),
-                &nickname,
-                &my_peer_id,
-                delivery_tracker.as_mut().unwrap(),
-                encryption_service.as_ref().unwrap(),
-                peripheral.as_ref().unwrap(),
-                cmd_char.as_ref().unwrap(),
-                &mesh_send_targets(&mesh_links),
-                ui_tx.clone(),
-                &mut app,
-                noise_session_manager.as_mut().unwrap(),
-            )
-            .await
-            {
-                // Update TUI to reflect DM mode if we entered DM mode
-                if let ChatMode::PrivateDM {
-                    nickname: target_nickname,
-                    ..
-                } = &chat_context.as_ref().unwrap().current_mode
+            let dm_link = peripheral
+                .as_ref()
+                .zip(cmd_char.as_ref())
+                .or_else(|| mesh_links.first().map(|link| (&link.peripheral, &link.cmd)));
+            if let Some((dm_peripheral, dm_cmd_char)) = dm_link {
+                if handle_dm_command(
+                    &line,
+                    chat_context.as_mut().unwrap(),
+                    peers.as_ref().unwrap(),
+                    &nickname,
+                    &my_peer_id,
+                    delivery_tracker.as_mut().unwrap(),
+                    encryption_service.as_ref().unwrap(),
+                    dm_peripheral,
+                    dm_cmd_char,
+                    &mesh_send_targets(&mesh_links),
+                    ui_tx.clone(),
+                    &mut app,
+                    noise_session_manager.as_mut().unwrap(),
+                )
+                .await
                 {
-                    app.switch_to_dm(target_nickname.clone());
+                    // Update TUI to reflect DM mode if we entered DM mode
+                    if let ChatMode::PrivateDM {
+                        nickname: target_nickname,
+                        ..
+                    } = &chat_context.as_ref().unwrap().current_mode
+                    {
+                        app.switch_to_dm(target_nickname.clone());
+                    }
+                    continue;
                 }
+            } else if line.starts_with("/dm ") {
+                app.add_log_message(
+                    "system: No active Bluetooth link available for /dm. Wait for mesh discovery or run /r."
+                        .to_string(),
+                );
                 continue;
             }
-            if handle_file_command(
-                &line,
-                chat_context.as_ref().unwrap(),
-                peers.as_ref().unwrap(),
-                password_protected_channels.as_ref().unwrap(),
-                encryption_service.as_ref().unwrap(),
-                &my_peer_id,
-                peripheral.as_ref().unwrap(),
-                cmd_char.as_ref().unwrap(),
-                ui_tx.clone(),
-                &mut app,
-            )
-            .await
+            if let Some((file_peripheral, file_cmd_char)) = dm_link {
+                if handle_file_command(
+                    &line,
+                    chat_context.as_ref().unwrap(),
+                    peers.as_ref().unwrap(),
+                    password_protected_channels.as_ref().unwrap(),
+                    encryption_service.as_ref().unwrap(),
+                    &my_peer_id,
+                    file_peripheral,
+                    file_cmd_char,
+                    ui_tx.clone(),
+                    &mut app,
+                )
+                .await
+                {
+                    continue;
+                }
+            } else if line.starts_with("/file ")
+                || line.starts_with("/receive")
+                || line.starts_with("/upload ")
             {
+                app.add_log_message(
+                    "system: No active Bluetooth link available for file command. Wait for mesh discovery or run /r."
+                        .to_string(),
+                );
                 continue;
             }
             if handle_clear_command(&line, chat_context.as_mut().unwrap(), ui_tx.clone()).await {
@@ -5651,37 +5820,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 continue;
             }
-            if handle_leave_command(
-                &line,
-                chat_context.as_mut().unwrap(),
-                channel_keys.as_mut().unwrap(),
-                app_state.as_mut().unwrap(),
-                &my_peer_id,
-                peripheral.as_ref().unwrap(),
-                cmd_char.as_ref().unwrap(),
-                ui_tx.clone(),
-                &mut app,
-            )
-            .await
-            {
-                // Update TUI to reflect public chat mode (since leaving a channel switches to public)
-                app.switch_to_public();
-                if let Err(e) = persist_runtime_state(
-                    chat_context.as_ref().unwrap(),
-                    blocked_peers.as_ref().unwrap(),
-                    &app.blocked,
-                    &app.nostr_aliases,
-                    verified_labels.as_ref().unwrap(),
-                    favorites.as_ref().unwrap(),
-                    channel_creators.as_ref().unwrap(),
-                    password_protected_channels.as_ref().unwrap(),
-                    channel_key_commitments.as_ref().unwrap(),
-                    app_state.as_ref().unwrap(),
-                    create_app_state.as_ref().unwrap(),
-                    &nickname,
-                ) {
-                    app.add_log_message(format!("system: Warning: Could not save state: {}", e));
+            if let Some((leave_peripheral, leave_cmd_char)) = dm_link {
+                if handle_leave_command(
+                    &line,
+                    chat_context.as_mut().unwrap(),
+                    channel_keys.as_mut().unwrap(),
+                    app_state.as_mut().unwrap(),
+                    &my_peer_id,
+                    leave_peripheral,
+                    leave_cmd_char,
+                    ui_tx.clone(),
+                    &mut app,
+                )
+                .await
+                {
+                    // Update TUI to reflect public chat mode (since leaving a channel switches to public)
+                    app.switch_to_public();
+                    if let Err(e) = persist_runtime_state(
+                        chat_context.as_ref().unwrap(),
+                        blocked_peers.as_ref().unwrap(),
+                        &app.blocked,
+                        &app.nostr_aliases,
+                        verified_labels.as_ref().unwrap(),
+                        favorites.as_ref().unwrap(),
+                        channel_creators.as_ref().unwrap(),
+                        password_protected_channels.as_ref().unwrap(),
+                        channel_key_commitments.as_ref().unwrap(),
+                        app_state.as_ref().unwrap(),
+                        create_app_state.as_ref().unwrap(),
+                        &nickname,
+                    ) {
+                        app.add_log_message(format!("system: Warning: Could not save state: {}", e));
+                    }
+                    continue;
                 }
+            } else if line == "/leave" {
+                app.add_log_message(
+                    "system: No active Bluetooth link available for /leave. Wait for mesh discovery or run /r."
+                        .to_string(),
+                );
                 continue;
             }
             if handle_fingerprint_command(
@@ -5846,7 +6023,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.add_dm_message(target_nickname.clone(), line.clone());
                     }
                     Err(e) => {
-                        app.add_log_message(format!("system: Failed to send DM: {}", e));
+                        let err_text = e.to_string();
+                        if is_mesh_write_failure(&err_text) {
+                            app.trigger_connection_retry();
+                            app.add_log_message(
+                                "system: Bluetooth link dropped while sending DM; restarting mesh scan automatically. Wait a few seconds, or run /r."
+                                    .to_string(),
+                            );
+                        } else {
+                            app.add_log_message(format!("system: Failed to send DM: {}", err_text));
+                        }
                     }
                 }
                 continue;
@@ -5956,8 +6142,8 @@ async fn find_peripheral(
     let min_rssi = configured_ble_min_rssi();
     let win10_probe_on_miss_enabled = cfg!(target_os = "windows")
         && std::env::var("BITCHAT_WIN10_STABLE_SCAN_PROBE_ON_MISS")
-            .map(|v| v.trim() != "0")
-            .unwrap_or(true);
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
     let win10_probe_delay = StdDuration::from_secs(env_u64(
         "BITCHAT_WIN10_STABLE_SCAN_PROBE_DELAY_SECS",
         12,
@@ -6008,8 +6194,8 @@ async fn find_peripheral(
     let mut any_fallback_candidate: Option<(Peripheral, i16)> = None;
     let win10_probe_connect_enabled = cfg!(target_os = "windows")
         && std::env::var("BITCHAT_WIN10_STABLE_PROBE_CONNECT_ON_MISS")
-            .map(|v| v.trim() != "0")
-            .unwrap_or(true);
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
     let win10_probe_connect_delay = StdDuration::from_secs(env_u64(
         "BITCHAT_WIN10_STABLE_PROBE_CONNECT_DELAY_SECS",
         10,

@@ -330,7 +330,7 @@ pub async fn send_packet_with_fragmentation_as(
 
             // Send fragment
             let write_type = if cfg!(target_os = "windows") {
-                WriteType::WithResponse
+                WriteType::WithoutResponse
             } else {
                 WriteType::WithoutResponse
             };
@@ -366,7 +366,9 @@ pub async fn send_packet_with_fragmentation_as(
         Ok(())
     } else {
         // Packet is small enough, send directly
-        let write_type = if cfg!(target_os = "windows") || packet.len() > 512 {
+        let write_type = if cfg!(target_os = "windows") {
+            WriteType::WithoutResponse
+        } else if packet.len() > 512 {
             WriteType::WithResponse
         } else {
             WriteType::WithoutResponse

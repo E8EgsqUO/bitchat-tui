@@ -29,7 +29,8 @@ async fn send_packet_to_mesh_targets(
     my_peer_id: &str,
     msg_type: MessageType,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if targets.is_empty() {
+    let peripheral_transport_ready = crate::ble_peripheral::ble_peripheral_transport_ready();
+    if targets.is_empty() && !peripheral_transport_ready {
         return Err("No Bluetooth mesh links available".into());
     }
 
@@ -50,11 +51,28 @@ async fn send_packet_to_mesh_targets(
         }
     }
 
+    if peripheral_transport_ready {
+        crate::ble_peripheral::queue_ble_peripheral_packet(&packet);
+        // Peripheral transport means we have at least one notify subscriber.
+        // Treat queueing as success even when central links fail.
+        sent_any = true;
+    }
+
     if sent_any {
         Ok(())
     } else {
         Err(format!("all mesh sends failed: {}", errors.join("; ")).into())
     }
+}
+
+fn is_mesh_write_failure(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    error_text.contains("0x80000013")
+        || error_text.contains("对象已关闭")
+        || error_text.contains("0x80650003")
+        || error_text.contains("无法写入属性")
+        || (lower.contains("object") && lower.contains("closed"))
+        || (lower.contains("write") && lower.contains("failed"))
 }
 
 const MAX_FILE_TRANSFER_BYTES: u64 = 1024 * 1024;
@@ -1179,10 +1197,14 @@ pub async fn handle_dm_command(
             )
             .await
             {
+                let err_text = e.to_string();
+                if is_mesh_write_failure(&err_text) {
+                    app.trigger_connection_retry();
+                }
                 let _ = ui_tx
                     .send(format!(
                         "\n\x1b[91m❌ Failed to send private message: {}\x1b[0m\n",
-                        e
+                        err_text
                     ))
                     .await;
             } else {

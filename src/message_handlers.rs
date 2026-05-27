@@ -44,13 +44,24 @@ fn write_send_debug_log(message: &str) {
     }
 }
 
+fn is_mesh_write_failure(error_text: &str) -> bool {
+    let err_lower = error_text.to_ascii_lowercase();
+    error_text.contains("0x80000013")
+        || error_text.contains("对象已关闭")
+        || error_text.contains("0x80650003")
+        || error_text.contains("无法写入属性")
+        || (err_lower.contains("object") && err_lower.contains("closed"))
+        || (err_lower.contains("write") && err_lower.contains("failed"))
+}
+
 async fn send_packet_to_mesh_targets(
     targets: &[(PlatformPeripheral, Characteristic)],
     packet: Vec<u8>,
     my_peer_id: &str,
     original_msg_type: MessageType,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if targets.is_empty() {
+    let peripheral_transport_ready = crate::ble_peripheral::ble_peripheral_transport_ready();
+    if targets.is_empty() && !peripheral_transport_ready {
         return Err("No Bluetooth mesh links available".into());
     }
 
@@ -67,7 +78,9 @@ async fn send_packet_to_mesh_targets(
             )
             .await
         } else {
-            let write_type = if cfg!(target_os = "windows") || packet.len() > 512 {
+            let write_type = if cfg!(target_os = "windows") {
+                WriteType::WithoutResponse
+            } else if packet.len() > 512 {
                 WriteType::WithResponse
             } else {
                 WriteType::WithoutResponse
@@ -99,6 +112,19 @@ async fn send_packet_to_mesh_targets(
                 errors.push(format!("link {}: {}", idx + 1, e));
             }
         }
+    }
+
+    if peripheral_transport_ready {
+        crate::ble_peripheral::queue_ble_peripheral_packet(&packet);
+        // Peripheral transport means we have at least one notify subscriber.
+        // Treat queueing as a successful send path even if central links failed.
+        sent_any = true;
+        write_send_debug_log(&format!(
+            "mesh peripheral notify queued: type={:?}, packet_len={}, central_links={}",
+            original_msg_type,
+            packet.len(),
+            targets.len()
+        ));
     }
 
     if sent_any {
@@ -711,12 +737,7 @@ pub async fn handle_regular_message(
 
     if let Err(e) = send_result {
         let err_text = e.to_string();
-        let err_lower = err_text.to_ascii_lowercase();
-        let link_closed = err_text.contains("0x80000013")
-            || err_text.contains("对象已关闭")
-            || (err_lower.contains("object") && err_lower.contains("closed"));
-
-        if link_closed {
+        if is_mesh_write_failure(&err_text) {
             app.trigger_connection_retry();
             let _ = ui_tx
                 .send(
