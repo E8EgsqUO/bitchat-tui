@@ -4,7 +4,8 @@ use btleplug::api::{
 };
 use btleplug::platform::{Manager, Peripheral};
 use ed25519_dalek::{Signature, VerifyingKey};
-use qrcode::{render::unicode, QrCode};
+use image::{GrayImage, Luma};
+use qrcode::{types::Color as QrColor, QrCode};
 
 use futures::stream::StreamExt;
 use rand::RngCore;
@@ -1935,14 +1936,43 @@ fn create_local_verify_link(
     Ok(format!("bitchat://verify?{}", query))
 }
 
-fn render_verify_qr(link: &str) -> Result<String, String> {
+fn render_verify_qr_png(link: &str) -> Result<std::path::PathBuf, String> {
     let qr = QrCode::new(link.as_bytes()).map_err(|e| format!("QR encode failed: {}", e))?;
-    Ok(qr
-        .render::<unicode::Dense1x2>()
-        .quiet_zone(true)
-        .dark_color(unicode::Dense1x2::Dark)
-        .light_color(unicode::Dense1x2::Light)
-        .build())
+    let side_modules = qr.width() as u32;
+    let scale = 12u32;
+    let quiet_zone = 4u32;
+    let side_pixels = (side_modules + quiet_zone * 2) * scale;
+    let mut image = GrayImage::from_pixel(side_pixels, side_pixels, Luma([255u8]));
+    let colors = qr.to_colors();
+
+    for y in 0..side_modules {
+        for x in 0..side_modules {
+            let idx = (y * side_modules + x) as usize;
+            if matches!(colors[idx], QrColor::Dark) {
+                let px0 = (x + quiet_zone) * scale;
+                let py0 = (y + quiet_zone) * scale;
+                for py in py0..(py0 + scale) {
+                    for px in px0..(px0 + scale) {
+                        image.put_pixel(px, py, Luma([0u8]));
+                    }
+                }
+            }
+        }
+    }
+
+    let output = std::env::current_dir()
+        .map_err(|e| format!("cannot resolve current dir: {}", e))?
+        .join("received_files")
+        .join("images")
+        .join("verify")
+        .join(format!("verify_qr_{}.png", Uuid::new_v4()));
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create directory: {}", e))?;
+    }
+    image
+        .save(&output)
+        .map_err(|e| format!("failed to save QR image: {}", e))?;
+    Ok(output)
 }
 
 fn verification_link_noise_fingerprint(noise_key_hex: &str) -> Result<String, String> {
@@ -3074,18 +3104,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &candidate_fp,
                             ) {
                                 app.set_mesh_peer_verified(peer_id, true);
-                                let needs_label = verified_labels
+                                let existing_label = verified_labels
                                     .as_ref()
                                     .unwrap()
                                     .get(verified_fp)
-                                    .map(|label| label.trim().is_empty())
-                                    .unwrap_or(true);
-                                if needs_label {
+                                    .map(|value| value.trim().to_string())
+                                    .unwrap_or_default();
+                                let peer_label = peer_name.trim();
+                                if !peer_label.is_empty() && existing_label != peer_label {
                                     let verified_fp = verified_fp.clone();
                                     verified_labels
                                         .as_mut()
                                         .unwrap()
-                                        .insert(verified_fp.clone(), peer_name.to_string());
+                                        .insert(verified_fp.clone(), peer_label.to_string());
                                     {
                                         let mut labels_guard =
                                             verified_labels_state.lock().unwrap();
@@ -4265,20 +4296,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let encryption = encryption_service.as_ref().unwrap();
                     match create_local_verify_link(encryption, &nickname, None) {
                         Ok(link) => {
-                            app.add_log_message(
-                                "system: Scan this QR in iOS Verify Me / verify scanner:"
-                                    .to_string(),
-                            );
-                            match render_verify_qr(&link) {
-                                Ok(qr_text) => {
-                                    for row in qr_text.lines() {
-                                        app.add_log_message(format!("system: {}", row));
-                                    }
+                            match render_verify_qr_png(&link) {
+                                Ok(path) => {
+                                    app.add_log_message(
+                                        "system: Scan this QR in iOS Verify Me / verify scanner:"
+                                            .to_string(),
+                                    );
+                                    app.add_log_message(format!(
+                                        "[image] {}",
+                                        path.to_string_lossy()
+                                    ));
                                     app.add_log_message(format!("system: {}", link));
                                 }
                                 Err(err) => {
                                     app.add_log_message(format!(
-                                        "system: Could not render QR: {}",
+                                        "system: Could not render verify QR image: {}",
                                         err
                                     ));
                                     app.add_log_message(format!("system: {}", link));
