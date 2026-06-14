@@ -66,6 +66,9 @@ static KNOWN_BITCHAT_PERIPHERAL_CACHE: StdOnceLock<StdMutex<HashMap<String, std:
 static BLE_SCAN_LOGGED_CANDIDATES: StdOnceLock<StdMutex<HashSet<String>>> = StdOnceLock::new();
 static STABLE_SPARSE_OBSERVATION_COUNTS: StdOnceLock<StdMutex<HashMap<String, u8>>> =
     StdOnceLock::new();
+#[cfg(target_os = "windows")]
+static LAST_WINRT_GATT_SELECTOR_SUMMARY: StdOnceLock<StdMutex<(String, std::time::Instant)>> =
+    StdOnceLock::new();
 
 fn local_ble_bridge_name(nickname: &str, local_peer_id: &str) -> String {
     let base = nickname
@@ -326,6 +329,23 @@ fn cleanup_candidate_caches(now: std::time::Instant) {
     if let Ok(mut guard) = known_bitchat_peripheral_cache().lock() {
         guard.retain(|_, expires_at| *expires_at > now);
     }
+}
+
+#[cfg(target_os = "windows")]
+fn should_log_winrt_gatt_selector_summary(summary: &str, now: std::time::Instant) -> bool {
+    let state = LAST_WINRT_GATT_SELECTOR_SUMMARY
+        .get_or_init(|| StdMutex::new((String::new(), now - StdDuration::from_secs(60))));
+    if let Ok(mut guard) = state.lock() {
+        let changed = guard.0 != summary;
+        let expired = now.duration_since(guard.1) >= StdDuration::from_secs(10);
+        if changed || expired {
+            guard.0.clear();
+            guard.0.push_str(summary);
+            guard.1 = now;
+            return true;
+        }
+    }
+    false
 }
 
 fn mark_non_bitchat_candidate(id: &str, now: std::time::Instant) {
@@ -1194,6 +1214,8 @@ async fn setup_bluetooth_connections(
                     "Skip candidate {}: temporarily blacklisted after unresponsive link",
                     peripheral_id
                 ));
+                skipped_peripherals.insert(peripheral_id);
+                let _ = p.disconnect().await;
                 continue;
             }
             let candidate_properties = p.properties().await.ok().flatten();
@@ -7098,7 +7120,7 @@ async fn find_peripheral_via_winrt_gatt_selector(
         }
     }
 
-    write_debug_log(&format!(
+    let summary = format!(
         "WinRT GATT selector summary: service_addrs={} service_names={} errors={}",
         service_addrs.len(),
         service_names.len(),
@@ -7107,7 +7129,10 @@ async fn find_peripheral_via_winrt_gatt_selector(
         } else {
             error_samples.join(" | ")
         }
-    ));
+    );
+    if should_log_winrt_gatt_selector_summary(&summary, std::time::Instant::now()) {
+        write_debug_log(&summary);
+    }
 
     if service_addrs.is_empty() && service_names.is_empty() {
         return None;

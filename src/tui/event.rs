@@ -241,8 +241,26 @@ pub fn handle_mouse_event(app: &mut App, mouse_event: MouseEvent) {
     if app.popup_active {
         return;
     }
-    if !matches!(mouse_event.kind, MouseEventKind::Up(MouseButton::Left)) {
-        return;
+    match mouse_event.kind {
+        MouseEventKind::ScrollUp => {
+            if app.messages_area_contains_position(mouse_event.row, mouse_event.column) {
+                let total_lines = app.message_rendered_line_count;
+                let messages_height = app.message_viewport_height;
+                let max_scroll = total_lines.saturating_sub(messages_height);
+                app.msg_scroll = (app.msg_scroll + 3).min(max_scroll);
+                app.note_user_scrolled();
+            }
+            return;
+        }
+        MouseEventKind::ScrollDown => {
+            if app.messages_area_contains_position(mouse_event.row, mouse_event.column) {
+                app.msg_scroll = app.msg_scroll.saturating_sub(3);
+                app.note_user_scrolled();
+            }
+            return;
+        }
+        MouseEventKind::Up(MouseButton::Left) => {}
+        _ => return,
     }
 
     let Some(target) = app.visible_copy_target_at_position(mouse_event.row, mouse_event.column)
@@ -631,6 +649,24 @@ mod tests {
         }
     }
 
+    fn mouse_scroll_up(row: u16, column: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn mouse_scroll_down(row: u16, column: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn release_char(ch: char) -> KeyEvent {
         KeyEvent::new_with_kind(KeyCode::Char(ch), KeyModifiers::NONE, KeyEventKind::Release)
     }
@@ -976,5 +1012,30 @@ mod tests {
 
         assert!(!app.image_preview_is_open());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_message_history_inside_messages_panel() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.messages_area_rect = Some((0, 0, 40, 8));
+        app.message_rendered_line_count = 50;
+        app.message_viewport_height = 10;
+
+        handle_mouse_event(&mut app, mouse_scroll_up(2, 5));
+        assert_eq!(app.msg_scroll, 3);
+
+        handle_mouse_event(&mut app, mouse_scroll_down(2, 5));
+        assert_eq!(app.msg_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_outside_messages_panel_does_not_scroll() {
+        let mut app = App::new_with_nickname("me".to_string());
+        app.messages_area_rect = Some((10, 10, 40, 8));
+        app.message_rendered_line_count = 50;
+        app.message_viewport_height = 10;
+
+        handle_mouse_event(&mut app, mouse_scroll_up(2, 5));
+        assert_eq!(app.msg_scroll, 0);
     }
 }

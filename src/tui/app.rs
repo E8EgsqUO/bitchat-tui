@@ -1501,6 +1501,19 @@ impl App {
             .flatten()
     }
 
+    pub fn messages_area_contains_position(&self, row: u16, column: u16) -> bool {
+        let Some((x, y, width, height)) = self.messages_area_rect else {
+            return false;
+        };
+        if width < 2 || height < 2 {
+            return false;
+        }
+        column > x
+            && column < x.saturating_add(width).saturating_sub(1)
+            && row > y
+            && row < y.saturating_add(height).saturating_sub(1)
+    }
+
     pub fn current_message_text_for_copy(&self, index: usize) -> Option<String> {
         let (messages, _, _) = self.get_current_messages();
         let msg = messages.get(index)?;
